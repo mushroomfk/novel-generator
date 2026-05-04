@@ -11,6 +11,40 @@
 
 [Release](https://github.com/mushroomfk/novel-generator/releases/tag/v0.1.0) · [文档索引](./docs/README.md) · [更新记录](./CHANGELOG.md) · [许可](./LICENSE)
 
+## 桌面截图
+
+### 写作工作台
+
+![稿匣写作工作台](./docs/assets/readme-workspace.png)
+
+### Agent 执行流程
+
+![Agent 执行流程](./docs/assets/readme-agent-flow.png)
+
+### 技能库与知识检索
+
+![技能库与知识检索](./docs/assets/readme-skills-knowledge.png)
+
+## 使用流程
+
+1. 创建作品，设置章节数量、目标字数和基础设定。
+2. 导入资料、人物卡、参考文本、网页或 PDF，建立本地知识索引。
+3. 生成整书架构或章节蓝图，把故事方向沉淀为项目文件。
+4. 选中目标章节，在 Agent 对话中提出续写、改稿、资料分析或架构调整请求。
+5. 审阅执行计划和生成结果，确认后写回章节正文。
+6. 通过本地历史、项目记忆、Prompt 历史和知识检索继续迭代。
+
+## 相对常见 AI 写作工具的优势
+
+| 维度 | 常见做法 | 稿匣 |
+| --- | --- | --- |
+| 数据位置 | 作品、资料和会话依赖云端项目 | 作品目录、章节、资料库、历史记录和知识索引默认保存在本机 |
+| 长篇组织 | 以单次聊天或单篇正文为中心 | 以作品、章节、设定、资料、架构和连续性为中心 |
+| 生成过程 | 直接返回一段文本，后续需要手工整理 | 生成前有计划，生成后可预览、审阅、写回和查看历史 |
+| 资料使用 | 主要依赖复制粘贴上下文 | 支持导入多格式资料，使用 SQLite / FTS5、embedding 和 rerank 组合检索 |
+| 可追踪性 | 难还原一次生成使用了哪些资料和步骤 | Agent 讨论、资料分析、章节写作和整书架构共用执行时间线 |
+| 二次开发 | 多数是封闭产品或插件 | 前端、backend、桌面壳和回归脚本都在仓库内，适合继续改造 |
+
 ## 为什么值得关注
 
 - 本地优先：作品数据、知识库、版本记录和项目记忆默认保存在本地目录
@@ -41,7 +75,16 @@
 | 桌面运行 | Tauri 自动拉起本地 backend，并把实际 backend 地址下发给前端 |
 | 发布回归 | backend 单测、前端构建、浏览器 smoke、桌面 sidecar 打包检查 |
 
-## 架构
+## 技术方案
+
+- 桌面壳：`Tauri 2` 负责窗口、应用元数据、桌面打包和 Python sidecar 拉起
+- 前端：`Vue 3 + Vite + TypeScript` 提供作品列表、章节工作台、技能库、设置页和 Agent 对话
+- 后端：`FastAPI` 负责项目文件、章节正文、资料导入、模型请求、技能流程和执行状态
+- 本地数据：作品文件、章节、设定和历史记录保存在作品目录；资料索引使用 `SQLite / FTS5`
+- 模型接入：使用 OpenAI-compatible `chat/completions`，可接入 OpenAI、DashScope、火山方舟等兼容服务
+- 检索增强：关键词检索、embedding、rerank 和联网考据可组合使用，适配资料库和作者参考库
+- 执行链路：Agent 计划、执行、进度、结果和错误状态通过 backend 统一管理，前端以流式状态展示
+- 发布验证：仓库保留 backend 单测、前端构建、浏览器 smoke、desktop sidecar 和 Tauri 打包检查脚本
 
 ```mermaid
 flowchart LR
@@ -141,6 +184,7 @@ Embedding 检索可单独配置：
 | `npm run backend:bundle` | 打包 Python sidecar |
 | `npm run verify:desktop` | 检查桌面发布链路 |
 | `npm run verify:release` | 执行 UI smoke 和桌面发布检查 |
+| `npm run docs:screenshots` | 生成 README 演示截图 |
 
 ## 目录结构
 
@@ -169,7 +213,7 @@ Embedding 检索可单独配置：
 - 增加更多真实作品规模下的性能样本
 - 完善跨章节连续性检查和写回确认体验
 - 补充 Windows / Linux 桌面打包验证
-- 给公开仓库补充截图、演示视频和更完整的使用教程
+- 补充演示视频和更完整的使用教程
 
 ## 许可
 

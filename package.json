@@ -38,6 +38,7 @@
     "verify:ui": "node scripts/verify-ui-smoke.mjs",
     "verify:desktop": "bash scripts/verify-desktop-release.sh",
     "verify:release": "npm run verify:ui && npm run verify:desktop",
+    "docs:screenshots": "node scripts/capture-readme-screenshots.mjs",
     "predev": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
     "prebuild": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
     "prepreview": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
