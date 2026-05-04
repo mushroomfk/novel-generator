@@ -1,0 +1,59 @@
+.DS_Store
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+.npm/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.claude/
+.codex/
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts
+build/
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/novel-backend*
+*.app/
+*.dmg
+*.pkg
+*.msi
+*.AppImage
+*.zip
+*.tar.gz
+
+# Logs
+*.log
+logs/
+
+# Local app data
+cache/
+output/
+NovelGenerator/
+projects/
+workspace/
+*.sqlite
+*.sqlite3
+*.db
+
+.test-data/
+test-results/

@@ -1,0 +1,66 @@
+{
+  "name": "novel-generator",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local desktop writing workbench for long-form novel projects.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mushroomfk/novel-generator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mushroomfk/novel-generator/issues"
+  },
+  "homepage": "https://github.com/mushroomfk/novel-generator#readme",
+  "keywords": [
+    "novel",
+    "writing",
+    "tauri",
+    "vue",
+    "fastapi",
+    "local-first"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/vite/bin/vite.js --host 0.0.0.0 --port 1420",
+    "build": "node node_modules/vue-tsc/bin/vue-tsc.js --noEmit && node node_modules/vite/bin/vite.js build",
+    "preview": "node node_modules/vite/bin/vite.js preview",
+    "tauri": "node node_modules/@tauri-apps/cli/tauri.js",
+    "backend:dev": ".venv/bin/python -m uvicorn novel_backend.app:app --app-dir backend --host 127.0.0.1 --port 18181 --http h11 --loop asyncio",
+    "backend:serve": ".venv/bin/python -m uvicorn novel_backend.app:app --app-dir backend --host 127.0.0.1 --port 18181 --http h11 --loop asyncio",
+    "backend:test": ".venv/bin/python -m unittest discover -s backend/tests -v",
+    "backend:bundle": "bash scripts/build-backend-sidecar.sh",
+    "desktop:resign": "bash scripts/repair-tauri-app-signature.sh",
+    "dev:all": "npm-run-all --parallel backend:dev dev",
+    "package:test:macos": "bash scripts/prepare-macos-test-release.sh",
+    "release:test:macos": "npm run verify:desktop && npm run package:test:macos",
+    "verify": "npm run backend:test && npm run build",
+    "verify:ui": "node scripts/verify-ui-smoke.mjs",
+    "verify:desktop": "bash scripts/verify-desktop-release.sh",
+    "verify:release": "npm run verify:ui && npm run verify:desktop",
+    "predev": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
+    "prebuild": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
+    "prepreview": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
+    "pretauri": "node scripts/fix-macos-native-binaries.mjs && node scripts/patch-vite-fsevents.mjs",
+    "deps:install": "npm install --ignore-scripts --no-audit --no-fund"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "vue": "^3.5.32"
+  },
+  "devDependencies": {
+    "@rollup/wasm-node": "^4.60.1",
+    "@tauri-apps/cli": "^2.10.1",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "esbuild": "npm:esbuild-wasm@0.24.2",
+    "npm-run-all": "^4.1.5",
+    "playwright-core": "^1.55.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.2",
+    "vue-tsc": "^3.2.6"
+  },
+  "overrides": {
+    "esbuild": "npm:esbuild-wasm@0.24.2",
+    "rollup": "npm:@rollup/wasm-node@4.60.1"
+  }
+}

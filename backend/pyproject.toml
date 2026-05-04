@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-backend"
+version = "0.1.0"
+description = "Local FastAPI backend for the Novel Generator desktop app."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "pypdf>=5.0.0,<6.0.0",
+  "pydantic-settings>=2.6.0,<3.0.0",
+  "uvicorn>=0.32.0,<1.0.0",
+  "watchfiles>=1.1.0,<2.0.0"
+]
+
+[project.scripts]
+novel-backend = "novel_backend.main:main"
