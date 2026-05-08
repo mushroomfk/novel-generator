@@ -48,6 +48,5 @@ jobs:
           name: gaoxia-windows-${{ github.sha }}
           if-no-files-found: error
           path: |
-            src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/binaries/novel-backend-x86_64-pc-windows-msvc.exe
