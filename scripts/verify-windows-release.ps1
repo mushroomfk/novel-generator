@@ -124,27 +124,24 @@ try {
     Write-Step "Check Windows sidecar health"
     Invoke-BackendSmoke $SidecarPath "sidecar"
 
-    Write-Step "Build Tauri Windows installer"
-    & npm run tauri -- build
+    Write-Step "Build Tauri Windows NSIS installer"
+    & npm run tauri -- build --bundles nsis
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   }
   finally {
     Pop-Location
   }
 
-  $MsiDir = Join-Path $RootDir "src-tauri\target\release\bundle\msi"
   $NsisDir = Join-Path $RootDir "src-tauri\target\release\bundle\nsis"
-  $Msi = Get-ChildItem -Path $MsiDir -Filter "*.msi" -File -ErrorAction SilentlyContinue | Select-Object -First 1
   $Nsis = Get-ChildItem -Path $NsisDir -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
-  if ($null -eq $Msi -and $null -eq $Nsis) {
-    throw "No Windows installer found under $MsiDir or $NsisDir"
+  if ($null -eq $Nsis) {
+    throw "No NSIS Windows installer found under $NsisDir"
   }
 
   Write-Step "Windows release check finished"
   Write-Host "sidecar=$SidecarPath"
-  if ($null -ne $Msi) { Write-Host "msi=$($Msi.FullName)" }
-  if ($null -ne $Nsis) { Write-Host "nsis=$($Nsis.FullName)" }
+  Write-Host "nsis=$($Nsis.FullName)"
 }
 finally {
   if (Test-Path $BuildLogDir) {
