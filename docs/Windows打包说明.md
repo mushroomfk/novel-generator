@@ -22,7 +22,6 @@ Windows Desktop Release
 
 上传产物包括：
 
-- `src-tauri/target/release/bundle/msi/*.msi`
 - `src-tauri/target/release/bundle/nsis/*.exe`
 - `src-tauri/binaries/novel-backend-x86_64-pc-windows-msvc.exe`
 
@@ -60,7 +59,7 @@ npm run verify:desktop:windows
 - 用 PyInstaller 打包 Windows sidecar
 - 拉起 sidecar，检查 `/api/app/health` 和 `/api/app/shutdown`
 - 执行 Tauri release 构建
-- 检查 `.msi` 或 NSIS `setup.exe` 是否生成
+- 检查 NSIS `setup.exe` 是否生成
 
 ## 边界
 
@@ -70,7 +69,7 @@ npm run verify:desktop:windows
 - 前端生产构建
 - Windows sidecar 打包
 - sidecar 运行级健康检查
-- Tauri Windows 安装包构建
+- Tauri Windows NSIS 安装包构建
 - GitHub Actions 产物上传
 
 还没覆盖：
