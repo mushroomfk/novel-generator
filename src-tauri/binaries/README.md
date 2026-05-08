@@ -11,13 +11,25 @@
 - Tauri 启动时拉起 backend
 - 前端读取动态 `backend_url`
 - 退出时回收 backend 进程
+- macOS / Linux sidecar 打包脚本
+- Windows sidecar 打包脚本和 GitHub Actions 打包流程
 
-发布版还差的只有 sidecar 打包这一步。
-
-本仓库现在已经提供脚本：
+macOS / Linux 使用：
 
 ```bash
 npm run backend:bundle
 ```
 
-脚本会自动检测当前目标三元组，并生成对应文件名。
+这条脚本会自动检测当前目标三元组，并生成对应文件名。
+
+Windows 使用：
+
+```powershell
+npm run backend:bundle:windows
+```
+
+Windows 默认生成：
+
+```text
+src-tauri/binaries/novel-backend-x86_64-pc-windows-msvc.exe
+```

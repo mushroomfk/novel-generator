@@ -102,6 +102,7 @@ flowchart LR
 
 - 已可本地运行前端、Python backend 和 Tauri 桌面壳
 - 已验证 macOS arm64 调试包和测试分发流程
+- Windows 安装包可通过 GitHub Actions 手动流程生成，仍需要 Windows 实机安装和卸载验收
 - 后端单测覆盖项目服务、生成服务、资料导入、许可证、技能流程和记忆系统
 - 浏览器层 UI smoke 覆盖建作品、写章节、Agent 计划执行、整书架构和技能检索主链路
 - 正式分发仍需要补充 Developer ID 签名、公证、安装包渠道和版本升级策略
@@ -114,6 +115,7 @@ flowchart LR
 - `npm 10+`
 - `Python 3.12`
 - macOS 桌面打包建议安装 Xcode Command Line Tools
+- Windows 桌面打包建议使用 GitHub Actions 的 `Windows Desktop Release` 工作流；本机打包需要 Rust MSVC 工具链和 Visual Studio Build Tools
 
 安装依赖：
 
@@ -182,7 +184,9 @@ Embedding 检索可单独配置：
 | `npm run verify` | 执行 backend 单测和前端构建 |
 | `npm run verify:ui` | 运行浏览器层 smoke |
 | `npm run backend:bundle` | 打包 Python sidecar |
+| `npm run backend:bundle:windows` | 在 Windows 打包 Python sidecar |
 | `npm run verify:desktop` | 检查桌面发布链路 |
+| `npm run verify:desktop:windows` | 在 Windows 检查 sidecar 和安装包构建链路 |
 | `npm run verify:release` | 执行 UI smoke 和桌面发布检查 |
 | `npm run docs:screenshots` | 生成 README 演示截图 |
 
