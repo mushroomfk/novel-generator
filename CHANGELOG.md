@@ -119,8 +119,8 @@
 
 ### Windows 安装包 CI 打包通道
 
-- 修改摘要：新增手动触发的 `Windows Desktop Release` GitHub Actions 工作流；补充 Windows PowerShell 版 sidecar 打包脚本和发布验证脚本；新增 `backend:test:windows`、`backend:bundle:windows`、`verify:desktop:windows` 命令；补充 Windows 打包说明和 README 状态说明。
-- 影响范围：Windows 安装包生成流程、CI 产物上传、Windows sidecar `novel-backend-x86_64-pc-windows-msvc.exe`、发布文档和常用命令；不改变应用接口、运行时数据结构或 macOS 打包流程。
+- 修改摘要：新增手动触发的 `Windows Desktop Release` GitHub Actions 工作流；补充 Windows PowerShell 版 sidecar 打包脚本和发布验证脚本；新增 `backend:test:windows`、`backend:bundle:windows`、`verify:desktop:windows` 命令；补充 Windows 打包说明和 README 状态说明；Windows 单测临时目录清理忽略 SQLite 文件锁清理错误。
+- 影响范围：Windows 安装包生成流程、CI 产物上传、Windows sidecar `novel-backend-x86_64-pc-windows-msvc.exe`、发布文档、常用命令和 Windows 测试清理行为；不改变应用接口、运行时数据结构或 macOS 打包流程。
 - 验证结果：`npm run verify` 通过，包含 143 个 backend 用例和前端生产构建；`git diff --check` 通过；`package.json` JSON 解析通过；`.github/workflows/windows-release.yml` YAML 解析通过；`npm run verify:desktop:windows` 未在本机执行，当前环境是 macOS arm64，不是 Windows runner。
 
 ## 2026-05-04
