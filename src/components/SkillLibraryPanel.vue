@@ -15,6 +15,7 @@ import {
   getCharacterReplicaProfile,
   getProjectDetail,
   getProjectFileContent,
+  getSelfEvolutionReport,
   getPromptHistory,
   getPromptPresetDetail,
   getStudioLogs,
@@ -168,6 +169,9 @@ const batchForm = reactive({
   instruction: '',
   styleName: '',
   xpPreset: '',
+  taskId: '',
+  retryFailed: false,
+  comment: '',
 });
 
 const continueForm = reactive({
@@ -237,6 +241,19 @@ const canImportWebResearchResult = computed(() => Boolean(
   && webResearchResult.value?.provider !== 'none'
 ));
 
+function webResearchProviderLabel(provider) {
+  if (!provider || provider === 'none') {
+    return '未完成';
+  }
+  if (provider === 'aliyun-bailian') {
+    return '阿里百炼联网搜索';
+  }
+  if (provider === 'bocha') {
+    return '博查联网搜索';
+  }
+  return '国内联网搜索';
+}
+
 const readerChapterId = ref('');
 
 const filesState = reactive({
@@ -254,6 +271,10 @@ const promptHistoryState = reactive({
   search: '',
   records: [],
   total: 0,
+});
+
+const selfEvolutionState = reactive({
+  report: null,
 });
 
 const promptPresetState = reactive({
@@ -761,6 +782,10 @@ async function loadToolData(tool) {
     await refreshPromptHistory();
     return;
   }
+  if (panel === 'self-evolution') {
+    await refreshSelfEvolution();
+    return;
+  }
   if (panel === 'file-browser' && props.project?.id) {
     await refreshFiles();
     return;
@@ -781,6 +806,9 @@ onMounted(() => {
 function handleStreamEvent(event) {
   if (event.event === 'started' && event.data && typeof event.data === 'object') {
     toolTaskId.value = event.data.task_id ?? '';
+    if (activeToolPanelKey.value === 'batch-generate' && event.data.task_id) {
+      batchForm.taskId = String(event.data.task_id);
+    }
     return;
   }
   if (event.event === 'progress' && event.data && typeof event.data === 'object') {
@@ -1116,6 +1144,9 @@ async function handleBatchRun() {
       instruction: batchForm.instruction.trim(),
       style_name: batchForm.styleName.trim(),
       xp_preset: batchForm.xpPreset.trim(),
+      task_id: batchForm.taskId.trim(),
+      retry_failed: batchForm.retryFailed,
+      comment: batchForm.comment.trim(),
     },
     refreshProjectDetail,
   );
@@ -1463,7 +1494,7 @@ async function runWebResearch() {
     if (webResearchResult.value?.warning) {
       setToolMessage(webResearchResult.value.warning, 'error');
     } else {
-      setToolMessage(`已完成 ${webResearchResult.value?.provider === 'bocha' ? '博查' : '国内'}联网考据`);
+      setToolMessage(`已完成${webResearchProviderLabel(webResearchResult.value?.provider)}考据`);
     }
   } catch (error) {
     setToolMessage(error instanceof Error ? error.message : '联网考据失败', 'error');
@@ -1487,7 +1518,7 @@ function buildWebResearchMaterial(result = webResearchResult.value) {
   return [
     `# 联网考据：${result.query}`,
     '',
-    `搜索源：${result.provider || '未完成'}`,
+    `搜索源：${webResearchProviderLabel(result.provider)}`,
     result.warning ? `提示：${result.warning}` : '',
     '',
     '## 研究简报',
@@ -1590,6 +1621,31 @@ async function handleClearPromptHistory() {
   await clearPromptHistory();
   await refreshPromptHistory();
   setToolMessage('Prompt 历史已清空');
+}
+
+function selfEvolutionKindLabel(kind) {
+  return {
+    skill: '技能候选',
+    prompt: 'Prompt 样本',
+    memory: '记忆候选',
+    review: '章节评测',
+  }[kind] ?? kind;
+}
+
+function curationStatusLabel(status) {
+  return {
+    active: '保留',
+    stale: '待复查',
+    archive_candidate: '可归档',
+  }[status] ?? status;
+}
+
+async function refreshSelfEvolution() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  selfEvolutionState.report = await getSelfEvolutionReport(props.project.id);
 }
 
 function resetPromptPresetDraft() {
@@ -2503,13 +2559,33 @@ async function handleStyleReferenceFilesSelected(event) {
                   </select>
                 </label>
               </div>
+              <div class="two-column-grid">
+                <label class="form-field">
+                  <span>任务 ID</span>
+                  <input v-model="batchForm.taskId">
+                </label>
+                <label class="checkbox-field form-checkbox-field">
+                  <input
+                    v-model="batchForm.retryFailed"
+                    type="checkbox"
+                  >
+                  <span>失败章节重试</span>
+                </label>
+              </div>
+              <label class="form-field">
+                <span>人工评论</span>
+                <textarea
+                  v-model="batchForm.comment"
+                  rows="2"
+                />
+              </label>
               <button
                 :disabled="isToolRunning"
                 class="primary-button"
                 type="button"
                 @click="handleBatchRun"
               >
-                {{ isToolRunning ? '批量处理中…' : '开始批量生成' }}
+                {{ isToolRunning ? '批量处理中…' : (batchForm.taskId.trim() ? '继续批量任务' : '开始批量生成') }}
               </button>
             </div>
           </template>
@@ -3135,6 +3211,23 @@ async function handleStyleReferenceFilesSelected(event) {
                 >
                   清空历史
                 </button>
+              </div>
+            </div>
+          </template>
+          <template v-else-if="activeToolPanelKey === 'self-evolution'">
+            <div class="field-stack">
+              <div class="subpanel">
+                <div class="subpanel-head">
+                  <h4>进化报告</h4>
+                  <button
+                    class="secondary-button small-button"
+                    type="button"
+                    @click="refreshSelfEvolution"
+                  >
+                    刷新
+                  </button>
+                </div>
+                <p>报告只生成候选建议；记忆和技能写入仍需人工确认。</p>
               </div>
             </div>
           </template>
@@ -3997,7 +4090,7 @@ async function handleStyleReferenceFilesSelected(event) {
                 <div class="subpanel-head">
                   <div>
                     <h4>{{ webResearchResult.query }}</h4>
-                    <p>{{ webResearchResult.provider === 'bocha' ? '博查联网搜索' : '国内联网搜索' }}</p>
+                    <p>{{ webResearchProviderLabel(webResearchResult.provider) }}</p>
                   </div>
                   <button
                     :disabled="!canImportWebResearchResult"
@@ -4115,6 +4208,83 @@ async function handleStyleReferenceFilesSelected(event) {
                   <pre class="mini-pre">{{ item.prompt }}</pre>
                 </article>
               </div>
+            </div>
+          </template>
+          <template v-else-if="activeToolPanelKey === 'self-evolution'">
+            <div class="result-shell">
+              <template v-if="selfEvolutionState.report">
+                <div class="detail-pills">
+                  <span class="overview-pill">候选 {{ selfEvolutionState.report.candidates?.length ?? 0 }}</span>
+                  <span class="overview-pill">学习记录 {{ selfEvolutionState.report.learning_review_count ?? 0 }}</span>
+                  <span class="overview-pill">轨迹 {{ selfEvolutionState.report.trajectory_count ?? 0 }}</span>
+                  <span class="overview-pill">Prompt 失败 {{ selfEvolutionState.report.prompt_failure_count ?? 0 }}</span>
+                </div>
+
+                <section>
+                  <div class="subpanel-head">
+                    <h4>候选建议</h4>
+                  </div>
+                  <div
+                    v-if="selfEvolutionState.report.candidates?.length"
+                    class="issue-list"
+                  >
+                    <article
+                      v-for="item in selfEvolutionState.report.candidates"
+                      :key="item.id"
+                      class="issue-card"
+                    >
+                      <strong>{{ item.title }}</strong>
+                      <p>{{ selfEvolutionKindLabel(item.kind) }} · 置信度 {{ Math.round((item.confidence ?? 0) * 100) }}%</p>
+                      <p>{{ item.summary }}</p>
+                      <ul
+                        v-if="item.evidence?.length"
+                        class="plain-list"
+                      >
+                        <li
+                          v-for="evidence in item.evidence"
+                          :key="`${item.id}-${evidence}`"
+                        >
+                          {{ evidence }}
+                        </li>
+                      </ul>
+                      <p v-if="item.recommendation">
+                        建议：{{ item.recommendation }}
+                      </p>
+                    </article>
+                  </div>
+                  <p
+                    v-else
+                    class="empty-result-copy"
+                  >
+                    当前没有新的经验候选或失败样本。
+                  </p>
+                </section>
+
+                <section>
+                  <div class="subpanel-head">
+                    <h4>技能维护</h4>
+                    <span>{{ selfEvolutionState.report.skill_curation?.total ?? 0 }} 个技能</span>
+                  </div>
+                  <div class="issue-list">
+                    <article
+                      v-for="item in (selfEvolutionState.report.skill_curation?.items ?? []).slice(0, 12)"
+                      :key="item.skill_id"
+                      class="issue-card"
+                    >
+                      <strong>{{ item.name }}</strong>
+                      <p>{{ curationStatusLabel(item.status) }} · 使用 {{ item.usage_count ?? 0 }} 次 · 沉淀 {{ item.materialized_count ?? 0 }} 次</p>
+                      <p>{{ item.reason }}</p>
+                      <p>{{ item.suggestion }}</p>
+                    </article>
+                  </div>
+                </section>
+              </template>
+              <p
+                v-else
+                class="empty-result-copy"
+              >
+                打开报告后，会显示经验候选、失败样本和技能维护建议。
+              </p>
             </div>
           </template>
           <template v-else-if="activeToolPanelKey === 'conversation-skill'">
@@ -4537,6 +4707,11 @@ textarea {
 .checkbox-field input {
   width: auto;
   margin: 0;
+}
+
+.form-checkbox-field {
+  min-height: 38px;
+  align-self: end;
 }
 
 .detail-pills,

@@ -9,11 +9,20 @@ from unittest.mock import patch
 
 from novel_backend.config import Settings
 from novel_backend.models import (
+  AppConfigUpdateRequest,
   AgentChatRequest,
   AgentMessage,
+  AgentThreadMessage,
+  AgentThreadRecord,
+  AgentThreadStoreUpdateRequest,
   AgentPlan,
   AgentPlanAction,
+  BrainstormResult,
   ChapterGenerateResult,
+  ChapterAutoRepairConfig,
+  ChapterReviewDimension,
+  ChapterReviewIssue,
+  ChapterReviewReport,
   ChapterRewriteResult,
   ChapterUpdateRequest,
   CreateProjectRequest,
@@ -26,6 +35,7 @@ from novel_backend.services.agent_trajectory_service import get_agent_trajectory
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.project_service import (
   create_project,
+  save_project_agent_threads,
   get_project_detail,
   import_project_knowledge,
   update_chapter_content,
@@ -151,7 +161,59 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["plan"]["actions"][0]["task_pack_kind"], "architecture")
     self.assertEqual(result_event[1]["plan"]["actions"][1]["kind"], "chapter_generate")
     self.assertEqual(result_event[1]["plan"]["actions"][1]["task_pack_kind"], "continuation")
+    self.assertEqual(result_event[1]["plan"]["actions"][1]["target_words"], 3500)
     self.assertIn("计划步骤：", result_event[1]["reply"])
+
+  def test_write_request_respects_explicit_word_count(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="续写这一章，写1000字。")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    chapter_action = next(item for item in result_event[1]["plan"]["actions"] if item["kind"] == "chapter_generate")
+    self.assertEqual(chapter_action["target_words"], 1000)
+
+  def test_write_request_full_chapter_uses_remaining_project_capacity(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="把这一章扩成完整章。")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    chapter_action = next(item for item in result_event[1]["plan"]["actions"] if item["kind"] == "chapter_generate")
+    self.assertGreaterEqual(chapter_action["target_words"], 9_000)
+    self.assertLessEqual(chapter_action["target_words"], 10_000)
 
   def test_empty_project_can_start_architecture_plan_from_execution_panel(self) -> None:
     events = asyncio.run(
@@ -573,6 +635,47 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(trajectories[0]["status"], "completed")
     self.assertEqual(trajectories[0]["project_id"], self.project.id)
 
+  def test_agent_session_recovers_relevant_chunks_from_long_thread_message(self) -> None:
+    long_content = "开头。" + ("潮声里反复出现旧码头的铜钥匙。" * 520) + "星核密钥藏在第七层钟楼。结尾。"
+    self.assertGreater(len(long_content), 6000)
+    save_project_agent_threads(
+      self.settings,
+      self.project.id,
+      AgentThreadStoreUpdateRequest(
+        active_thread_id="thread-long",
+        threads=[
+          AgentThreadRecord(
+            id="thread-long",
+            title="长线程",
+            preview="长线程预览",
+            updated_at="2026-05-15T12:00:00+00:00",
+            messages=[AgentThreadMessage(id="message-long", role="user", content=long_content)],
+          )
+        ],
+      ),
+    )
+
+    def fake_brainstorm(_settings, request, _task_id):
+      self.assertIn("第七层钟楼", request.extra_context)
+      return BrainstormResult(task_id="brainstorm-task", reply="已读取长线程片段。")
+
+    with patch("novel_backend.services.agent_service._generate_brainstorm", side_effect=fake_brainstorm):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              thread_id="thread-long",
+              messages=[AgentMessage(id="message-long", role="user", content="聊聊星核密钥")],
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertEqual(result_event[1]["reply"], "已读取长线程片段。")
+
   def test_approved_plan_executes_and_updates_chapter(self) -> None:
     plan = AgentPlan(
       id="plan-test",
@@ -623,10 +726,210 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["mode"], "execution")
     self.assertIn("已经生成并写回项目", result_event[1]["reply"])
     self.assertIn("已更新第 1 章《第一章 雨夜靠港》正文", result_event[1]["changes"])
+    self.assertTrue(any("章节核验：" in item for item in result_event[1]["changes"]))
+    chapter_artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "chapter_content")
+    self.assertIn("review_score", chapter_artifact["metadata"])
 
     detail = get_project_detail(self.settings, self.project.id)
     chapter = next(item for item in detail.chapters if item.id == "chapter-001")
     self.assertIn("他把钥匙塞进口袋", chapter.content)
+
+  def test_approved_plan_auto_repairs_low_review_score(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(
+          api_key="test-key",
+          base_url="https://example.com/v1",
+          model_name="demo-model",
+        ),
+        chapter_auto_repair=ChapterAutoRepairConfig(max_rounds=2),
+      ),
+    )
+    plan = AgentPlan(
+      id="plan-auto-repair",
+      title="续写第 1 章",
+      summary="写正文并根据核验修订。",
+      requires_confirmation=True,
+      steps=["续写第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="chapter_generate",
+          label="续写第 1 章",
+          chapter_id="chapter-001",
+          instruction="保留港口追兵压力。",
+          target_words=1200,
+        )
+      ],
+    )
+    risk_review = ChapterReviewReport(
+      chapter_id="chapter-001",
+      chapter_index=1,
+      chapter_title="第一章 雨夜靠港",
+      engine="test",
+      status="risk",
+      overall_score=52,
+      summary="冲突压力不足，章末悬念偏弱。",
+      dimensions=[
+        ChapterReviewDimension(
+          id="structure",
+          label="结构与节奏",
+          score=50,
+          status="risk",
+          summary="压力推进不足。",
+          issues=[
+            ChapterReviewIssue(level="warning", title="冲突抬升不够", detail="追兵没有形成明确阻力。"),
+          ],
+        )
+      ],
+    )
+    second_risk_review = risk_review.model_copy(
+      update={
+        "overall_score": 61,
+        "summary": "追兵压力有所加强，但结尾问题仍不足。",
+      }
+    )
+    good_review = ChapterReviewReport(
+      chapter_id="chapter-001",
+      chapter_index=1,
+      chapter_title="第一章 雨夜靠港",
+      engine="test",
+      status="good",
+      overall_score=88,
+      summary="压力和章末悬念已经补足。",
+      dimensions=[
+        ChapterReviewDimension(
+          id="structure",
+          label="结构与节奏",
+          score=88,
+          status="good",
+          summary="冲突更清楚。",
+        )
+      ],
+    )
+
+    with patch(
+      "novel_backend.services.agent_service._generate_chapter",
+      return_value=ChapterGenerateResult(
+        task_id="chapter-generate-task",
+        headline="正文已生成",
+        summary="这一版先写钥匙出场。",
+        content="# 第一章 雨夜靠港\n林追把钥匙塞进口袋，雨声淹过码头。\n",
+        next_action="继续收紧追兵视角。",
+      ),
+    ), patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=[risk_review, second_risk_review, good_review],
+    ), patch(
+      "novel_backend.services.chapter_auto_repair_service._invoke_model",
+      side_effect=[
+        json.dumps(
+          {
+            "summary": "先补强追兵阻力。",
+            "changes": ["让追兵贴近仓库门"],
+            "revised_content": "# 第一章 雨夜靠港\n林追把钥匙塞进口袋，雨声淹过码头。仓库门外的脚步停住，探照灯贴着门缝扫进来。\n",
+          },
+          ensure_ascii=False,
+        ),
+        json.dumps(
+          {
+            "summary": "再补上章末悬念。",
+            "changes": ["章末保留钥匙异动"],
+            "revised_content": "# 第一章 雨夜靠港\n林追把钥匙塞进口袋，雨声淹过码头。仓库门外的脚步停住，探照灯贴着门缝扫进来。\n钥匙忽然在掌心发热。\n",
+          },
+          ensure_ascii=False,
+        ),
+      ],
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="续写这一章"),
+                AgentMessage(role="assistant", content="先写正文"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("自动修订", result_event[1]["reply"])
+    self.assertIn("自动修订 2 轮", result_event[1]["reply"])
+    self.assertTrue(any("自动修订" in item for item in result_event[1]["changes"]))
+    chapter_artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "chapter_content")
+    self.assertTrue(chapter_artifact["metadata"]["review_auto_repair_applied"])
+    self.assertEqual(chapter_artifact["metadata"]["review_auto_repair_rounds_applied"], 2)
+    self.assertEqual(chapter_artifact["metadata"]["review_score"], 88)
+    self.assertIn("钥匙忽然在掌心发热", chapter_artifact["content_preview"])
+
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertIn("钥匙忽然在掌心发热", chapter.content)
+
+  def test_approved_plan_reports_chapter_review_failure(self) -> None:
+    plan = AgentPlan(
+      id="plan-review-failure",
+      title="续写第 1 章",
+      summary="写正文并写回。",
+      requires_confirmation=True,
+      steps=["续写第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="chapter_generate",
+          label="续写第 1 章",
+          chapter_id="chapter-001",
+          instruction="让追兵靠近。",
+          target_words=1200,
+        )
+      ],
+    )
+
+    with patch(
+      "novel_backend.services.agent_service._generate_chapter",
+      return_value=ChapterGenerateResult(
+        task_id="chapter-generate-task",
+        headline="正文已生成",
+        summary="追兵已经靠近。",
+        content="# 第一章 雨夜靠港\n林追刚扣好门闩，外面的白光就贴上了窗。\n",
+        next_action="重新核验本章。",
+      ),
+    ), patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=RuntimeError("review offline"),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="续写这一章"),
+                AgentMessage(role="assistant", content="写回正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("章节已保存，但核验失败", result_event[1]["reply"])
+    self.assertTrue(any("review offline" in item for item in result_event[1]["changes"]))
+    self.assertIn("重新运行章节核验。", result_event[1]["suggestions"])
+
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertIn("白光就贴上了窗", chapter.content)
 
   def test_approved_plan_injects_active_custom_skill_into_chapter_generation(self) -> None:
     self._write_custom_skill(
@@ -752,6 +1055,338 @@ class AgentServiceTestCase(unittest.TestCase):
     learning_artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "learning_review")
     self.assertEqual(learning_artifact["metadata"]["skill_candidate_count"], 1)
 
+  def test_rewrite_auto_completes_when_model_overclaims_length(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+    )
+    plan = AgentPlan(
+      id="plan-rewrite-length",
+      title="重写第 1 章",
+      summary="按要求修订正文。",
+      requires_confirmation=True,
+      steps=["修订第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="修订第 1 章",
+          chapter_id="chapter-001",
+          mode="finalize",
+          instruction="重写第一章",
+        )
+      ],
+    )
+    good_review = ChapterReviewReport(
+      chapter_id="chapter-001",
+      chapter_index=1,
+      chapter_title="第一章",
+      engine="test",
+      status="good",
+      overall_score=86,
+      summary="正文保存后可继续扩展。",
+      dimensions=[
+        ChapterReviewDimension(
+          id="structure",
+          label="结构与节奏",
+          score=86,
+          status="good",
+          summary="基本顺畅。",
+        )
+      ],
+    )
+    completed_text = "# 第一章\n" + ("追兵逼近。" * 2000)
+    captured_completion_target = 0
+
+    def fake_completion(_settings, **kwargs):
+      nonlocal captured_completion_target
+      captured_completion_target = int(kwargs.get("target_words") or 0)
+      return {
+        "headline": "章节已补足",
+        "summary": "已接续短稿补足章节容量。",
+        "content": completed_text,
+        "next_action": "复查本章。",
+        "scenes": [],
+        "checklist": [],
+      }
+
+    with patch(
+      "novel_backend.services.agent_service._rewrite_chapter",
+      return_value=ChapterRewriteResult(
+        task_id="rewrite-task",
+        headline="已处理",
+        summary="少年在旧码头遭遇追兵，章节主事件已整理。",
+        original="# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
+        revised="# 第一章\n旧码头重新亮灯，林追把铜钥匙塞进口袋，听见门外有人停步。\n",
+        changes=[
+          "将原约2000字短稿扩展为完整章节（约15000字），严格遵循上、中、下三段结构。",
+          "新增追兵逼近和铜钥匙异动。",
+        ],
+      ),
+    ), patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      return_value=good_review,
+    ), patch(
+      "novel_backend.services.agent_service._run_continuation_pipeline",
+      side_effect=fake_completion,
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="重写第一章"),
+                AgentMessage(role="assistant", content="修订正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("自动续写补足章节容量", result_event[1]["reply"])
+    self.assertIn("保存校验", result_event[1]["reply"])
+    self.assertNotIn("约15000字", result_event[1]["reply"])
+    self.assertIn("新增追兵逼近", result_event[1]["reply"])
+    self.assertGreater(captured_completion_target, 0)
+
+    artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
+    self.assertEqual(artifact["metadata"]["length_status"], "checked")
+    self.assertTrue(artifact["metadata"]["length_completion_applied"])
+    self.assertLessEqual(captured_completion_target, 4500)
+    self.assertGreaterEqual(
+      artifact["metadata"]["saved_word_count"],
+      int(artifact["metadata"]["length_target_words"] * 0.9),
+    )
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertEqual(chapter.content, completed_text)
+
+  def test_rewrite_restores_original_when_length_completion_fails_before_any_saved_chunk(self) -> None:
+    original_content = "# 第一章\n旧码头重新亮灯，主角被迫回港。\n"
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content=original_content),
+    )
+    plan = AgentPlan(
+      id="plan-rewrite-length-fail",
+      title="重写第 1 章",
+      summary="按要求修订正文。",
+      requires_confirmation=True,
+      steps=["修订第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="修订第 1 章",
+          chapter_id="chapter-001",
+          mode="finalize",
+          instruction="重写第一章",
+        )
+      ],
+    )
+
+    with patch(
+      "novel_backend.services.agent_service._rewrite_chapter",
+      return_value=ChapterRewriteResult(
+        task_id="rewrite-task",
+        headline="已处理",
+        summary="少年在旧码头遭遇追兵，章节主事件已整理。",
+        original=original_content,
+        revised="# 第一章\n旧码头重新亮灯，林追把铜钥匙塞进口袋，听见门外有人停步。\n",
+        changes=["新增追兵逼近。"],
+      ),
+    ), patch(
+      "novel_backend.services.agent_service._run_continuation_pipeline",
+      side_effect=RuntimeError("模型请求超时"),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="重写第一章"),
+                AgentMessage(role="assistant", content="修订正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("自动续写补足章节容量失败", result_event[1]["reply"])
+    self.assertIn("已恢复本轮改稿前正文", result_event[1]["reply"])
+    artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
+    self.assertTrue(artifact["metadata"]["length_completion_attempted"])
+    self.assertFalse(artifact["metadata"]["length_completion_applied"])
+    self.assertTrue(artifact["metadata"]["length_completion_restored_original"])
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertEqual(chapter.content, original_content)
+
+  def test_rewrite_restores_empty_original_when_length_completion_fails(self) -> None:
+    original_content = ""
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content=original_content),
+    )
+    plan = AgentPlan(
+      id="plan-rewrite-empty-length-fail",
+      title="重写第 1 章",
+      summary="按要求修订正文。",
+      requires_confirmation=True,
+      steps=["修订第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="修订第 1 章",
+          chapter_id="chapter-001",
+          mode="finalize",
+          instruction="重写第一章",
+        )
+      ],
+    )
+
+    with patch(
+      "novel_backend.services.agent_service._rewrite_chapter",
+      return_value=ChapterRewriteResult(
+        task_id="rewrite-task",
+        headline="已处理",
+        summary="少年在旧码头遭遇追兵，章节主事件已整理。",
+        original=original_content,
+        revised="# 第一章\n旧码头重新亮灯，林追把铜钥匙塞进口袋，听见门外有人停步。\n",
+        changes=["新增追兵逼近。"],
+      ),
+    ), patch(
+      "novel_backend.services.agent_service._run_continuation_pipeline",
+      side_effect=RuntimeError("模型请求超时"),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="重写第一章"),
+                AgentMessage(role="assistant", content="修订正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("自动续写补足章节容量失败", result_event[1]["reply"])
+    artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
+    self.assertFalse(artifact["metadata"]["length_completion_applied"])
+    self.assertTrue(artifact["metadata"]["length_completion_restored_original"])
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertEqual(chapter.content, original_content)
+
+  def test_rewrite_restores_original_when_length_completion_fails_after_partial_chunk(self) -> None:
+    original_content = "# 第一章\n旧码头重新亮灯，主角被迫回港。\n"
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content=original_content),
+    )
+    plan = AgentPlan(
+      id="plan-rewrite-length-partial-fail",
+      title="重写第 1 章",
+      summary="按要求修订正文。",
+      requires_confirmation=True,
+      steps=["修订第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="修订第 1 章",
+          chapter_id="chapter-001",
+          mode="finalize",
+          instruction="重写第一章",
+        )
+      ],
+    )
+    partial_text = "# 第一章\n" + ("追兵逼近。" * 500)
+    calls = 0
+
+    def fake_completion(_settings, **_kwargs):
+      nonlocal calls
+      calls += 1
+      if calls == 1:
+        return {
+          "headline": "章节继续扩写",
+          "summary": "先补一段追兵压力。",
+          "content": partial_text,
+          "next_action": "继续补足。",
+          "scenes": [],
+          "checklist": [],
+        }
+      raise RuntimeError("模型请求超时")
+
+    with patch(
+      "novel_backend.services.agent_service._rewrite_chapter",
+      return_value=ChapterRewriteResult(
+        task_id="rewrite-task",
+        headline="已处理",
+        summary="少年在旧码头遭遇追兵，章节主事件已整理。",
+        original=original_content,
+        revised="# 第一章\n旧码头重新亮灯，林追把铜钥匙塞进口袋，听见门外有人停步。\n",
+        changes=["新增追兵逼近。"],
+      ),
+    ), patch(
+      "novel_backend.services.agent_service._run_continuation_pipeline",
+      side_effect=fake_completion,
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="重写第一章"),
+                AgentMessage(role="assistant", content="修订正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("自动续写补足章节容量失败", result_event[1]["reply"])
+    self.assertIn("已恢复本轮改稿前正文", result_event[1]["reply"])
+    artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
+    self.assertEqual(artifact["metadata"]["length_completion_rounds_applied"], 1)
+    self.assertFalse(artifact["metadata"]["length_completion_applied"])
+    self.assertTrue(artifact["metadata"]["length_completion_restored_original"])
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertEqual(chapter.content, original_content)
+    self.assertNotIn("追兵逼近。" * 100, chapter.content)
+
   def test_approved_plan_executes_knowledge_review_before_architecture(self) -> None:
     plan = AgentPlan(
       id="plan-knowledge-review",
@@ -846,7 +1481,7 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(chapter_action["scene_location"], "旧码头仓库")
     self.assertEqual(chapter_action["time_constraint"], "涨潮前一小时")
 
-  def test_approved_chapter_generate_uses_single_partial_pipeline(self) -> None:
+  def test_approved_chapter_generate_emits_subtask_events(self) -> None:
     save_config(
       self.settings,
       ModelConfig(
@@ -877,66 +1512,14 @@ class AgentServiceTestCase(unittest.TestCase):
         )
       ],
     )
-    responses = [
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "继续承接仓库门外的危险。",
-                  "last_state": ["林追在仓库内，手里有铜钥匙"],
-                  "active_characters": ["林追"],
-                  "open_threads": ["门外白光逼近"],
-                  "next_beat": "让门外危险更近一步。",
-                  "hard_constraints": ["林追不能放下铜钥匙"],
-                  "avoid_conflicts": ["不要提前揭开钥匙用途"],
-                  "next_action": "继续写门外动静。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": "门缝里亮光一闪，林追把铜钥匙扣进掌心，听见墙外有人停住了呼吸。\n"
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "没有发现硬冲突。",
-                  "passed": True,
-                  "conflicts": [],
-                  "rewrite_focus": [],
-                  "next_action": "下一段让林追决定去留。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-    ]
-    captured_payloads: list[dict[str, object]] = []
-
-    def fake_request(_endpoint, _api_key, payload):
-      captured_payloads.append(payload)
-      index = min(len(captured_payloads) - 1, len(responses) - 1)
-      return responses[index]
-
     with patch(
-      "novel_backend.services.generation_service._request_chat_completion",
-      side_effect=fake_request,
+      "novel_backend.services.studio_service._run_continuation_pipeline",
+      return_value={
+        "headline": "章节初稿已生成",
+        "summary": "已并行生成 3 个候选并完成审校。",
+        "content": "# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n门缝里亮光一闪，林追把铜钥匙扣进掌心，听见墙外有人停住了呼吸。\n",
+        "next_action": "下一段让林追决定去留。",
+      },
     ):
       events = asyncio.run(
         collect_stream(
@@ -958,14 +1541,13 @@ class AgentServiceTestCase(unittest.TestCase):
 
     result_event = next(item for item in events if item[0] == "result")
     self.assertEqual(result_event[1]["mode"], "execution")
-    self.assertGreaterEqual(len(captured_payloads), 3)
-    self.assertTrue(captured_payloads[0]["enable_thinking"])
-    self.assertFalse(captured_payloads[1]["enable_thinking"])
-    self.assertTrue(captured_payloads[2]["enable_thinking"])
-    partial_payloads = [
-      item for item in captured_payloads if item["messages"][-1].get("partial")
-    ]
-    self.assertEqual(len(partial_payloads), 1)
+    subtask_started = [item for item in events if item[0] == "subtask_started"]
+    self.assertGreaterEqual(len(subtask_started), 4)
+    roles = [item[1]["role"] for item in subtask_started]
+    self.assertIn("写作 agent", roles)
+    self.assertIn("连续性审校 agent", roles)
+    self.assertIn("人物口气审校 agent", roles)
+    self.assertIn("可读性审校 agent", roles)
     detail = get_project_detail(self.settings, self.project.id)
     chapter = next(item for item in detail.chapters if item.id == "chapter-001")
     self.assertIn("门缝里亮光一闪", chapter.content)

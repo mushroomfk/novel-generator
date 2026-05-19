@@ -77,6 +77,50 @@ smoke_backend_binary() {
   rm -rf "$data_dir"
 }
 
+app_executable_path() {
+  local executable_name="$APP_NAME"
+  local plist="$APP_BUNDLE/Contents/Info.plist"
+
+  if [[ -f "$plist" ]] && [[ -x /usr/libexec/PlistBuddy ]]; then
+    executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null || printf '%s' "$APP_NAME")"
+  fi
+
+  printf '%s\n' "$APP_BUNDLE/Contents/MacOS/$executable_name"
+}
+
+smoke_app_launch() {
+  local app_executable
+  local log_file
+  local pid
+  local status
+
+  app_executable="$(app_executable_path)"
+  log_file="$BUILD_LOG_DIR/app-launch.log"
+
+  require_file "$app_executable"
+  if [[ ! -x "$app_executable" ]]; then
+    echo ".app 主程序没有执行权限: $app_executable" >&2
+    exit 1
+  fi
+
+  "$app_executable" >"$log_file" 2>&1 &
+  pid=$!
+
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || status=$?
+      status="${status:-0}"
+      echo ".app 启动后提前退出: ${status}" >&2
+      cat "$log_file" >&2 || true
+      exit 1
+    fi
+    sleep 0.5
+  done
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 log "运行 backend 回归"
 (cd "$ROOT_DIR" && npm run backend:test)
 
@@ -124,6 +168,9 @@ fi
 
 log "验证应用内 sidecar 健康检查"
 smoke_backend_binary "$APP_SIDECAR" "app-sidecar"
+
+log "验证 .app 启动"
+smoke_app_launch
 
 log "桌面版回归完成"
 printf 'app=%s\n' "$APP_BUNDLE"

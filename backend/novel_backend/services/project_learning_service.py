@@ -121,17 +121,15 @@ def _build_skill_candidates(
   latest_user = _latest_user_text(payload)
   if any(artifact.kind == "user_skill" for artifact in result.artifacts):
     return []
+  candidates: list[dict[str, object]] = []
 
   candidate_signals = [
     suggestion for suggestion in result.suggestions
     if "保存成用户技能" in suggestion or "用户技能" in suggestion
   ]
-  if not candidate_signals:
-    return []
-
-  content = _compact_text(latest_user or "本次形成了可复用流程。", 260)
-  return [
-    {
+  if candidate_signals:
+    content = _compact_text(latest_user or "本次形成了可复用流程。", 260)
+    candidates.append({
       "id": _candidate_id("skill", "用户技能候选", content),
       "kind": "skill",
       "title": "用户技能候选",
@@ -140,8 +138,50 @@ def _build_skill_candidates(
       "rationale": _compact_text(candidate_signals[0], 160),
       "confidence": 0.7,
       "status": "pending",
-    }
-  ]
+    })
+
+  for artifact in result.artifacts:
+    if artifact.kind not in {"chapter_content", "rewrite_report"}:
+      continue
+    metadata = artifact.metadata or {}
+    review_score = metadata.get("review_score")
+    auto_repair_applied = bool(metadata.get("review_auto_repair_applied"))
+    repair_summary = str(metadata.get("review_auto_repair_summary") or "").strip()
+    if not auto_repair_applied and not (isinstance(review_score, int) and review_score < 70):
+      continue
+    title = "章节低分修订经验"
+    content = _compact_text(
+      "\n".join(
+        item
+        for item in [
+          artifact.title,
+          artifact.summary,
+          repair_summary,
+          f"核验分数：{review_score}/100" if isinstance(review_score, int) else "",
+        ]
+        if item
+      ),
+      260,
+    )
+    if not content:
+      continue
+    candidates.append(
+      {
+        "id": _candidate_id("skill", title, content),
+        "kind": "skill",
+        "title": title,
+        "category": "写作技能",
+        "content": content,
+        "rationale": "章节核验或自动修订已经产生可复用的处理经验，适合由作者确认后沉淀成写作技能。",
+        "confidence": 0.78 if auto_repair_applied else 0.62,
+        "status": "pending",
+      }
+    )
+
+  unique: dict[str, dict[str, object]] = {}
+  for item in candidates:
+    unique[str(item["id"])] = item
+  return list(unique.values())[:4]
 
 
 def _build_risk_notes(traces: list[AgentExecutionTrace]) -> list[str]:

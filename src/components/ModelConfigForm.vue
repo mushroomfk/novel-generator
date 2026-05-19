@@ -50,6 +50,11 @@ const form = reactive({
     retrieval_k: 6,
     batch_size: 8,
   },
+  chapter_auto_repair: {
+    enabled: true,
+    score_threshold: 65,
+    max_rounds: 1,
+  },
 });
 
 const isSaving = ref(false);
@@ -144,6 +149,7 @@ watch(
       ...(nextConfig.embedding ?? {}),
       dimensions: nextConfig.embedding?.dimensions ?? '',
     });
+    Object.assign(form.chapter_auto_repair, nextConfig.chapter_auto_repair ?? {});
   },
   { immediate: true },
 );
@@ -164,6 +170,7 @@ async function save() {
     await updateModelConfig({
       model: { ...form.model },
       embedding: { ...autoEmbeddingConfig.value },
+      chapter_auto_repair: { ...form.chapter_auto_repair },
     });
     message.value = '写作设置已保存';
     emit('updated');
@@ -283,6 +290,41 @@ async function save() {
           <p class="field-helper">不需要单独再填 Embedding。保存写作模型后，知识检索会自动切到对应向量模型；API Key 默认跟随当前写作模型，留空时继续走环境变量。</p>
         </div>
 
+        <div class="section-label">
+          章节核验自动修订
+        </div>
+        <label class="switch-row">
+          <input
+            v-model="form.chapter_auto_repair.enabled"
+            type="checkbox"
+          />
+          <span>核验低分后自动修订</span>
+        </label>
+        <div class="grid two-columns">
+          <label>
+            <span>触发分数</span>
+            <input
+              v-model.number="form.chapter_auto_repair.score_threshold"
+              min="0"
+              max="100"
+              step="1"
+              type="number"
+            />
+          </label>
+
+          <label>
+            <span>最多修订轮数</span>
+            <input
+              v-model.number="form.chapter_auto_repair.max_rounds"
+              min="0"
+              max="3"
+              step="1"
+              type="number"
+            />
+          </label>
+        </div>
+        <small class="field-helper">状态为 risk 会直接触发；其他状态低于触发分数时触发。建议最多 1 到 2 轮，避免正文偏离原章节目标。</small>
+
         <p
           v-if="message"
           class="message"
@@ -373,6 +415,18 @@ async function save() {
 label {
   display: grid;
   gap: 8px;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.switch-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: #2563eb;
 }
 
 label > span {

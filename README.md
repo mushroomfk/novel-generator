@@ -2,7 +2,7 @@
 
 ![Status](https://img.shields.io/badge/status-public%20preview-2563eb)
 ![Stack](https://img.shields.io/badge/stack-Tauri%202%20%2B%20Vue%203%20%2B%20FastAPI-0f766e)
-![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20tested-111827)
+![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20tested%20%7C%20Windows%20CI-111827)
 ![License](https://img.shields.io/badge/license-custom-lightgrey)
 
 面向长篇小说创作的本地优先桌面工作台。
@@ -42,7 +42,7 @@
 | 长篇组织 | 以单次聊天或单篇正文为中心 | 以作品、章节、设定、资料、架构和连续性为中心 |
 | 生成过程 | 直接返回一段文本，后续需要手工整理 | 生成前有计划，生成后可预览、审阅、写回和查看历史 |
 | 资料使用 | 主要依赖复制粘贴上下文 | 支持导入多格式资料，使用 SQLite / FTS5、embedding 和 rerank 组合检索 |
-| 可追踪性 | 难还原一次生成使用了哪些资料和步骤 | Agent 讨论、资料分析、章节写作和整书架构共用执行时间线 |
+| 可追踪性 | 难还原一次生成使用了哪些资料和步骤 | Agent 讨论、资料分析、章节写作、审校子任务和整书架构共用执行时间线 |
 | 二次开发 | 多数是封闭产品或插件 | 前端、backend、桌面壳和回归脚本都在仓库内，适合继续改造 |
 
 ## 为什么值得关注
@@ -51,7 +51,7 @@
 - 面向长篇：围绕章节、设定、人物、资料、连续性和整书架构组织工作流
 - 可审阅生成：模型输出进入计划、执行、预览、写回和本地历史，不只是一段聊天回复
 - 资料可检索：导入文本、文档、网页、PDF 后建立 SQLite / FTS5 索引，并支持 embedding 与 rerank
-- Agent 有轨迹：讨论、资料分析、章节写作和整书架构共用执行时间线，结果可追溯
+- Agent 有轨迹：讨论、资料分析、章节写作、并行审校和整书架构共用执行时间线，结果可追溯
 - 可二次开发：前端、Python backend、Tauri 壳层和回归脚本都在仓库内
 
 ## 适合场景
@@ -66,14 +66,14 @@
 | 模块 | 能力 |
 | --- | --- |
 | 作品管理 | 创建、重命名、删除作品，打开本地作品目录 |
-| 章节工作台 | 编辑正文、自动保存、本地历史、章节概览、章节写回 |
+| 章节工作台 | 编辑正文、自动保存、本地历史、章节概览、章节写回和核验 |
 | 故事架构 | 生成整书架构、分步架构、蓝图和项目设定文件 |
 | 资料库 | 导入 `txt / md / json / csv / html / docx / pdf`，建立本地索引 |
 | 知识检索 | 关键词、embedding、rerank、作者参考库、联网考据 |
-| 写作技能 | 人物复刻、去 AI、文风参考、提示词预设、XP 预设、文件浏览 |
-| Agent 执行 | 讨论、资料分析、章节写作、整书架构、执行轨迹、经验候选 |
+| 写作技能 | 人物复刻、去 AI、文风参考、提示词预设、XP 预设、文件浏览、自我进化报告 |
+| Agent 执行 | 讨论、资料分析、章节写作、并行候选审校、可配置低分自动修订、整书架构、执行轨迹、经验候选、失败样本回看 |
 | 桌面运行 | Tauri 自动拉起本地 backend，并把实际 backend 地址下发给前端 |
-| 发布回归 | backend 单测、前端构建、浏览器 smoke、桌面 sidecar 打包检查 |
+| 发布回归 | backend 单测、前端构建、浏览器 smoke、桌面 sidecar 和 `.app` 启动检查 |
 
 ## 技术方案
 
@@ -83,8 +83,8 @@
 - 本地数据：作品文件、章节、设定和历史记录保存在作品目录；资料索引使用 `SQLite / FTS5`
 - 模型接入：使用 OpenAI-compatible `chat/completions`，可接入 OpenAI、DashScope、火山方舟等兼容服务
 - 检索增强：关键词检索、embedding、rerank 和联网考据可组合使用，适配资料库和作者参考库
-- 执行链路：Agent 计划、执行、进度、结果和错误状态通过 backend 统一管理，前端以流式状态展示
-- 发布验证：仓库保留 backend 单测、前端构建、浏览器 smoke、desktop sidecar 和 Tauri 打包检查脚本
+- 执行链路：Agent 计划、子任务进度、批量章节队列、结果、错误状态和自我进化候选通过 backend 统一管理，前端以流式状态展示
+- 发布验证：仓库保留 backend 单测、前端构建、浏览器 smoke、desktop sidecar、Tauri 打包和 `.app` 启动检查脚本
 
 ```mermaid
 flowchart LR
@@ -169,8 +169,9 @@ Embedding 检索可单独配置：
 - `NOVEL_API_KEY`
 - `OPENAI_API_KEY`
 
-联网考据使用博查 Web Search API：
+联网考据优先使用阿里百炼联网搜索，已配置阿里百炼写作模型时会复用当前模型 Key；也可以用 `DASHSCOPE_API_KEY` 提供。博查 Web Search API 是备用搜索源：
 
+- `DASHSCOPE_API_KEY`
 - `BOCHA_API_KEY`
 - `BOCHA_SEARCH_ENDPOINT`，可选，默认 `https://api.bochaai.com/v1/web-search`
 
@@ -185,10 +186,12 @@ Embedding 检索可单独配置：
 | `npm run verify:ui` | 运行浏览器层 smoke |
 | `npm run backend:bundle` | 打包 Python sidecar |
 | `npm run backend:bundle:windows` | 在 Windows 打包 Python sidecar |
-| `npm run verify:desktop` | 检查桌面发布链路 |
+| `npm run verify:desktop` | 检查桌面发布链路，包含 sidecar 和 `.app` 启动 |
 | `npm run verify:desktop:windows` | 在 Windows 检查 sidecar 和安装包构建链路 |
 | `npm run verify:release` | 执行 UI smoke 和桌面发布检查 |
 | `npm run docs:screenshots` | 生成 README 演示截图 |
+| `scripts/generate-license-keypair.py` | 生成离线许可证签发密钥 |
+| `scripts/create-license.py` | 使用私钥签发测试许可证 |
 
 ## 目录结构
 
@@ -216,7 +219,7 @@ Embedding 检索可单独配置：
 - 补充稳定的桌面安装包发布流程
 - 增加更多真实作品规模下的性能样本
 - 完善跨章节连续性检查和写回确认体验
-- 补充 Windows / Linux 桌面打包验证
+- 补充 Windows 实机安装卸载验收和 Linux 桌面打包验证
 - 补充演示视频和更完整的使用教程
 
 ## 许可

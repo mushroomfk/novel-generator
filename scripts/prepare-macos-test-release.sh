@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(node -e "const fs=require('fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); process.stdout.write(pkg.version)")"
 APP_NAME="稿匣"
 DMG_PATH="$ROOT_DIR/src-tauri/target/debug/bundle/dmg/${APP_NAME}_${VERSION}_aarch64.dmg"
-OUTPUT_DIR="$ROOT_DIR/dist/test-release/macos/${APP_NAME}_${VERSION}_测试包"
-INSTALL_GUIDE_SRC="$ROOT_DIR/macOS测试版安装说明.md"
-FEEDBACK_GUIDE_SRC="$ROOT_DIR/测试反馈清单.md"
+OUTPUT_DIR="$ROOT_DIR/release/test-release/macos/${APP_NAME}_${VERSION}_测试包"
+INSTALL_GUIDE_SRC="$ROOT_DIR/docs/macOS测试版安装说明.md"
+FEEDBACK_GUIDE_SRC="$ROOT_DIR/docs/测试反馈清单.md"
 
 if [[ ! -f "$DMG_PATH" ]]; then
   echo "缺少 dmg 产物：$DMG_PATH" >&2

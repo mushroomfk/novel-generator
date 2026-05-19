@@ -11,6 +11,8 @@ from fastapi import HTTPException
 from novel_backend.config import Settings
 from novel_backend.models import (
   BrainstormMessage,
+  SkillCurationItem,
+  SkillCurationReport,
   SkillBehavior,
   SkillCatalog,
   SkillItem,
@@ -29,7 +31,7 @@ from novel_backend.services.generation_service import (
   _string_list_from_keys,
 )
 from novel_backend.services.project_service import get_project_detail
-from novel_backend.utils.jsonfile import atomic_write_text, read_json
+from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 _USER_SKILL_SECTION_ID = "user-skills"
 _USER_SKILL_SECTION_TITLE = "用户沉淀"
@@ -107,6 +109,16 @@ def _default_skill_behavior(skill_id: str) -> SkillBehavior:
 
 def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(value: str) -> datetime | None:
+  text = str(value or "").strip()
+  if not text:
+    return None
+  try:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+  except ValueError:
+    return None
 
 
 def _ordered_unique(items: list[str]) -> list[str]:
@@ -306,6 +318,112 @@ def _iter_skill_records(settings: Settings) -> list[_SkillRecord]:
   return records
 
 
+def _skill_usage_path(settings: Settings) -> Path:
+  return skills_dir(settings) / ".skill_usage.json"
+
+
+def _load_skill_usage(settings: Settings) -> dict[str, dict[str, object]]:
+  payload = read_json(_skill_usage_path(settings), {})
+  if not isinstance(payload, dict):
+    return {}
+  result: dict[str, dict[str, object]] = {}
+  for key, value in payload.items():
+    if isinstance(value, dict):
+      result[str(key)] = value
+  return result
+
+
+def _save_skill_usage(settings: Settings, usage: dict[str, dict[str, object]]) -> None:
+  path = _skill_usage_path(settings)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(path, usage)
+
+
+def record_skill_usage(settings: Settings, skill_id: str, *, event: str = "used") -> None:
+  cleaned = skill_id.strip()
+  if not cleaned:
+    return
+  usage = _load_skill_usage(settings)
+  item = usage.get(cleaned, {})
+  now = _now_iso()
+  item["skill_id"] = cleaned
+  item["updated_at"] = str(item.get("updated_at") or now)
+  if event == "materialized":
+    item["materialized_count"] = int(item.get("materialized_count") or 0) + 1
+    item["last_materialized_at"] = now
+  else:
+    item["usage_count"] = int(item.get("usage_count") or 0) + 1
+    item["last_used_at"] = now
+  usage[cleaned] = item
+  _save_skill_usage(settings, usage)
+
+
+def _skill_curation_status(record: _SkillRecord, usage: dict[str, object]) -> tuple[str, str, str]:
+  if record.item.source == "builtin":
+    return "active", "内置技能默认保留。", "不需要维护。"
+
+  pinned = _as_bool(record.frontmatter.get("pinned") if record.frontmatter else None)
+  if pinned:
+    return "active", "技能已锁定。", "保持启用。"
+
+  usage_count = int(usage.get("usage_count") or 0)
+  materialized_count = int(usage.get("materialized_count") or 0)
+  updated_at = str(record.item.updated_at or usage.get("updated_at") or "")
+  updated_dt = _parse_iso(updated_at)
+  age_days = 0
+  if updated_dt is not None:
+    now = datetime.now(updated_dt.tzinfo or timezone.utc)
+    age_days = max(0, (now - updated_dt).days)
+
+  if usage_count > 0 or materialized_count > 0:
+    total_count = usage_count + materialized_count
+    return "active", f"近期使用 {total_count} 次。", "继续保留，后续根据实际任务迭代。"
+  if updated_dt is None:
+    return "stale", "缺少更新时间且暂时没有使用记录。", "建议补一次说明或确认是否仍然需要。"
+  if age_days >= 90:
+    return "archive_candidate", f"{age_days} 天没有使用记录。", "建议归档或合并到更常用的技能。"
+  if age_days >= 30:
+    return "stale", f"{age_days} 天没有使用记录。", "建议复查适用场景，必要时收窄边界。"
+  return "active", "技能还在观察期。", "保持启用。"
+
+
+def get_skill_curation_report(settings: Settings) -> SkillCurationReport:
+  usage_payload = _load_skill_usage(settings)
+  items: list[SkillCurationItem] = []
+  for record in _iter_skill_records(settings):
+    usage = usage_payload.get(record.item.id, {})
+    status, reason, suggestion = _skill_curation_status(record, usage)
+    pinned = _as_bool(record.frontmatter.get("pinned") if record.frontmatter else None)
+    items.append(
+      SkillCurationItem(
+        skill_id=record.item.id,
+        name=record.item.name,
+        source=record.item.source,
+        status=status,
+        pinned=pinned,
+        usage_count=int(usage.get("usage_count") or 0),
+        materialized_count=int(usage.get("materialized_count") or 0),
+        updated_at=str(record.item.updated_at or usage.get("updated_at") or ""),
+        last_used_at=str(usage.get("last_used_at") or ""),
+        reason=reason,
+        suggestion=suggestion,
+      )
+    )
+
+  items.sort(key=lambda item: ({"archive_candidate": 0, "stale": 1, "active": 2}.get(item.status, 3), item.name))
+  active_count = sum(1 for item in items if item.status == "active")
+  stale_count = sum(1 for item in items if item.status == "stale")
+  archive_count = sum(1 for item in items if item.status == "archive_candidate")
+  return SkillCurationReport(
+    generated_at=_now_iso(),
+    total=len(items),
+    active_count=active_count,
+    stale_count=stale_count,
+    archive_candidate_count=archive_count,
+    items=items,
+  )
+
+
 def _find_skill_record(settings: Settings, skill_id: str) -> _SkillRecord | None:
   target = skill_id.strip()
   if not target:
@@ -360,6 +478,7 @@ def get_custom_skill_prompt(settings: Settings, skill_id: str) -> str:
   skill_body = record.body.split("## 最近一次回归", 1)[0].strip()
   if not skill_body:
     return ""
+  record_skill_usage(settings, record.item.id, event="used")
   return (
     f"当前启用用户技能：{record.item.name}\n"
     f"技能说明：{record.item.description or '无'}\n"
@@ -951,6 +1070,7 @@ def materialize_skill(settings: Settings, payload: SkillMaterializeRequest) -> S
   final_record = _find_skill_record(settings, skill_id)
   if final_record is None:
     raise RuntimeError("技能二次写回后没有被目录识别")
+  record_skill_usage(settings, skill_id, event="materialized")
   action = "iterate" if existing_record is not None or payload.action == "iterate" else "create"
   message = f"已{'更新' if action == 'iterate' else '沉淀'}技能「{final_record.item.name}」。"
   return SkillMaterializeResult(

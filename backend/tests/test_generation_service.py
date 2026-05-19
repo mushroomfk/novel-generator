@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from novel_backend.config import Settings
@@ -14,6 +15,8 @@ from novel_backend.models import (
   ArchitectureStepRequest,
   ArchitectureWorkspace,
   ChapterWorkflowRequest,
+  ChapterWorkflowResult,
+  ChapterWorkflowScene,
   CreateProjectRequest,
   KnowledgeImportItem,
   KnowledgeImportRequest,
@@ -24,7 +27,15 @@ from novel_backend.models import (
 )
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.continuity_guard_service import build_continuity_guard_context
-from novel_backend.services.generation_service import architecture_step_stream, architecture_stream, chapter_workflow_stream
+from novel_backend.services.generation_service import (
+  _continuation_segment_targets,
+  _generate_continuation_candidates,
+  _judge_continuation,
+  _run_continuation_pipeline,
+  architecture_step_stream,
+  architecture_stream,
+  chapter_workflow_stream,
+)
 from novel_backend.services.project_service import create_project, get_project_detail, import_project_knowledge, run_project_dream, update_project_memory
 
 
@@ -603,7 +614,328 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertTrue(captured_payloads[0]["enable_thinking"])
     self.assertFalse(captured_payloads[1]["enable_thinking"])
     self.assertTrue(captured_payloads[2]["enable_thinking"])
+    self.assertEqual(captured_payloads[1]["max_tokens"], 11000)
     self.assertEqual(events[-1][1]["status"], "completed")
+
+  def test_continuation_segment_targets_are_balanced(self) -> None:
+    self.assertEqual(_continuation_segment_targets(5_500), [5_500])
+    self.assertEqual(_continuation_segment_targets(5_501), [2_751, 2_750])
+    self.assertEqual(_continuation_segment_targets(6_000), [3_000, 3_000])
+    self.assertEqual(_continuation_segment_targets(15_000), [5_000, 5_000, 5_000])
+    self.assertEqual(_continuation_segment_targets(30_000), [5_000, 5_000, 5_000, 5_000, 5_000, 5_000])
+
+  def test_run_continuation_pipeline_splits_oversized_target(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="长章分段",
+        genre="历史幻想",
+        target_chapters=4,
+        target_words=60000,
+      ),
+    )
+    project_dir = Path(project.path)
+    (project_dir / "chapters" / "001.md").write_text(
+      "# 第一章 葛陂以北\n石季龙在战场边缘听见黑石里的低语。\n",
+      encoding="utf-8",
+    )
+    detail = get_project_detail(self.settings, project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    fake_scene_result = ChapterWorkflowResult(
+      task_id="scene-task",
+      mode="draft",
+      headline="场景计划",
+      summary="按战后荒原、归营、营中异动推进。",
+      scenes=[
+        ChapterWorkflowScene(
+          title="战场余响",
+          goal="承接黑石低语",
+          conflict="兵魂煞气继续侵蚀",
+          turn="营地传来粮道消息",
+        )
+      ],
+    )
+    fake_plan = {
+      "bundle": SimpleNamespace(context_text="当前章节：石季龙刚吸收兵魂煞气。"),
+      "chapter": chapter,
+      "evidence_text": "证据：石勒已目睹异象。",
+      "evidence_hits": [],
+      "canon": {
+        "summary": "必须承接葛陂战后现场和石季龙身体代价。",
+        "must_keep": ["石季龙已吸收兵魂煞气"],
+        "current_state": ["二人正准备归营"],
+        "voice_rules": ["冷峻短句"],
+        "blocked_changes": ["不要解释铜雀伏笔"],
+        "next_action": "继续写营地压力。",
+      },
+      "scene_result": fake_scene_result,
+    }
+    partial_calls: list[dict[str, object]] = []
+    judge_calls: list[str] = []
+
+    def fake_partial(_settings, _messages, **kwargs):
+      partial_calls.append(kwargs)
+      return f"第 {len(partial_calls)} 小节正文继续推进。\n" + ("推进。" * 1700)
+
+    def fake_judge(_settings, **kwargs):
+      judge_calls.append(str(kwargs["content"]))
+      return {
+        "summary": "承接可用。",
+        "score": 90,
+        "passed": True,
+        "issues": [],
+        "rewrite_focus": [],
+        "next_action": "继续写下一段。",
+      }
+
+    with patch(
+      "novel_backend.services.generation_service._generate_continuation_plan",
+      return_value=fake_plan,
+    ) as plan_mock, patch(
+      "novel_backend.services.generation_service._invoke_partial_model",
+      side_effect=fake_partial,
+    ), patch(
+      "novel_backend.services.generation_service._judge_continuation",
+      side_effect=fake_judge,
+    ):
+      result = _run_continuation_pipeline(
+        self.settings,
+        project_id=project.id,
+        chapter_id="chapter-001",
+        instruction="按目标字数写完整章一万五千字。",
+        target_words=1_800,
+        support_text="",
+        candidate_count=1,
+      )
+
+    self.assertEqual(plan_mock.call_args.kwargs["target_words"], 15000)
+    self.assertEqual(result["segment_count"], 3)
+    self.assertEqual(result["segment_targets"], [5000, 5000, 5000])
+    self.assertEqual(len(partial_calls), 3)
+    self.assertEqual(len(judge_calls), 3)
+    self.assertIn("第 1 小节正文继续推进", result["content"])
+    self.assertIn("第 2 小节正文继续推进", result["content"])
+    self.assertIn("第 3 小节正文继续推进", result["content"])
+    self.assertIn("先规划 3 个小节", result["summary"])
+    self.assertEqual(
+      [item["task_name"] for item in partial_calls],
+      [
+        "chapter_generate:segment-01:partial:dialogue-pressure",
+        "chapter_generate:segment-02:partial:dialogue-pressure",
+        "chapter_generate:segment-03:partial:dialogue-pressure",
+      ],
+    )
+
+  def test_segmented_continuation_adds_sections_until_length_target(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="长章追加小节",
+        genre="历史幻想",
+        target_chapters=4,
+        target_words=60000,
+      ),
+    )
+    project_dir = Path(project.path)
+    (project_dir / "chapters" / "001.md").write_text(
+      "# 第一章 葛陂以北\n石季龙在战场边缘听见黑石里的低语。\n",
+      encoding="utf-8",
+    )
+    detail = get_project_detail(self.settings, project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    fake_scene_result = ChapterWorkflowResult(
+      task_id="scene-task",
+      mode="draft",
+      headline="场景计划",
+      summary="按战后荒原、归营、营中异动推进。",
+      scenes=[
+        ChapterWorkflowScene(
+          title="战场余响",
+          goal="承接黑石低语",
+          conflict="兵魂煞气继续侵蚀",
+          turn="营地传来粮道消息",
+        )
+      ],
+    )
+    fake_plan = {
+      "bundle": SimpleNamespace(context_text="当前章节：石季龙刚吸收兵魂煞气。"),
+      "chapter": chapter,
+      "evidence_text": "证据：石勒已目睹异象。",
+      "evidence_hits": [],
+      "canon": {
+        "summary": "必须承接葛陂战后现场和石季龙身体代价。",
+        "must_keep": ["石季龙已吸收兵魂煞气"],
+        "current_state": ["二人正准备归营"],
+        "voice_rules": ["冷峻短句"],
+        "blocked_changes": ["不要解释铜雀伏笔"],
+        "next_action": "继续写营地压力。",
+      },
+      "scene_result": fake_scene_result,
+    }
+    partial_calls: list[dict[str, object]] = []
+
+    def fake_partial(_settings, _messages, **kwargs):
+      partial_calls.append(kwargs)
+      return f"第 {len(partial_calls)} 小节正文继续推进。\n" + ("推进。" * 1000)
+
+    def fake_judge(_settings, **_kwargs):
+      return {
+        "summary": "承接可用。",
+        "score": 90,
+        "passed": True,
+        "issues": [],
+        "rewrite_focus": [],
+        "next_action": "继续写下一节。",
+      }
+
+    with patch(
+      "novel_backend.services.generation_service._generate_continuation_plan",
+      return_value=fake_plan,
+    ), patch(
+      "novel_backend.services.generation_service._invoke_partial_model",
+      side_effect=fake_partial,
+    ), patch(
+      "novel_backend.services.generation_service._judge_continuation",
+      side_effect=fake_judge,
+    ):
+      result = _run_continuation_pipeline(
+        self.settings,
+        project_id=project.id,
+        chapter_id="chapter-001",
+        instruction="按目标字数写完整章一万五千字。",
+        target_words=1_800,
+        support_text="",
+        candidate_count=1,
+      )
+
+    self.assertGreater(result["segment_count"], result["planned_segment_count"])
+    self.assertEqual(result["planned_segment_targets"], [5000, 5000, 5000])
+    self.assertEqual(result["completion_status"], "complete")
+    self.assertGreaterEqual(result["actual_words"], result["completion_threshold_words"])
+    self.assertEqual(len(partial_calls), result["segment_count"])
+    self.assertIn("实际生成", result["summary"])
+
+  def test_continuation_judge_runs_dimension_reviews_in_order(self) -> None:
+    scene_result = ChapterWorkflowResult(
+      task_id="scene-task",
+      mode="draft",
+      headline="场景计划",
+      summary="先守住门外压力。",
+      scenes=[
+        ChapterWorkflowScene(
+          title="仓库门外",
+          goal="让林追判断是否离开",
+          conflict="门外有人逼近",
+          turn="铜钥匙发出异常声响",
+        )
+      ],
+    )
+    calls: list[str] = []
+
+    def fake_dimension(_settings, **kwargs):
+      dimension = str(kwargs["dimension"])
+      calls.append(dimension)
+      scores = {"承接事实": 100, "人物口气": 80, "可读性": 60}
+      return {
+        "dimension": dimension,
+        "summary": f"{dimension}审校完成。",
+        "score": scores[dimension],
+        "passed": dimension != "可读性",
+        "issues": [{"title": "段尾偏弱", "detail": "结尾压力不足", "severity": "warning"}] if dimension == "可读性" else [],
+        "rewrite_focus": ["增强段尾压力"] if dimension == "可读性" else [],
+        "next_action": "继续写门外逼近。",
+      }
+
+    with patch("novel_backend.services.generation_service._judge_continuation_dimension", side_effect=fake_dimension):
+      report = _judge_continuation(
+        self.settings,
+        context_text="当前章节：林追握着铜钥匙。",
+        evidence_text="原文证据：铜钥匙仍在林追手中。",
+        canon={
+          "summary": "林追刚拿到铜钥匙。",
+          "must_keep": ["铜钥匙仍在林追手中"],
+          "current_state": ["门外有人逼近"],
+          "voice_rules": ["短句推进"],
+          "blocked_changes": ["不要提前揭开钥匙用途"],
+        },
+        scene_result=scene_result,
+        content="# 第一章 雨夜靠港\n林追握着铜钥匙，门外有人靠近。\n",
+      )
+
+    self.assertEqual(set(calls), {"承接事实", "人物口气", "可读性"})
+    self.assertEqual([item["dimension"] for item in report["dimensions"]], ["承接事实", "人物口气", "可读性"])
+    self.assertEqual(report["score"], 84)
+    self.assertFalse(report["passed"])
+    self.assertEqual(report["rewrite_focus"], ["增强段尾压力"])
+    self.assertEqual(report["issues"][0]["title"], "可读性：段尾偏弱")
+
+  def test_generate_continuation_candidates_keeps_parallel_results_ordered(self) -> None:
+    scene_result = ChapterWorkflowResult(
+      task_id="scene-task",
+      mode="draft",
+      headline="场景计划",
+      summary="先守住门外压力。",
+      scenes=[
+        ChapterWorkflowScene(
+          title="仓库门外",
+          goal="让林追判断是否离开",
+          conflict="门外有人逼近",
+          turn="铜钥匙发出异常声响",
+        )
+      ],
+    )
+    task_names: list[str] = []
+
+    def fake_partial(_settings, _messages, *, task_name, **_kwargs):
+      task_names.append(str(task_name))
+      return f"{task_name} 写出的续写正文。\n"
+
+    def fake_judge(_settings, **kwargs):
+      content = str(kwargs["content"])
+      score = 95 if "dialogue-pressure" in content else 80
+      return {
+        "summary": "候选审校完成。",
+        "score": score,
+        "passed": True,
+        "issues": [],
+        "rewrite_focus": [],
+        "next_action": "继续推进。",
+      }
+
+    with patch("novel_backend.services.generation_service._invoke_partial_model", side_effect=fake_partial), patch(
+      "novel_backend.services.generation_service._judge_continuation",
+      side_effect=fake_judge,
+    ):
+      candidates = _generate_continuation_candidates(
+        self.settings,
+        prefix="# 第一章 雨夜靠港\n",
+        context_text="当前章节：林追握着铜钥匙。",
+        evidence_text="原文证据：铜钥匙仍在林追手中。",
+        canon={
+          "summary": "林追刚拿到铜钥匙。",
+          "must_keep": ["铜钥匙仍在林追手中"],
+          "current_state": ["门外有人逼近"],
+          "voice_rules": ["短句推进"],
+          "blocked_changes": ["不要提前揭开钥匙用途"],
+        },
+        scene_result=scene_result,
+        instruction="让门外压力靠近。",
+        target_words=1200,
+        support_text="",
+        task_name_prefix="chapter_generate",
+        candidate_count=3,
+      )
+
+    self.assertEqual([item["id"] for item in candidates], ["dialogue-pressure", "action-pressure", "hook-pressure"])
+    self.assertEqual(
+      set(task_names),
+      {
+        "chapter_generate:partial:dialogue-pressure",
+        "chapter_generate:partial:action-pressure",
+        "chapter_generate:partial:hook-pressure",
+      },
+    )
+    self.assertEqual(candidates[0]["judge"]["score"], 95)
 
   def test_architecture_step_stream_returns_target_step_content(self) -> None:
     save_config(

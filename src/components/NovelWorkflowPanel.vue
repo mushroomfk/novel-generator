@@ -6,6 +6,7 @@ import AgentPlanCard from './AgentPlanCard.vue';
 import ProjectWorkspaceSidebar from './ProjectWorkspaceSidebar.vue';
 import {
   applyProjectArchitectureWorkspace,
+  getProjectDetail,
   getProjectAgentThreads,
   importProjectKnowledgeFiles,
   listStyles,
@@ -51,6 +52,10 @@ const emit = defineEmits(['project-detail-updated', 'discussion-thread-state-upd
 
 const DISCUSSION_THREAD_STORE_KEY = 'novel-agent-threads-v2';
 const MAX_DISCUSSION_THREADS = 20;
+const AGENT_REQUEST_MESSAGE_LIMIT = 50;
+const AGENT_REQUEST_MESSAGE_CONTENT_LIMIT = 6000;
+const AGENT_REQUEST_OMITTED_MARKER = '\n\n[中间较长历史已省略]\n\n';
+const AGENT_THREAD_SUMMARY_LIMIT = 500;
 
 const composerText = ref('');
 const composerFileInput = ref(null);
@@ -619,6 +624,30 @@ function openPlanConfirmModal() {
   planConfirmOpen.value = true;
 }
 
+function buildDiscussionMessageId() {
+  return `message-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function messageContentHash(value) {
+  const source = String(value ?? '');
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function summarizeThreadContent(value, limit = AGENT_THREAD_SUMMARY_LIMIT) {
+  const normalized = String(value ?? '').trim().replace(/\s+/g, ' ');
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  const headLength = Math.max(120, Math.floor(limit * 0.54));
+  const tailLength = Math.max(120, limit - headLength - 12);
+  return `${normalized.slice(0, headLength).trimEnd()} …… ${normalized.slice(-tailLength).trimStart()}`;
+}
+
 function createMessage(seed = {}) {
   const executionTrace = Array.isArray(seed.execution_trace ?? seed.executionTrace)
     ? (seed.execution_trace ?? seed.executionTrace).map((item, index) => ({
@@ -655,9 +684,15 @@ function createMessage(seed = {}) {
     }))
     : [];
 
+  const content = String(seed.content ?? '');
+  const contentHash = String(seed.content_hash ?? seed.contentHash ?? '') || messageContentHash(content);
   return {
+    id: String(seed.id ?? '') || buildDiscussionMessageId(),
     role: seed.role === 'user' ? 'user' : seed.role === 'system' ? 'system' : 'assistant',
-    content: String(seed.content ?? ''),
+    content,
+    contentHash,
+    originalLength: Number(seed.original_length ?? seed.originalLength ?? content.length) || content.length,
+    summary: String(seed.summary ?? '') || summarizeThreadContent(content),
     mode: String(seed.mode ?? ''),
     taskPackKind: String(seed.task_pack_kind ?? seed.taskPackKind ?? ''),
     plan: seed.plan ?? null,
@@ -851,8 +886,12 @@ function readLocalProjectThreads(projectId) {
 
 function serializeThreadMessage(message) {
   return {
+    id: String(message.id ?? ''),
     role: message.role,
     content: String(message.content ?? ''),
+    content_hash: String(message.contentHash ?? message.content_hash ?? '') || messageContentHash(message.content),
+    original_length: Number(message.originalLength ?? message.original_length ?? String(message.content ?? '').length) || 0,
+    summary: String(message.summary ?? '') || summarizeThreadContent(message.content),
     mode: String(message.mode ?? ''),
     task_pack_kind: String(message.taskPackKind ?? ''),
     plan: message.plan ?? null,
@@ -1391,6 +1430,30 @@ function statePills(state) {
   return items;
 }
 
+async function refreshProjectDetailAfterExecution(projectId, result) {
+  if (!projectId || props.project?.id !== projectId) {
+    return;
+  }
+
+  if (result?.project_detail?.id === projectId) {
+    emit('project-detail-updated', result.project_detail);
+    return;
+  }
+
+  if (result?.mode !== 'execution') {
+    return;
+  }
+
+  try {
+    const detail = await getProjectDetail(projectId);
+    if (props.project?.id === projectId) {
+      emit('project-detail-updated', detail);
+    }
+  } catch {
+    // The conversation result is still shown; the next project refresh will pick up saved files.
+  }
+}
+
 function isExplicitExecutionRequest(value) {
   const text = String(value ?? '').trim();
   if (!text) {
@@ -1493,10 +1556,33 @@ async function handleSuggestionClick(value) {
 }
 
 function buildMessagePayload(messages) {
-  return messages.map((item) => ({
-    role: item.role,
-    content: item.content,
-  }));
+  const headLength = 1800;
+  const tailLength = AGENT_REQUEST_MESSAGE_CONTENT_LIMIT - headLength - AGENT_REQUEST_OMITTED_MARKER.length;
+
+  return messages
+    .slice(-AGENT_REQUEST_MESSAGE_LIMIT)
+    .map((item) => {
+      const normalizedContent = String(item.content ?? '').trim();
+      const content = normalizedContent.length > AGENT_REQUEST_MESSAGE_CONTENT_LIMIT
+        ? `${normalizedContent.slice(0, headLength).trimEnd()}${AGENT_REQUEST_OMITTED_MARKER}${normalizedContent.slice(-tailLength).trimStart()}`
+        : normalizedContent;
+
+      return {
+        id: String(item.id ?? ''),
+        role: ['user', 'assistant', 'system'].includes(item.role) ? item.role : 'assistant',
+        content,
+        content_hash: String(item.contentHash ?? item.content_hash ?? '') || messageContentHash(item.content),
+        compacted: content.length < normalizedContent.length,
+        original_length: normalizedContent.length,
+        summary: String(item.summary ?? '') || summarizeThreadContent(normalizedContent),
+      };
+    })
+    .filter((item) => item.content);
+}
+
+function threadHistoryNeedsRemoteSnapshot(messages) {
+  return messages.length > AGENT_REQUEST_MESSAGE_LIMIT
+    || messages.some((item) => String(item.content ?? '').trim().length > AGENT_REQUEST_MESSAGE_CONTENT_LIMIT);
 }
 
 function focusChapterIdFromArtifacts(artifacts) {
@@ -1611,6 +1697,24 @@ async function sendConversation(options = {}) {
     activate: true,
   });
   persistThreadStoreSnapshot(targetProjectId, backgroundThreadStore);
+  const needsRemoteSnapshot = threadHistoryNeedsRemoteSnapshot(nextMessages);
+  try {
+    await saveProjectAgentThreads(targetProjectId, serializeThreadStoreSnapshot(backgroundThreadStore));
+  } catch (error) {
+    writeLocalDiscussionThreadStore(targetProjectId, buildLocalPersistPayload(targetProjectId));
+    if (needsRemoteSnapshot) {
+      runtimeError.value = error instanceof Error
+        ? `长线程保存失败，已停止本轮执行，避免只用压缩历史继续生成：${error.message}`
+        : '长线程保存失败，已停止本轮执行，避免只用压缩历史继续生成。';
+      runningProjectId.value = '';
+      runningThreadId.value = '';
+      if (appendUserMessage && userContent) {
+        composerText.value = '';
+        clearComposerReferences();
+      }
+      return;
+    }
+  }
   if (appendUserMessage && userContent) {
     composerText.value = '';
     clearComposerReferences();
@@ -1637,6 +1741,8 @@ async function sendConversation(options = {}) {
     if (sessionStatus.value === 'cancelled') {
       return;
     }
+
+    await refreshProjectDetailAfterExecution(targetProjectId, result);
 
     const stillViewingTargetThread = props.project?.id === targetProjectId
       && activeDiscussionThreadId.value === targetThreadId;

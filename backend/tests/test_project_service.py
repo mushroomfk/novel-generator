@@ -49,6 +49,7 @@ from novel_backend.services.project_distillation_service import build_distillati
 from novel_backend.services.project_service import (
   _initialize_knowledge_db,
   apply_architecture_workspace,
+  build_project_agent_thread_context,
   create_project,
   create_project_snapshot,
   delete_project,
@@ -116,6 +117,7 @@ class ProjectServiceTestCase(unittest.TestCase):
     character_names = [item.name for item in detail.story_overview.characters]
     location_names = [item.name for item in detail.story_overview.locations]
     organization_names = [item.name for item in detail.story_overview.organizations]
+    prop_names = [item.name for item in detail.story_overview.props]
     skill_names = [item.name for item in detail.story_overview.skills]
 
     self.assertIn("林追", character_names)
@@ -124,8 +126,12 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIn("白石商会", organization_names)
     self.assertIn("灯塔议会", organization_names)
     self.assertNotIn("随后闯进白石商会", organization_names)
+    self.assertIn("钥匙", prop_names)
+    self.assertNotIn("灯", prop_names)
     self.assertIn("追线索", skill_names)
     self.assertIn("开锁", skill_names)
+    self.assertNotIn("林追擅长开锁", skill_names)
+    self.assertNotIn("仓库用开锁", skill_names)
 
     active_character = next(item for item in detail.story_overview.characters if item.name == "林追")
     self.assertEqual(len(active_character.timeline), 2)
@@ -222,6 +228,355 @@ class ProjectServiceTestCase(unittest.TestCase):
     fang = next(item for item in detail.story_overview.characters if item.name == "方鸿渐")
     self.assertIn("旧式知识分子", fang.profile)
     self.assertIn("阁楼", fang.current_state)
+
+  def test_story_overview_filters_historical_phrases_from_character_names(self) -> None:
+    summary = self.create_demo_project("历史短语过滤")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      json.dumps(
+        {
+          "content": [
+            {
+              "name": "石季龙",
+              "prototype": "石虎",
+              "role": "主角，玄赵天王",
+              "arc": "从战场兵器到邺城之主，最终被取力方式反噬。",
+            },
+            {"name": "石勒", "role": "国主", "summary": "葛陂以北，后赵建立系。"},
+            {
+              "name": "龙城燕庭",
+              "prototype": "慕容鲜卑",
+              "traits": ["风雪", "骑阵", "青龙地脉"],
+              "risk": "不是天然正义，只是另一种北方秩序。",
+            },
+          ],
+          "timeline": [
+            {"year": 337, "history": "石虎称天王，石邃之乱，天王境成，东宫副印失控。"},
+            {"year": 338, "history": "石虎称帝后，十六国北方乱，封王与州鼎相连。"},
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    (project_dir / "plot_structure.txt").write_text(
+      (
+        "石虎称天王后，权力方式反噬。"
+        "石虎称帝后，国北方乱，封王与州鼎相连。"
+        "石虎称王的叙事方式改写了后赵秩序。"
+        "石季龙走进邺城，石勒旧部在议会外低声议论。"
+        "众臣入议会，青龙地脉像一条冷线穿过州鼎。"
+      ),
+      encoding="utf-8",
+    )
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 邺城夜议\n石季龙握住东宫副印，回到邺城宫门。石勒旧部在议会外低声议论。\n",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    character_names = [item.name for item in detail.story_overview.characters]
+    location_names = [item.name for item in detail.story_overview.locations]
+    organization_names = [item.name for item in detail.story_overview.organizations]
+    self.assertIn("石季龙", character_names)
+    self.assertIn("石勒", character_names)
+    self.assertIn("石虎", character_names)
+    self.assertIn("邺城", location_names)
+    self.assertIn("邺城宫门", location_names)
+    self.assertNotIn("龙城", location_names)
+    self.assertIn("龙城燕庭", organization_names)
+    self.assertIn("议会", organization_names)
+    for wrong_name in [
+      "石虎称",
+      "方式",
+      "方式反",
+      "方式改",
+      "封王",
+      "国北方",
+      "赵天王",
+      "东宫副",
+      "王境",
+      "国主",
+      "龙城燕庭",
+    ]:
+      self.assertNotIn(wrong_name, character_names)
+    self.assertNotIn("众臣入议会", organization_names)
+
+  def test_story_overview_filters_research_material_noise_when_architecture_has_characters(self) -> None:
+    summary = self.create_demo_project("资料噪声过滤")
+    project_dir = Path(summary.path)
+    (project_dir / "core_seed.txt").write_text(
+      "主角石季龙以国家为宗门、以邺城为丹田，试图把旧天庭御印合为帝箓。",
+      encoding="utf-8",
+    )
+    (project_dir / "character_design.txt").write_text(
+      (
+        "石季龙：原型石虎，邺城之主。\n"
+        "佛图澄：西域来僧。代表术法：钵中见城、铃下止杀。\n"
+        "慕容皝与慕容恪：龙城燕庭代表。\n"
+      ),
+      encoding="utf-8",
+    )
+    (project_dir / "world_building.txt").write_text(
+      "国家修仙官位境包含金丹、元婴等参考节奏。城隍土地被玄赵纳入户籍阵后会变成怨炁仓库。三官转成解厄三类国家法术。",
+      encoding="utf-8",
+    )
+    (project_dir / "plot_structure.txt").write_text(
+      (
+        "335 年迁都邺城；石季龙后期追求帝箓，最终让邺城成为人间与旧天庭残法互相撕扯的鼎。"
+        "章尾邺城起风，章尾长安城门封闭，章尾宫门只剩火光。"
+        "华林苑宴饮遮住宫城，荒死亡神性压近宫城，郑缨照参与邺城旧宴。"
+        "季龙第一次看见国家像宗门，国家如宗门，而是旧王朝，章尾刘氏与旧王朝相连。"
+        "佛图澄向石季龙点破石中声，石勒不许军中继续议论。"
+      ),
+      encoding="utf-8",
+    )
+    import_project_knowledge(
+      self.settings,
+      summary.id,
+      KnowledgeImportRequest(
+        items=[
+          KnowledgeImportItem(
+            title="石虎题材结构化资料JSON",
+            content=(
+              "东晋十六国后赵资料反复提到国家修仙、金丹、元婴和通天阵。"
+              "渡江晋庭保存海内图，龙城燕庭掌握海外北经残片。"
+              "愿这份调研报告能为创作提供基础。}"
+            ),
+          )
+        ]
+      ),
+    )
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 邺城夜火\n石季龙回到邺城，哨塔上点着一盏油灯。石勒横刀未出鞘。\n",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    character_names = [item.name for item in detail.story_overview.characters]
+    location_names = [item.name for item in detail.story_overview.locations]
+    prop_names = [item.name for item in detail.story_overview.props]
+    skill_names = [item.name for item in detail.story_overview.skills]
+    organization_names = [item.name for item in detail.story_overview.organizations]
+    event_names = [item.name for item in detail.story_overview.events]
+
+    self.assertIn("石季龙", character_names)
+    self.assertIn("佛图澄", character_names)
+    self.assertIn("慕容皝", character_names)
+    self.assertIn("慕容恪", character_names)
+    for wrong_name in [
+      "国家修",
+      "东晋十",
+      "龙城燕",
+      "金丹",
+      "元婴",
+      "通天阵",
+      "季龙在",
+      "石头在",
+      "章尾佛",
+      "章尾石",
+      "章尾他",
+      "章尾季",
+      "向石季",
+      "石勒不",
+    ]:
+      self.assertNotIn(wrong_name, character_names)
+    self.assertIn("邺城", location_names)
+    self.assertIn("长安城门", location_names)
+    for wrong_location in [
+      "以邺城",
+      "年迁都邺城",
+      "最终让邺城",
+      "籍阵后会变成怨炁仓库",
+      "仓库",
+      "章尾邺城",
+      "章尾长安城门",
+      "章尾宫门",
+      "华林苑宴饮遮住宫城",
+      "荒死亡神性压近宫城",
+      "郑缨照参与邺城",
+      "宫门",
+      "宫城",
+      "夺城",
+    ]:
+      self.assertNotIn(wrong_location, location_names)
+    self.assertIn("灯", prop_names)
+    self.assertIn("刀", prop_names)
+    self.assertNotIn("代表术法", skill_names)
+    self.assertNotIn("解厄三类国家法术", skill_names)
+    self.assertIn("龙城燕庭", organization_names)
+    for wrong_org in [
+      "主角石季龙以国家为宗门",
+      "宗门",
+      "旧王朝",
+      "季龙第一次看见国家像宗门",
+      "国家如宗门",
+      "章尾刘氏与旧王朝",
+      "而是旧王朝",
+    ]:
+      self.assertNotIn(wrong_org, organization_names)
+    self.assertNotIn("}", event_names)
+    self.assertNotIn("愿这份调研报告能为创作提供基础。}", event_names)
+    self.assertNotIn("第 1 章 邺城夜火", event_names)
+    self.assertIn("石季龙回到邺城，哨塔上点着一盏油灯。", event_names)
+
+  def test_story_overview_keeps_scene_title_out_of_chapter_events(self) -> None:
+    summary = self.create_demo_project("事件过滤")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林追：旧港调查员。\n",
+      encoding="utf-8",
+    )
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 雾港\n雾压住海面，像一层灰布。林追进入雾港码头，找到失踪船队留下的地图。\n",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    event_names = [item.name for item in detail.story_overview.events]
+    scene_names = [item.name for item in detail.story_overview.scenes]
+    active_character = next(item for item in detail.story_overview.characters if item.name == "林追")
+
+    self.assertIn("第一章 雾港", scene_names)
+    self.assertNotIn("第一章 雾港", event_names)
+    self.assertNotIn("雾压住海面，像一层灰布。", event_names)
+    self.assertIn("林追进入雾港码头，找到失踪船队留下的地图。", event_names)
+    self.assertIn("林追进入雾港码头，找到失踪船队留下的地图。", active_character.events)
+
+  def test_story_overview_uses_model_review_and_cache_for_ambiguous_character_candidates(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(api_key="test-key", model_name="qwen3.6-plus"),
+      ),
+    )
+    summary = self.create_demo_project("模型人物复核")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林追：港口调查者，负责追查旧船队真相。\n",
+      encoding="utf-8",
+    )
+    (project_dir / "plot_structure.txt").write_text(
+      "方略说要先改制度。方略说要重排秩序。方略说要压住分歧。",
+      encoding="utf-8",
+    )
+
+    task_names: list[str] = []
+
+    def fake_invoke(_settings, _messages, *, task_name: str = "", **_kwargs) -> str:
+      task_names.append(task_name)
+      if task_name == "story_overview_entity_review":
+        return json.dumps(
+          {
+            "valid_entities": {
+              "locations": ["港口"],
+              "organizations": [],
+              "props": [],
+              "skills": [],
+            },
+            "rejected": [],
+          },
+          ensure_ascii=False,
+        )
+      return json.dumps(
+        {
+          "characters": [],
+          "non_characters": ["方略"],
+          "aliases": {},
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.generation_service._invoke_model", side_effect=fake_invoke):
+      first_detail = get_project_detail(self.settings, summary.id, review_characters=True)
+      second_detail = get_project_detail(self.settings, summary.id, review_characters=True)
+
+    first_names = [item.name for item in first_detail.story_overview.characters]
+    second_names = [item.name for item in second_detail.story_overview.characters]
+    self.assertIn("林追", first_names)
+    self.assertNotIn("方略", first_names)
+    self.assertEqual(first_names, second_names)
+    self.assertEqual(task_names.count("story_overview_character_review"), 1)
+    self.assertEqual(task_names.count("story_overview_entity_review"), 1)
+
+  def test_story_overview_uses_model_review_for_world_entity_candidates(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(api_key="test-key", model_name="qwen3.6-plus"),
+      ),
+    )
+    summary = self.create_demo_project("模型世界要素复核")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林追：红线公会调查员，擅长开锁，随身带着地图。\n",
+      encoding="utf-8",
+    )
+    (project_dir / "plot_structure.txt").write_text(
+      (
+        "林追进入雾港码头。红线公会在雾港码头设点。"
+        "有人说临时同盟像公会，城市像宗门。"
+        "地图是唯一线索，协议法术只是世界规则，不是人物技能。"
+      ),
+      encoding="utf-8",
+    )
+
+    task_names: list[str] = []
+
+    def fake_invoke(_settings, _messages, *, task_name: str = "", **_kwargs) -> str:
+      task_names.append(task_name)
+      if task_name == "story_overview_entity_review":
+        return json.dumps(
+          {
+            "valid_entities": {
+              "locations": ["雾港码头"],
+              "organizations": ["红线公会"],
+              "props": ["地图"],
+              "skills": ["开锁"],
+            },
+            "rejected": [
+              {"kind": "organizations", "name": "公会", "reason": "泛称"},
+              {"kind": "skills", "name": "协议法术", "reason": "世界规则"},
+            ],
+          },
+          ensure_ascii=False,
+        )
+      request_payload = json.loads(_messages[1]["content"])
+      candidates = request_payload.get("candidates", []) if isinstance(request_payload, dict) else []
+      return json.dumps(
+        {
+          "characters": [],
+          "non_characters": candidates if isinstance(candidates, list) else [],
+          "aliases": {},
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.generation_service._invoke_model", side_effect=fake_invoke):
+      first_detail = get_project_detail(self.settings, summary.id, review_characters=True)
+      second_detail = get_project_detail(self.settings, summary.id, review_characters=True)
+
+    first_locations = [item.name for item in first_detail.story_overview.locations]
+    first_organizations = [item.name for item in first_detail.story_overview.organizations]
+    first_props = [item.name for item in first_detail.story_overview.props]
+    first_skills = [item.name for item in first_detail.story_overview.skills]
+    second_organizations = [item.name for item in second_detail.story_overview.organizations]
+
+    self.assertIn("雾港码头", first_locations)
+    self.assertIn("红线公会", first_organizations)
+    self.assertIn("地图", first_props)
+    self.assertIn("开锁", first_skills)
+    self.assertNotIn("公会", first_organizations)
+    self.assertNotIn("协议法术", first_skills)
+    self.assertEqual(first_organizations, second_organizations)
+    self.assertEqual(task_names.count("story_overview_character_review"), 1)
+    self.assertEqual(task_names.count("story_overview_entity_review"), 1)
 
   def test_project_detail_includes_distillation_report_and_task_packs(self) -> None:
     summary = self.create_demo_project("蒸馏结构")
@@ -1163,6 +1518,46 @@ class ProjectServiceTestCase(unittest.TestCase):
 
     self.assertFalse((project_dir / ".gaoxia" / "threads" / "thread-1.json").exists())
     self.assertTrue((project_dir / ".gaoxia" / "threads" / "thread-2.json").exists())
+
+  def test_save_project_agent_threads_keeps_long_message_and_builds_context_index(self) -> None:
+    summary = self.create_demo_project("长线程索引")
+    project_dir = Path(summary.path)
+    long_content = "开头。" + ("潮声里反复出现旧码头的铜钥匙。" * 520) + "星核密钥藏在第七层钟楼。结尾。"
+
+    save_project_agent_threads(
+      self.settings,
+      summary.id,
+      AgentThreadStoreUpdateRequest(
+        active_thread_id="thread-long",
+        threads=[
+          AgentThreadRecord(
+            id="thread-long",
+            title="长文本",
+            preview="长文本预览",
+            updated_at="2026-05-15T12:00:00+00:00",
+            messages=[
+              AgentThreadMessage(id="message-long", role="user", content=long_content),
+            ],
+          )
+        ],
+      ),
+    )
+
+    loaded = get_project_agent_threads(self.settings, summary.id)
+    self.assertEqual(loaded.threads[0].messages[0].content, long_content)
+    self.assertEqual(loaded.threads[0].messages[0].id, "message-long")
+    self.assertEqual(loaded.threads[0].messages[0].original_length, len(long_content))
+    self.assertTrue((project_dir / ".gaoxia" / "thread_context" / "thread-long.json").exists())
+    self.assertGreater(len(long_content), 6000)
+
+    context = build_project_agent_thread_context(
+      self.settings,
+      summary.id,
+      "thread-long",
+      query="星核密钥",
+      current_message_ids=["message-long"],
+    )
+    self.assertIn("第七层钟楼", context)
 
 
 if __name__ == "__main__":

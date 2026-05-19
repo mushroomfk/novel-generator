@@ -37,6 +37,7 @@ const isSettingsOpen = ref(false);
 const isCreateOpen = ref(false);
 const isHistoryOpen = ref(false);
 const isStoryOverviewOpen = ref(false);
+const isStoryOverviewRefreshing = ref(false);
 const chapterBrowserProjectId = ref('');
 const exportFormat = ref('markdown');
 const isExporting = ref(false);
@@ -376,6 +377,26 @@ function handleProjectSelect(projectId) {
   requestedDiscussionThreadId.value = '';
   selectedProjectId.value = projectId;
   chapterBrowserProjectId.value = projectId;
+}
+
+async function openStoryOverview() {
+  const projectId = selectedProjectDetail.value?.id ?? selectedProjectId.value;
+  isStoryOverviewOpen.value = true;
+  if (!projectId || isStoryOverviewRefreshing.value) {
+    return;
+  }
+
+  isStoryOverviewRefreshing.value = true;
+  try {
+    const detail = await getProjectDetail(projectId, { reviewCharacters: true });
+    if (selectedProjectId.value === projectId) {
+      handleProjectDetailUpdated(detail);
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '架构总览人物复核失败', 'error');
+  } finally {
+    isStoryOverviewRefreshing.value = false;
+  }
 }
 
 function handleChapterBrowserToggle(projectId) {
@@ -765,10 +786,11 @@ onBeforeUnmount(() => {
             class="stage-actions"
           >
             <button
+              :aria-busy="isStoryOverviewRefreshing"
               class="secondary-button stage-primary-action"
               data-testid="open-story-overview-button"
               type="button"
-              @click="isStoryOverviewOpen = true"
+              @click="openStoryOverview"
             >
               <span>架构总览</span>
               <strong>{{ storyOverviewCharacterCount }}</strong>
@@ -865,50 +887,52 @@ onBeforeUnmount(() => {
           />
         </section>
 
-        <template v-else-if="selectedProject">
-          <div class="stage-workbench">
-            <section
-              :class="[
-                'stage-canvas',
-                { 'stage-canvas-loading': isProjectLoading && selectedProjectDetail },
-              ]"
+        <div
+          v-if="selectedProject"
+          v-show="activeSurface !== 'skills'"
+          class="stage-workbench"
+        >
+          <section
+            :class="[
+              'stage-canvas',
+              { 'stage-canvas-loading': isProjectLoading && selectedProjectDetail },
+            ]"
+          >
+            <template v-if="selectedProjectDetail">
+              <NovelWorkflowPanel
+                :model-name="modelDisplayName"
+                :project="selectedProjectDetail"
+                :conversation-session-key="conversationSessionKey"
+                :requested-discussion-thread-id="requestedDiscussionThreadId"
+                :selected-chapter-id="selectedChapterId"
+                :selected-chapter="selectedChapter"
+                @discussion-thread-state-updated="handleDiscussionThreadStateUpdated"
+                @focus-chapter="handleChapterSelect"
+                @open-model-settings="isSettingsOpen = true"
+                @project-detail-updated="handleProjectDetailUpdated"
+              />
+            </template>
+
+            <div
+              v-else
+              class="loading-panel"
             >
-              <template v-if="selectedProjectDetail">
-                <NovelWorkflowPanel
-                  :model-name="modelDisplayName"
-                  :project="selectedProjectDetail"
-                  :conversation-session-key="conversationSessionKey"
-                  :requested-discussion-thread-id="requestedDiscussionThreadId"
-                  :selected-chapter-id="selectedChapterId"
-                  :selected-chapter="selectedChapter"
-                  @discussion-thread-state-updated="handleDiscussionThreadStateUpdated"
-                  @focus-chapter="handleChapterSelect"
-                  @open-model-settings="isSettingsOpen = true"
-                  @project-detail-updated="handleProjectDetailUpdated"
-                />
-              </template>
+              {{ isProjectLoading ? '正在读取当前小说的章节索引…' : '正在准备当前小说工作区…' }}
+            </div>
 
-              <div
-                v-else
-                class="loading-panel"
-              >
-                {{ isProjectLoading ? '正在读取当前小说的章节索引…' : '正在准备当前小说工作区…' }}
+            <div
+              v-if="isProjectLoading && selectedProjectDetail"
+              class="stage-loading-overlay"
+            >
+              <div class="loading-panel stage-loading-overlay-panel">
+                正在读取当前小说的章节索引…
               </div>
-
-              <div
-                v-if="isProjectLoading && selectedProjectDetail"
-                class="stage-loading-overlay"
-              >
-                <div class="loading-panel stage-loading-overlay-panel">
-                  正在读取当前小说的章节索引…
-                </div>
-              </div>
-            </section>
-          </div>
-        </template>
+            </div>
+          </section>
+        </div>
 
         <section
-          v-else
+          v-if="!selectedProject && activeSurface !== 'skills'"
           class="empty-stage"
         >
           <p class="empty-stage-kicker">还没有打开的小说</p>

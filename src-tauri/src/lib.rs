@@ -1,10 +1,13 @@
 use serde::Serialize;
 use std::{
-    env,
     ffi::OsString,
     net::TcpListener,
-    path::{Path, PathBuf},
     sync::Mutex,
+};
+#[cfg(dev)]
+use std::{
+    env,
+    path::{Path, PathBuf},
 };
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_shell::{
@@ -57,8 +60,9 @@ impl BackendRuntime {
             port_arg,
         ];
 
-        let workspace_dir = workspace_root();
-        let (mut events, child) = if cfg!(debug_assertions) {
+        #[cfg(dev)]
+        let (mut events, child) = {
+            let workspace_dir = workspace_root();
             let backend_binary = find_dev_backend_binary().ok_or_else(|| {
                 format!(
                     "找不到开发环境 backend，可检查 {} 下的 .venv",
@@ -71,7 +75,10 @@ impl BackendRuntime {
                 .current_dir(&workspace_dir)
                 .spawn()
                 .map_err(|error| format!("启动开发 backend 失败: {error}"))?
-        } else {
+        };
+
+        #[cfg(not(dev))]
+        let (mut events, child) = {
             app.shell()
                 .sidecar("novel-backend")
                 .map_err(|error| format!("创建 sidecar 命令失败: {error}"))?
@@ -142,6 +149,7 @@ fn reserve_local_port() -> std::io::Result<u16> {
     Ok(port)
 }
 
+#[cfg(dev)]
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -149,6 +157,7 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
+#[cfg(dev)]
 fn find_dev_backend_binary() -> Option<PathBuf> {
     let workspace_dir = workspace_root();
     let mut candidates = Vec::new();

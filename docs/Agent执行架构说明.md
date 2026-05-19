@@ -44,6 +44,9 @@
 - `plan_generated`
 - `plan_confirm_required`
 - `action_started`
+- `subtask_started`
+- `subtask_result`
+- `subtask_failed`
 - `action_result`
 - `action_failed`
 - `state_updated`
@@ -68,6 +71,8 @@
 - `done`
 
 这样前端可以逐步迁移，不需要一次把旧逻辑全删掉。
+
+`subtask_*` 用来展示 action 内部的父子任务。事件字段包含 `subtask_id`、`parallel_group`、`role`、`capability`、`action_kind` 和当前状态。前端会把它们挂到对应 action 的时间线下面，所以用户能看到“写作 agent、连续性审校 agent、人物口气审校 agent、可读性审校 agent”等子任务状态，而不是只看到一个大步骤。
 
 ### 2. Action Registry
 
@@ -98,6 +103,19 @@
 1. 计算当前 action 的任务包
 2. 调用 registry 里的 handler
 3. 把中间状态转换成统一执行结果
+
+章节写回类 action 会把保存后的章节核验结果一并写入执行反馈：
+
+- `chapter_generate`、`chapter_workflow` 的 draft 模式、`rewrite_chapter` 会在写回正文后读取章节核验报告
+- `chapter_generate` 会按作品目标字数和当前章节长度计算目标容量；用户要求完整章、技能库章节生成未指定目标字数，或目标超过单次安全长度时，会交给生成链路按章节容量规划小节并逐节审校。若模型单节写短，后端会按保存前的实际正文长度继续追加小节，直到接近目标容量或达到安全次数上限。
+- `rewrite_chapter` 写回后会按保存后的正文长度、用户字数要求和项目单章均值复算章节容量；重写、改写、定稿整章时如果保存正文低于完整章容量，会从当前正文末尾按小节扩写。补足过程中任一请求失败，或最终仍未达到容量阈值，都会恢复本轮改稿前正文，避免把不合格短稿或半截扩写留在章节里。去 AI、短稿、片段、开头等明确短文本请求不会触发扩写。
+- 如果模型把短稿描述成完整章，执行反馈会过滤“约 15000 字”“完整章节”等未经验证的修改说明，并把 `saved_word_count / length_target_words / length_status / length_completion_*` 写入产物 `metadata`
+- 核验分数、状态和摘要会进入 `changes`、回复正文和产物 `metadata`
+- 若核验状态为 `risk` 或总分低于配置阈值，后端会按核验问题自动修订，重新写回正文后再次生成核验报告
+- 自动修订默认启用，默认阈值为 65，默认最多 1 轮；可在 AI 写作设置里关闭、调整触发分数或把最多修订轮数调到 0 到 3
+- 自动修订结果会进入回复正文、`changes` 和产物 `metadata`，包括是否尝试、是否写入、修订摘要、修订项和复查结果
+- 核验失败时，章节正文仍会保留，但执行结果会明确返回失败原因，并给出重新运行章节核验的建议
+- 核验失败不会触发自动修订，因为这时没有可靠的问题清单
 
 ### 3. Planner
 
@@ -134,12 +152,26 @@
 - `AgentThreadMessage.artifacts`
 - `AgentExecutionTrace.status`
 - `AgentChatRequest.thread_id`
+- `AgentPlanAction.subtask_id`
+- `AgentPlanAction.parallel_group`
+- `AgentPlanAction.role`
+- `AgentPlanAction.capability`
 
 用途：
 
 - `execution_trace` 给执行链路
 - `event_blocks` 给计划和阶段性事件
 - `artifacts` 给结果产物和历史回看
+
+`parallel_group / subtask_id / role / capability` 参考了 Hermes 的 batch subagent 组织方式，但当前实现不让子任务直接改项目文件或长期记忆。写正文、写章节核验结果和写项目记忆仍由主 action handler 统一处理；子任务只通过 artifact、审校报告、执行事件或候选正文把结果交回主流程。
+
+当前内置角色边界：
+
+- 资料分析 agent：只产出资料分析 artifact，不直接改正文或项目记忆
+- 写作 agent：负责候选正文和修订正文，写回由主 action handler 执行
+- 连续性审校 agent：检查人物关系、事件结果、时间地点和道具状态，只产出报告
+- 人物口气审校 agent：检查人物声音、对白关系和叙述距离，只产出报告
+- 可读性审校 agent：检查节奏、段尾压力和阅读牵引，只产出报告
 
 ### 5. 执行轨迹与经验候选
 
@@ -161,7 +193,21 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 - 资料分析产物里值得复用的结论
 - 可转成用户技能的重复处理方式
 
-这套机制只是把经验整理出来。它不会越过作者确认直接改 `project_memory/author/`。
+章节核验和自动修订也会参与经验整理。低分章节、自动修订摘要和复查结果会转成写作技能候选，方便后续把“低分修订经验”沉淀成用户技能。
+
+技能库新增 `自我进化` 查看入口，对应接口：
+
+- `GET /api/studio/self-evolution?project_id=...`
+- `GET /api/studio/skills/curation`
+
+自我进化报告会合并四类来源：
+
+- 项目 `.gaoxia/learning/reviews.jsonl` 里的记忆候选和技能候选
+- `logs/agent_trajectories.jsonl` 里的失败执行样本
+- 章节产物 metadata 里的核验低分、风险状态和自动修订记录
+- `logs/prompt_history.jsonl` 里的模型调用失败记录
+
+报告只给出候选、证据和建议。它不会越过作者确认直接改 `project_memory/author/`，也不会自动创建或删除技能文件。
 
 ## 前端结构
 
@@ -176,6 +222,10 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 - 维护 `sessionStatus`
 - 维护当前 `timelineItems`
 - 维护本轮 `latestResult`
+- 结构化 `project_updated` 和最终 `session_result.project_detail` 都会触发项目详情更新，避免章节文件已写回但正文面板仍显示旧内容
+- Agent 对话发起前，前端会先保存完整线程到项目目录，再向 backend 提交最近 50 条历史；单条历史超过 6000 字时只在请求体里保留开头和末尾，原文仍保存在项目文件里
+- 如果本轮历史超过 50 条，或任意单条历史超过 6000 字，而完整线程保存失败，前端会停止本轮执行并显示错误，避免只拿压缩历史继续生成
+- 每条线程消息保存 `id / content_hash / original_length / summary`，用于后端确认请求体里的压缩消息对应哪条完整历史
 
 `NovelWorkflowPanel.vue` 不再自己解析每条 SSE。
 
@@ -187,6 +237,7 @@ Agent session 结束后，后端会追加一条结构化轨迹：
   - 展示计划标题、摘要、步骤、动作标签
 - `AgentActionTimeline`
   - 展示每一步的状态、任务包、摘要、变更
+  - 展示 action 下的子任务列表、角色、能力、运行状态和子任务摘要
 - `AgentArtifactSummary`
   - 展示产物标题、类别、摘要、预览
 
@@ -198,6 +249,7 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 - 计划卡仍然会保留在聊天记录里，但不再卡在「待确认」
 - 只有用户表达不明确，或者只是想先看方案时，才停在计划态等手动执行
 - 如果本轮实际写回的是别的章节，右侧预览会自动切到被写回的章节
+- Agent 执行结束后，如果最终结果没有携带项目详情，前端会重新读取一次项目详情，保证当前章节正文显示保存后的版本
 
 ### 3. 整书架构执行
 
@@ -226,11 +278,17 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 
 线程消息现在会一起保存：
 
+- `id`
+- `content_hash`
+- `original_length`
+- `summary`
 - `execution_trace`
 - `event_blocks`
 - `artifacts`
 
 所以重新打开线程后，不只是能看到回复文本，还能看到当次计划和执行记录。
+
+项目目录还会生成 `.gaoxia/thread_context/{thread_id}.json`。该文件把长消息分成带 hash 的片段索引；Agent session 建立时会根据当前输入和本轮已提交 message id，取回相关片段并插入系统上下文。这样请求体保持可控，模型仍可使用长历史里的关键信息。
 
 ## 兼容策略
 
@@ -272,11 +330,12 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 
 结果：
 
-- 108 个测试通过
+- 123 个测试通过
 
 ### 额外验证
 
 - `backend.tests.test_agent_service`
+- `backend.tests.test_generation_service`
 - `backend.tests.test_project_service`
 - `backend.tests.test_context_builder`
 - `backend.tests.test_model_error_service`

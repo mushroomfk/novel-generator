@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import {
   importProjectKnowledge,
   importProjectKnowledgeFiles,
@@ -29,6 +29,8 @@ const emit = defineEmits(['close', 'project-detail-updated']);
 
 const activeTab = ref('characters');
 const activeCharacterName = ref('');
+const activeEntitySectionId = ref('');
+const overviewPanel = ref(null);
 const draftDocuments = ref({});
 const saveMessage = ref('');
 const knowledgeMessage = ref('');
@@ -94,6 +96,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '人物',
     value: `${characters.value.length} 个`,
+    targetTab: 'characters',
+    targetKey: 'characters',
     note: characters.value.length > 0
       ? '当前项目里已经识别的人物节点'
       : '还没有提取到明确人物',
@@ -101,6 +105,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '事件',
     value: `${overview.value.events.length} 个`,
+    targetTab: 'entities',
+    targetKey: 'events',
     note: overview.value.events.length > 0
       ? '按章节汇总推进动作和关键节点'
       : '还没有抽取出稳定事件',
@@ -108,6 +114,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '地点',
     value: `${overview.value.locations.length} 个`,
+    targetTab: 'entities',
+    targetKey: 'locations',
     note: overview.value.locations.length > 0
       ? '人物活动范围和关键位置会挂在这里'
       : '还没有地点线索',
@@ -115,6 +123,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '道具',
     value: `${overview.value.props.length} 个`,
+    targetTab: 'entities',
+    targetKey: 'props',
     note: overview.value.props.length > 0
       ? '和剧情推进有关的物件会持续累积'
       : '还没有道具线索',
@@ -122,6 +132,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '技能',
     value: `${skills.value.length} 个`,
+    targetTab: 'entities',
+    targetKey: 'skills',
     note: skills.value.length > 0
       ? '人物的能力、擅长和本领会集中挂在这里'
       : '还没有稳定的人物技能',
@@ -129,6 +141,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '组织/势力',
     value: `${overview.value.organizations.length} 个`,
+    targetTab: 'entities',
+    targetKey: 'organizations',
     note: overview.value.organizations.length > 0
       ? '人物归属、对立阵营和资源来源会挂在这里'
       : '还没有稳定的组织线索',
@@ -136,6 +150,8 @@ const coreSummaryCards = computed(() => ([
   {
     label: '时间线',
     value: `${totalTimelineEntries.value} 条`,
+    targetTab: 'characters',
+    targetKey: 'timeline',
     note: totalTimelineEntries.value > 0
       ? '把人物推进挂到章节顺序上'
       : '还没有可读时间线',
@@ -180,6 +196,11 @@ const entitySections = computed(() => ([
     id: 'props',
     label: '道具',
     items: overview.value.props,
+  },
+  {
+    id: 'skills',
+    label: '技能',
+    items: skills.value,
   },
   {
     id: 'organizations',
@@ -432,6 +453,14 @@ function openCharacter(name) {
   activeCharacterName.value = name;
 }
 
+async function openSummaryTarget(item) {
+  activeTab.value = item.targetTab;
+  activeEntitySectionId.value = item.targetTab === 'entities' ? item.targetKey : '';
+  await nextTick();
+  const target = overviewPanel.value?.querySelector(`[data-overview-target="${item.targetKey}"]`);
+  target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
 const memoryCategoryOptions = ['硬规则', '偏好', '连续性', '警告', '目标'];
 
 function addMemoryEntry() {
@@ -665,6 +694,7 @@ async function importKnowledge() {
 
 <template>
   <section
+    ref="overviewPanel"
     class="story-overview-panel"
     data-testid="story-overview-modal"
     role="dialog"
@@ -705,15 +735,18 @@ async function importKnowledge() {
         class="overview-summary overview-summary-core"
         data-testid="story-overview-core-summary"
       >
-        <article
+        <button
           v-for="item in coreSummaryCards"
           :key="item.label"
           class="summary-card"
           :title="item.note"
+          :aria-label="`查看${item.label}`"
+          type="button"
+          @click="openSummaryTarget(item)"
         >
           <span>{{ item.label }}</span>
           <strong>{{ item.value }}</strong>
-        </article>
+        </button>
       </div>
       <nav class="overview-tabs">
         <button
@@ -766,7 +799,10 @@ async function importKnowledge() {
       class="overview-body overview-body-characters"
       data-testid="story-overview-character-map"
     >
-      <aside class="character-index">
+      <aside
+        class="character-index"
+        data-overview-target="characters"
+      >
         <button
           v-for="item in characters"
           :key="item.name"
@@ -931,7 +967,10 @@ async function importKnowledge() {
 
         </section>
 
-        <section class="timeline-shell">
+        <section
+          class="timeline-shell"
+          data-overview-target="timeline"
+        >
           <div class="timeline-shell-head">
             <div>
               <p class="overview-kicker">时间线</p>
@@ -1021,7 +1060,8 @@ async function importKnowledge() {
       <section
         v-for="section in entitySections"
         :key="section.id"
-        class="entity-section"
+        :class="['entity-section', { 'entity-section-active': activeEntitySectionId === section.id }]"
+        :data-overview-target="section.id"
       >
         <header class="entity-section-head">
           <div>
@@ -1043,13 +1083,13 @@ async function importKnowledge() {
             <p>{{ item.summary || '暂无补充说明。' }}</p>
             <div class="chip-row">
               <span
-                v-for="name in item.related_characters"
+                v-for="name in item.related_characters ?? []"
                 :key="`${item.name}-${name}`"
                 class="meta-chip"
               >
                 人物 · {{ name }}
               </span>
-              <span class="meta-chip meta-chip-muted">{{ formatChapterIndexes(item.chapter_indexes) }}</span>
+              <span class="meta-chip meta-chip-muted">{{ formatChapterIndexes(item.chapter_indexes ?? []) }}</span>
             </div>
           </article>
         </div>
@@ -1709,6 +1749,20 @@ async function importKnowledge() {
   gap: 10px;
   padding: 8px 12px;
   border-radius: 15px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.summary-card:hover {
+  border-color: #cfe0fa;
+  background: #f8fbff;
+}
+
+.summary-card:focus-visible {
+  outline: 2px solid #456ce9;
+  outline-offset: 2px;
 }
 
 .summary-card span,
@@ -2044,6 +2098,18 @@ async function importKnowledge() {
 .entity-section {
   display: grid;
   gap: 10px;
+  scroll-margin-top: 8px;
+}
+
+.entity-section-active .entity-section-head {
+  border-color: #cfe0fa;
+  background: #f8fbff;
+}
+
+.entity-section-head {
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 14px;
 }
 
 .entity-grid {

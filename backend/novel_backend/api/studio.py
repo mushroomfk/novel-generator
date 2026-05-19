@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
+from novel_backend.api.license_guard import require_valid_license
 from novel_backend.models import (
   AgentChatRequest,
   BatchGenerateRequest,
@@ -56,7 +57,8 @@ from novel_backend.services.preset_service import (
   update_prompt_preset,
   update_xp_preset,
 )
-from novel_backend.services.skill_service import list_skill_catalog, materialize_skill
+from novel_backend.services.self_evolution_service import build_self_evolution_report
+from novel_backend.services.skill_service import get_skill_curation_report, list_skill_catalog, materialize_skill
 from novel_backend.services.style_service import (
   clear_style_references,
   delete_style,
@@ -110,18 +112,36 @@ def post_materialize_skill(request: Request, payload: SkillMaterializeRequest):
   return {"ok": True, "data": materialize_skill(settings, payload).model_dump(mode="json")}
 
 
+@router.get("/skills/curation")
+def get_skills_curation(request: Request):
+  settings = request.app.state.settings
+  return {"ok": True, "data": get_skill_curation_report(settings).model_dump(mode="json")}
+
+
+@router.get("/self-evolution")
+def get_self_evolution(
+  request: Request,
+  project_id: str = Query(..., min_length=1, max_length=120),
+):
+  settings = request.app.state.settings
+  return {"ok": True, "data": build_self_evolution_report(settings, project_id).model_dump(mode="json")}
+
+
 @router.post("/brainstorm/stream")
 async def stream_brainstorm(request: Request, payload: BrainstormRequest):
+  require_valid_license(request)
   return _stream_response(brainstorm_stream(request.app.state.settings, payload))
 
 
 @router.post("/agent/stream")
 async def stream_agent_session(request: Request, payload: AgentChatRequest):
+  require_valid_license(request)
   return _stream_response(agent_session_stream(request.app.state.settings, payload))
 
 
 @router.post("/character-replica/stream")
 async def stream_character_replica(request: Request, payload: CharacterReplicaRequest):
+  require_valid_license(request)
   return _stream_response(character_replica_stream(request.app.state.settings, payload))
 
 
@@ -153,66 +173,79 @@ def remove_character_replica_profile(request: Request, name: str):
 
 @router.post("/consistency/stream")
 async def stream_consistency(request: Request, payload: ConsistencyCheckRequest):
+  require_valid_license(request)
   return _stream_response(consistency_stream(request.app.state.settings, payload))
 
 
 @router.post("/blueprint/stream")
 async def stream_blueprint(request: Request, payload: BlueprintGenerateRequest):
+  require_valid_license(request)
   return _stream_response(blueprint_stream(request.app.state.settings, payload))
 
 
 @router.post("/chapter-generate/stream")
 async def stream_chapter_generate(request: Request, payload: ChapterGenerateRequest):
+  require_valid_license(request)
   return _stream_response(chapter_generate_stream(request.app.state.settings, payload))
 
 
 @router.post("/chapter-finalize/stream")
 async def stream_chapter_finalize(request: Request, payload: ChapterRewriteRequest):
+  require_valid_license(request)
   return _stream_response(chapter_rewrite_stream(request.app.state.settings, payload, "finalize"))
 
 
 @router.post("/chapter-polish/stream")
 async def stream_chapter_polish(request: Request, payload: ChapterRewriteRequest):
+  require_valid_license(request)
   return _stream_response(chapter_rewrite_stream(request.app.state.settings, payload, "polish"))
 
 
 @router.post("/chapter-humanize/stream")
 async def stream_chapter_humanize(request: Request, payload: ChapterRewriteRequest):
+  require_valid_license(request)
   return _stream_response(chapter_rewrite_stream(request.app.state.settings, payload, "humanize"))
 
 
 @router.post("/batch-generate/stream")
 async def stream_batch_generate(request: Request, payload: BatchGenerateRequest):
+  require_valid_license(request)
   return _stream_response(batch_generate_stream(request.app.state.settings, payload))
 
 
 @router.post("/continue-project/stream")
 async def stream_continue_project(request: Request, payload: ContinueProjectRequest):
+  require_valid_license(request)
   return _stream_response(continue_project_stream(request.app.state.settings, payload))
 
 
 @router.post("/styles/analyze/stream")
 async def stream_style_analyze(request: Request, payload: StyleAnalyzeRequest):
+  require_valid_license(request)
   return _stream_response(style_analyze_stream(request.app.state.settings, payload))
 
 
 @router.post("/styles/analyze-dna/stream")
 async def stream_style_analyze_dna(request: Request, payload: StyleDNAAnalyzeRequest):
+  require_valid_license(request)
   return _stream_response(style_analyze_dna_stream(request.app.state.settings, payload))
 
 
 @router.post("/styles/calibrate/stream")
 async def stream_style_calibrate(request: Request, payload: StyleCalibrateRequest):
+  require_valid_license(request)
   return _stream_response(style_calibrate_stream(request.app.state.settings, payload))
 
 
 @router.post("/styles/calibrate-narrative/stream")
 async def stream_style_calibrate_narrative(request: Request, payload: StyleCalibrateRequest):
+  require_valid_license(request)
   return _stream_response(style_calibrate_narrative_stream(request.app.state.settings, payload))
 
 
 @router.post("/styles/merge/stream")
 async def stream_style_merge(request: Request, payload: StyleMergeRequest):
+  require_valid_license(request)
   return _stream_response(style_merge_stream(request.app.state.settings, payload))
 
 

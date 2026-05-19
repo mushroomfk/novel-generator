@@ -1,8 +1,9 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
-import { getLicenseStatus, importLicense } from '../lib/api.js';
+import { getLicenseDeviceFingerprints, getLicenseStatus, importLicense } from '../lib/api.js';
 
 const licenseStatus = ref(null);
+const deviceFingerprints = ref([]);
 const isRefreshing = ref(false);
 const isImporting = ref(false);
 const importMessage = ref('');
@@ -15,11 +16,16 @@ const statusTone = computed(() => (
 const expiresLabel = computed(() => {
   const value = licenseStatus.value?.expires_at;
   if (!value) {
+    if (licenseStatus.value?.valid) {
+      return '永久';
+    }
     return '未写过期时间';
   }
 
   return new Date(value).toLocaleString('zh-CN');
 });
+
+const primaryDeviceFingerprint = computed(() => deviceFingerprints.value[0] ?? '');
 
 async function refreshStatus() {
   isRefreshing.value = true;
@@ -27,6 +33,10 @@ async function refreshStatus() {
 
   try {
     licenseStatus.value = await getLicenseStatus();
+    const devicePayload = await getLicenseDeviceFingerprints();
+    deviceFingerprints.value = Array.isArray(devicePayload?.fingerprints)
+      ? devicePayload.fingerprints
+      : [];
   } catch (error) {
     importMessage.value =
       error instanceof Error ? error.message : '许可证状态读取失败';
@@ -55,6 +65,20 @@ async function submitLicense() {
       error instanceof Error ? error.message : '许可证导入失败';
   } finally {
     isImporting.value = false;
+  }
+}
+
+async function copyDeviceFingerprint() {
+  if (!primaryDeviceFingerprint.value) {
+    importMessage.value = '当前没有可复制的设备码';
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(primaryDeviceFingerprint.value);
+    importMessage.value = '设备码已复制';
+  } catch {
+    importMessage.value = '设备码复制失败，可以手动选中复制';
   }
 }
 
@@ -89,12 +113,27 @@ onMounted(() => {
       <span>过期时间：{{ expiresLabel }}</span>
     </div>
 
+    <div
+      v-if="primaryDeviceFingerprint"
+      class="device-code"
+    >
+      <span>当前设备码</span>
+      <code>{{ primaryDeviceFingerprint }}</code>
+      <button
+        class="ghost-button"
+        type="button"
+        @click="copyDeviceFingerprint"
+      >
+        复制设备码
+      </button>
+    </div>
+
     <label class="license-input">
       <span>导入许可证</span>
       <textarea
         v-model="licenseContent"
         rows="6"
-        placeholder='粘贴许可证内容，例如 {"licensee":"张三","expires_at":"2026-12-31T00:00:00Z"}'
+        placeholder='粘贴签名许可证，例如 {"algorithm":"ed25519","payload":{"licensee":"张三","expires_at":"2026-12-31T00:00:00Z"},"signature":"..."} 或 {"algorithm":"ed25519","payload":{"licensee":"张三","permanent":true},"signature":"..."}'
       />
     </label>
 
@@ -176,6 +215,26 @@ onMounted(() => {
 .license-status-invalid {
   background: #fff5f3;
   border-color: #f0c3bc;
+}
+
+.device-code {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.device-code span {
+  color: #57606a;
+  font-size: 13px;
+}
+
+.device-code code {
+  color: #1f2328;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
 }
 
 .license-input {

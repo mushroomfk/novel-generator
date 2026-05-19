@@ -37,7 +37,12 @@ from novel_backend.models import (
   StyleDetail,
   StyleMergeRequest,
 )
-from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, project_documents_map
+from novel_backend.services.context_builder import (
+  build_project_context_bundle,
+  build_prompt_support,
+  project_documents_map,
+)
+from novel_backend.services.chapter_auto_repair_service import auto_repair_chapter_after_review
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.generation_service import (
   _compact_text,
@@ -56,14 +61,21 @@ from novel_backend.services.humanize_service import (
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.project_service import (
   get_project_detail,
-  update_chapter_content,
+  summarize_chapter_review_status,
+  update_chapter_content_with_review_status,
   update_project_targets,
   update_story_documents,
 )
 from novel_backend.services.skill_service import get_custom_skill_prompt, suggest_reusable_skill
 from novel_backend.services.style_service import get_style
 from novel_backend.services.style_service import rollback_style_calibration, save_style_detail, style_calibration_snapshot
+from novel_backend.utils.jsonfile import atomic_write_json, read_json
 from novel_backend.utils.sse import encode_sse
+
+
+def _now_iso() -> str:
+  return datetime.now(timezone.utc).isoformat()
+
 
 _BRAINSTORM_SYSTEM_PROMPT = """
 你是中文长篇小说的陪跑编辑，负责在创作过程中和作者一起推进问题。
@@ -995,13 +1007,16 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     project_id=payload.project_id,
     chapter_id=payload.chapter_id,
     instruction=payload.instruction,
-    target_words=1800,
+    target_words=payload.target_words or 1800,
     support_text=support,
     characters_involved=payload.characters_involved,
     key_items=payload.key_items,
     scene_location=payload.scene_location,
     time_constraint=payload.time_constraint,
     task_name_prefix="chapter_generate",
+    candidate_count=3,
+    prefer_project_budget=True,
+    complete_chapter=payload.target_words <= 0,
   )
   return ChapterGenerateResult(
     task_id=task_id,
@@ -1321,17 +1336,104 @@ async def style_merge_stream(settings: Settings, payload: StyleMergeRequest):
     yield item
 
 
+def _batch_task_path(settings: Settings, task_id: str):
+  task_dir = settings.data_dir / "batch_tasks"
+  task_dir.mkdir(parents=True, exist_ok=True)
+  return task_dir / f"{task_id}.json"
+
+
+def _batch_task_request_payload(payload: BatchGenerateRequest) -> dict[str, object]:
+  return {
+    "project_id": payload.project_id,
+    "start_chapter": payload.start_chapter,
+    "end_chapter": payload.end_chapter,
+    "instruction": payload.instruction,
+    "style_name": payload.style_name,
+    "xp_preset": payload.xp_preset,
+  }
+
+
+def _load_or_create_batch_task(settings: Settings, payload: BatchGenerateRequest, task_id: str) -> dict[str, object]:
+  path = _batch_task_path(settings, task_id)
+  existing = read_json(path, None)
+  request_payload = _batch_task_request_payload(payload)
+  if isinstance(existing, dict) and existing.get("request") == request_payload:
+    if payload.comment.strip():
+      comments = existing.get("comments")
+      if not isinstance(comments, list):
+        comments = []
+      comments.append({"at": _now_iso(), "comment": payload.comment.strip()})
+      existing["comments"] = comments
+      existing["updated_at"] = _now_iso()
+      atomic_write_json(path, existing)
+    return existing
+
+  state = {
+    "task_id": task_id,
+    "status": "running",
+    "created_at": _now_iso(),
+    "updated_at": _now_iso(),
+    "request": request_payload,
+    "comments": [{"at": _now_iso(), "comment": payload.comment.strip()}] if payload.comment.strip() else [],
+    "chapters": [
+      {
+        "chapter_index": chapter_index,
+        "chapter_id": f"chapter-{chapter_index:03d}",
+        "status": "pending",
+        "attempts": 0,
+        "last_error": "",
+        "result": None,
+      }
+      for chapter_index in range(payload.start_chapter, payload.end_chapter + 1)
+    ],
+  }
+  atomic_write_json(path, state)
+  return state
+
+
+def _save_batch_task(settings: Settings, state: dict[str, object]) -> None:
+  state["updated_at"] = _now_iso()
+  atomic_write_json(_batch_task_path(settings, str(state["task_id"])), state)
+
+
 async def batch_generate_stream(settings: Settings, payload: BatchGenerateRequest):
   if payload.end_chapter < payload.start_chapter:
     raise RuntimeError("结束章节不能小于起始章节")
 
-  task_id = str(uuid4())
-  yield encode_sse("started", {"task_id": task_id})
+  task_id = payload.task_id.strip() or str(uuid4())
+  task_state = _load_or_create_batch_task(settings, payload, task_id)
+  yield encode_sse("started", {"task_id": task_id, "resumable": True})
   generated: list[BatchGenerateChapterResult] = []
-  total = payload.end_chapter - payload.start_chapter + 1
+  chapters = task_state.get("chapters")
+  if not isinstance(chapters, list):
+    chapters = []
+  total = len(chapters)
 
-  for offset, chapter_index in enumerate(range(payload.start_chapter, payload.end_chapter + 1), start=1):
-    chapter_id = f"chapter-{chapter_index:03d}"
+  for offset, task_item in enumerate(chapters, start=1):
+    if not isinstance(task_item, dict):
+      continue
+    chapter_index = int(task_item.get("chapter_index") or offset)
+    chapter_id = str(task_item.get("chapter_id") or f"chapter-{chapter_index:03d}")
+    previous_status = str(task_item.get("status") or "")
+    previous_result = task_item.get("result")
+    if previous_status == "completed" and isinstance(previous_result, dict):
+      generated.append(BatchGenerateChapterResult.model_validate(previous_result))
+      yield encode_sse(
+        "progress",
+        {"step": offset, "total": total, "message": f"第 {chapter_index} 章已完成，跳过"},
+      )
+      continue
+    if previous_status == "failed" and not payload.retry_failed and isinstance(previous_result, dict):
+      generated.append(BatchGenerateChapterResult.model_validate(previous_result))
+      yield encode_sse(
+        "progress",
+        {"step": offset, "total": total, "message": f"第 {chapter_index} 章上次失败，等待重试"},
+      )
+      continue
+
+    task_item["status"] = "running"
+    task_item["attempts"] = int(task_item.get("attempts") or 0) + 1
+    _save_batch_task(settings, task_state)
     yield encode_sse(
       "progress",
       {"step": offset, "total": total, "message": f"正在生成第 {chapter_index} 章"},
@@ -1345,21 +1447,62 @@ async def batch_generate_stream(settings: Settings, payload: BatchGenerateReques
     )
     try:
       result = await asyncio.to_thread(_generate_chapter, settings, request_payload, f"{task_id}-{chapter_index}")
-      await asyncio.to_thread(
-        update_chapter_content,
+      detail, review_error = await asyncio.to_thread(
+        update_chapter_content_with_review_status,
         settings,
         payload.project_id,
         chapter_id,
-        ChapterUpdateRequest(content=result.content, style_name=payload.style_name),
+        ChapterUpdateRequest(content=result.content, style_name=payload.style_name, xp_preset=payload.xp_preset),
       )
+      detail, review_error, repair_result = await asyncio.to_thread(
+        auto_repair_chapter_after_review,
+        settings,
+        payload.project_id,
+        chapter_id,
+        detail,
+        review_error=review_error,
+        style_name=payload.style_name,
+        xp_preset=payload.xp_preset,
+        instruction=payload.instruction,
+      )
+      review_status = summarize_chapter_review_status(detail, chapter_id, review_error)
+      review_score = review_status.get("score")
+      review_label = str(review_status.get("status_label") or "").strip()
+      status = "completed"
+      if review_error:
+        status = f"completed_with_review_error: {review_error}"
+      elif isinstance(review_score, int):
+        status = f"completed: 核验 {review_score}/100"
+        if review_label:
+          status = f"{status}（{review_label}）"
+        if repair_result.applied:
+          status = f"{status}，已自动修订"
+        elif repair_result.attempted:
+          status = f"{status}，自动修订未写入"
+      final_chapter = next((item for item in detail.chapters if item.id == chapter_id), None)
+      preview_content = final_chapter.content if final_chapter is not None and final_chapter.content.strip() else result.content
       generated.append(
         BatchGenerateChapterResult(
           chapter_id=chapter_id,
           title=result.headline or f"第 {chapter_index} 章",
-          status="completed",
-          preview=_compact_text(result.content, 100),
+          status=status,
+          preview=_compact_text(preview_content, 100),
+          review_status=str(review_status.get("status") or ""),
+          review_score=review_score if isinstance(review_score, int) else None,
+          review_summary=str(review_status.get("summary") or ""),
+          review_error=str(review_status.get("error") or ""),
+          review_auto_repair_attempted=repair_result.attempted,
+          review_auto_repair_applied=repair_result.applied,
+          review_auto_repair_rounds_attempted=repair_result.rounds_attempted,
+          review_auto_repair_rounds_applied=repair_result.rounds_applied,
+          review_auto_repair_summary=repair_result.summary,
+          review_auto_repair_error=repair_result.error,
         )
       )
+      task_item["status"] = "completed"
+      task_item["last_error"] = ""
+      task_item["result"] = generated[-1].model_dump(mode="json")
+      _save_batch_task(settings, task_state)
     except Exception as error:
       generated.append(
         BatchGenerateChapterResult(
@@ -1369,9 +1512,18 @@ async def batch_generate_stream(settings: Settings, payload: BatchGenerateReques
           preview="",
         )
       )
+      task_item["status"] = "failed"
+      task_item["last_error"] = str(error)
+      task_item["result"] = generated[-1].model_dump(mode="json")
+      _save_batch_task(settings, task_state)
 
+  task_state["status"] = "completed" if all(
+    isinstance(item, dict) and str(item.get("status") or "") == "completed"
+    for item in chapters
+  ) else "partial"
+  _save_batch_task(settings, task_state)
   yield encode_sse(
     "result",
     BatchGenerateResult(task_id=task_id, generated=generated).model_dump(mode="json"),
   )
-  yield encode_sse("done", {"task_id": task_id, "status": "completed"})
+  yield encode_sse("done", {"task_id": task_id, "status": str(task_state["status"])})

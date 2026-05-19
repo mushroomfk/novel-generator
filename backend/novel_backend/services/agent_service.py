@@ -20,6 +20,7 @@ from novel_backend.models import (
   AgentChatResult,
   AgentEventBlock,
   AgentExecutionTrace,
+  AgentMessage,
   AgentPlan,
   AgentPlanAction,
   AgentStateSummary,
@@ -37,22 +38,39 @@ from novel_backend.models import (
   StoryDocumentBatchUpdateRequest,
   StoryDocumentPatch,
 )
-from novel_backend.services.context_builder import project_documents_map
+from novel_backend.services.context_builder import (
+  build_prompt_support,
+  chapter_average_word_target,
+  chapter_text_length,
+  explicit_length_target,
+  full_chapter_generation_target,
+  instruction_requests_explicit_length,
+  instruction_requests_full_chapter,
+  project_documents_map,
+  recommended_chapter_generation_target,
+)
 from novel_backend.services.agent_trajectory_service import append_agent_trajectory
 from novel_backend.services.config_service import load_config
+from novel_backend.services.chapter_auto_repair_service import (
+  ChapterAutoRepairResult,
+  auto_repair_chapter_after_review,
+)
 from novel_backend.services.generation_service import (
   _extract_json_object,
   _generate_architecture_step,
   _generate_chapter_workflow,
   _invoke_model,
+  _run_continuation_pipeline,
   _string_from_keys,
 )
 from novel_backend.services.project_distillation_service import build_distillation_review_text, resolve_task_pack_kind
 from novel_backend.services.project_learning_service import build_learning_review_artifact
 from novel_backend.services.project_service import (
+  build_project_agent_thread_context,
   get_project_detail,
   load_project_knowledge_material_contents,
-  update_chapter_content,
+  summarize_chapter_review_status,
+  update_chapter_content_with_review_status,
   update_story_documents,
 )
 from novel_backend.services.skill_service import (
@@ -70,6 +88,7 @@ from novel_backend.services.studio_service import (
   _generate_consistency,
   _rewrite_chapter,
 )
+from novel_backend.utils.jsonfile import atomic_write_text
 from novel_backend.utils.sse import encode_sse
 
 _ARCHITECTURE_KEYS = [
@@ -256,6 +275,28 @@ def _skill_query_text(payload: AgentChatRequest) -> str:
   parts.extend(str(item).strip() for item in payload.skill_hints if str(item).strip())
   parts.extend(str(item).strip() for item in payload.reference_filenames if str(item).strip())
   return "\n".join(item for item in parts if item.strip())
+
+
+def _chapter_generation_target_for_action(
+  runtime: RuntimeState,
+  chapter,
+  *,
+  requested_target: int,
+  instruction: str,
+) -> int:
+  explicit_target = explicit_length_target(instruction)
+  if explicit_target > 0:
+    requested_target = explicit_target
+  elif instruction_requests_full_chapter(instruction):
+    full_target = full_chapter_generation_target(runtime.detail, chapter)
+    if full_target > 0:
+      requested_target = full_target
+  return recommended_chapter_generation_target(
+    runtime.detail,
+    chapter,
+    requested_target=requested_target,
+    prefer_project_budget=not instruction_requests_explicit_length(instruction),
+  )
 
 
 def _build_skill_catalog_context(settings: Settings) -> str:
@@ -475,6 +516,68 @@ def _append_reference_note(instruction: str, reference_filenames: list[str]) -> 
   return "\n\n".join(parts).strip()
 
 
+def _thread_context_from_payload(payload: AgentChatRequest) -> str:
+  for item in payload.messages:
+    if item.role == "system" and item.id == "thread-context":
+      return item.content.strip()
+  return ""
+
+
+def _current_message_ids(payload: AgentChatRequest) -> list[str]:
+  return _ordered_unique_strings([item.id for item in payload.messages if item.id.strip()])
+
+
+def _payload_with_thread_context(settings: Settings, payload: AgentChatRequest) -> AgentChatRequest:
+  if not payload.thread_id.strip():
+    return payload
+
+  try:
+    context = build_project_agent_thread_context(
+      settings,
+      payload.project_id,
+      payload.thread_id,
+      query=_latest_user_text(payload),
+      current_message_ids=_current_message_ids(payload),
+      max_chars=3600,
+    )
+  except Exception:
+    return payload
+
+  if not context:
+    return payload
+
+  context_message = AgentMessage(
+    id="thread-context",
+    role="system",
+    content=context,
+    content_hash="thread-context",
+    summary="本地完整对话历史检索",
+  )
+  recent_messages = payload.messages[-49:]
+  if not recent_messages:
+    return payload
+  messages = [*recent_messages[:-1], context_message, recent_messages[-1]]
+  return payload.model_copy(update={"messages": messages})
+
+
+def _append_thread_context_note(instruction: str, payload: AgentChatRequest) -> str:
+  context = _thread_context_from_payload(payload)
+  if not context:
+    return _preserve_thread_context_text(instruction.strip(), 3900)
+  parts = [_preserve_thread_context_text(instruction.strip(), 1200)] if instruction.strip() else []
+  parts.append(f"相关对话历史：\n{_preserve_thread_context_text(context, 2500)}")
+  return _preserve_thread_context_text("\n\n".join(parts).strip(), 3900)
+
+
+def _preserve_thread_context_text(text: str, limit: int) -> str:
+  normalized = str(text or "").strip()
+  if len(normalized) <= limit:
+    return normalized
+  head_limit = max(600, limit // 2)
+  tail_limit = max(600, limit - head_limit - 18)
+  return f"{normalized[:head_limit].rstrip()}\n……\n{normalized[-tail_limit:].lstrip()}"
+
+
 def _instruction_requires_knowledge_review(instruction: str) -> bool:
   return bool(_KNOWLEDGE_REVIEW_PATTERN.search(instruction.strip()))
 
@@ -582,6 +685,93 @@ def _append_artifact(
       metadata=dict(metadata or {}),
     )
   )
+
+
+def _review_metadata(review_status: dict[str, object]) -> dict[str, object]:
+  metadata: dict[str, object] = {}
+  for key in ("score", "status", "status_label", "summary", "is_stale", "updated_at", "error"):
+    value = review_status.get(key)
+    if value not in (None, ""):
+      metadata[f"review_{key}"] = value
+  return metadata
+
+
+def _auto_repair_metadata(repair_result: ChapterAutoRepairResult | None) -> dict[str, object]:
+  if repair_result is None:
+    return {}
+  metadata: dict[str, object] = {
+    "review_auto_repair_attempted": repair_result.attempted,
+    "review_auto_repair_applied": repair_result.applied,
+    "review_auto_repair_rounds_attempted": repair_result.rounds_attempted,
+    "review_auto_repair_rounds_applied": repair_result.rounds_applied,
+    "review_auto_repair_score_threshold": repair_result.score_threshold,
+    "review_auto_repair_max_rounds": repair_result.max_rounds,
+  }
+  for key, value in (
+    ("review_auto_repair_reason", repair_result.reason),
+    ("review_auto_repair_summary", repair_result.summary),
+    ("review_auto_repair_error", repair_result.error),
+    ("review_auto_repair_review_error", repair_result.review_error),
+  ):
+    if value:
+      metadata[key] = value
+  if repair_result.changes:
+    metadata["review_auto_repair_changes"] = repair_result.changes
+  return metadata
+
+
+def _apply_review_feedback(
+  *,
+  reply: str,
+  changes: list[str],
+  suggestions: list[str],
+  review_status: dict[str, object],
+) -> tuple[str, list[str], list[str]]:
+  message = str(review_status.get("message") or "").strip()
+  if not message:
+    return reply, changes, suggestions
+
+  next_changes = [*changes, message]
+  next_suggestions = [*suggestions]
+  if review_status.get("error"):
+    _append_ordered_unique(next_suggestions, "重新运行章节核验。")
+  return f"{reply}\n\n{message}".strip(), next_changes, next_suggestions
+
+
+def _apply_auto_repair_feedback(
+  *,
+  reply: str,
+  changes: list[str],
+  suggestions: list[str],
+  repair_result: ChapterAutoRepairResult | None,
+) -> tuple[str, list[str], list[str]]:
+  if repair_result is None or not repair_result.attempted:
+    return reply, changes, suggestions
+
+  next_changes = [*changes]
+  next_suggestions = [*suggestions]
+  if repair_result.applied:
+    review_status = repair_result.review_status or {}
+    score = review_status.get("score")
+    label = str(review_status.get("status_label") or "").strip()
+    rounds_applied = repair_result.rounds_applied or 1
+    if isinstance(score, int):
+      message = f"已按章节核验自动修订 {rounds_applied} 轮；复查：{score}/100"
+      if label:
+        message = f"{message}（{label}）"
+      message = f"{message}。"
+    else:
+      message = f"已按章节核验自动修订 {rounds_applied} 轮。"
+    next_changes.append(message)
+    if repair_result.summary:
+      message = f"{message}\n{repair_result.summary}"
+    return f"{reply}\n\n{message}".strip(), next_changes, next_suggestions
+
+  reason = repair_result.error or repair_result.reason or "模型没有返回可用改动。"
+  message = f"章节自动修订未写入：{reason}"
+  next_changes.append(message)
+  _append_ordered_unique(next_suggestions, "查看章节核验报告后指定修订重点。")
+  return f"{reply}\n\n{message}".strip(), next_changes, next_suggestions
 
 
 def _record_action_completion(
@@ -1029,13 +1219,20 @@ def _build_action_from_plan_payload(
   payload_label = "" if user_explicit_chapter else str(payload.get("label") or "").strip()
 
   if kind == "chapter_generate":
+    requested_target = max(0, _int_from_value(payload.get("target_words"), 1800)) or 1800
+    target_words = _chapter_generation_target_for_action(
+      runtime,
+      chapter,
+      requested_target=requested_target,
+      instruction=action_instruction,
+    )
     return AgentPlanAction(
       kind=kind,
       label=payload_label or f"生成第 {chapter.index} 章正文",
       task_pack_kind=_task_pack_kind_for_action(kind, action_instruction, mode),
       chapter_id=chapter.id,
       instruction=action_instruction,
-      target_words=max(0, _int_from_value(payload.get("target_words"), 1800)) or 1800,
+      target_words=target_words,
       style_name=request.style_name,
       xp_preset=request.xp_preset,
       characters_involved=request.characters_involved,
@@ -1047,6 +1244,20 @@ def _build_action_from_plan_payload(
 
   if kind == "chapter_workflow":
     workflow_mode = mode if mode in {"diagnose", "scenes", "draft"} else "diagnose"
+    requested_target = (
+      max(0, _int_from_value(payload.get("target_words"), 1800 if workflow_mode == "draft" else 1200))
+      or (1800 if workflow_mode == "draft" else 1200)
+    )
+    target_words = (
+      _chapter_generation_target_for_action(
+        runtime,
+        chapter,
+        requested_target=requested_target,
+        instruction=action_instruction,
+      )
+      if workflow_mode == "draft"
+      else requested_target
+    )
     return AgentPlanAction(
       kind=kind,
       label=payload_label or (
@@ -1058,8 +1269,7 @@ def _build_action_from_plan_payload(
       chapter_id=chapter.id,
       mode=workflow_mode,
       instruction=action_instruction,
-      target_words=max(0, _int_from_value(payload.get("target_words"), 1800 if workflow_mode == "draft" else 1200))
-        or (1800 if workflow_mode == "draft" else 1200),
+      target_words=target_words,
       style_name=request.style_name,
       xp_preset=request.xp_preset,
       skill_ids=action_skill_ids,
@@ -1274,7 +1484,7 @@ def _heuristic_route(text: str) -> RoutingDecision:
       reason="命中诊断关键词",
     )
 
-  if re.search(r"(续写|写正文|补完本章|写这一章|写第.+章|补写|扩成正文)", normalized):
+  if re.search(r"(续写|写正文|补完本章|完整章|整章|写完整|写这一章|写第.+章|补写|扩成正文|扩成完整|扩到完整|按目标字数|补到目标字数)", normalized):
     return RoutingDecision(
       intent="write_chapter",
       objective="生成章节正文",
@@ -1588,6 +1798,12 @@ def _build_plan(runtime: RuntimeState, decision: RoutingDecision, instruction: s
       steps.append("先根据当前项目状态补齐整书架构")
 
     if decision.intent == "write_chapter":
+      target_words = _chapter_generation_target_for_action(
+        runtime,
+        target_chapter,
+        requested_target=1800,
+        instruction=instruction,
+      )
       actions.append(
         AgentPlanAction(
           kind="chapter_generate",
@@ -1595,7 +1811,7 @@ def _build_plan(runtime: RuntimeState, decision: RoutingDecision, instruction: s
           task_pack_kind=_task_pack_kind_for_action("chapter_generate", instruction),
           chapter_id=target_chapter.id,
           instruction=instruction,
-          target_words=1800,
+          target_words=target_words,
           style_name=payload.style_name,
           xp_preset=payload.xp_preset,
           characters_involved=payload.characters_involved,
@@ -1705,6 +1921,15 @@ def _brainstorm_request(
   active_skill_ids: list[str] | None = None,
 ) -> BrainstormRequest:
   extra_context = _append_reference_note("", payload.reference_filenames)
+  thread_context = _thread_context_from_payload(payload)
+  if thread_context:
+    extra_context = "\n\n".join(
+      item for item in [
+        extra_context,
+        f"相关对话历史：\n{_preserve_thread_context_text(thread_context, 3400)}",
+      ]
+      if item.strip()
+    )
   if skill_prompt.strip():
     extra_context = "\n\n".join(
       item for item in [
@@ -1713,6 +1938,7 @@ def _brainstorm_request(
       ]
       if item.strip()
     )
+  extra_context = _preserve_thread_context_text(extra_context, 3900)
   return BrainstormRequest(
     project_id=payload.project_id,
     messages=[
@@ -1808,15 +2034,29 @@ def _execute_chapter_workflow(
   )
 
   if action.mode == "draft" and result.draft.strip():
-    detail = update_chapter_content(
+    detail, review_error = update_chapter_content_with_review_status(
       settings,
       runtime.detail.id,
       action.chapter_id,
       ChapterUpdateRequest(content=result.draft, style_name=action.style_name, xp_preset=action.xp_preset),
     )
-    return result, detail
+    detail, review_error, repair_result = auto_repair_chapter_after_review(
+      settings,
+      runtime.detail.id,
+      action.chapter_id,
+      detail,
+      review_error=review_error,
+      style_name=action.style_name,
+      xp_preset=action.xp_preset,
+      instruction=_compose_execution_instruction(
+        action.instruction,
+        knowledge_summary=knowledge_summary,
+        skill_prompt=skill_prompt,
+      ),
+    )
+    return result, detail, review_error, repair_result
 
-  return result, runtime.detail
+  return result, runtime.detail, "", None
 
 
 def _chapter_generate_instruction(action: AgentPlanAction, knowledge_summary: str = "", skill_prompt: str = "") -> str:
@@ -1845,6 +2085,7 @@ def _execute_chapter_generate(
       project_id=runtime.detail.id,
       chapter_id=action.chapter_id,
       instruction=_chapter_generate_instruction(action, knowledge_summary, skill_prompt),
+      target_words=action.target_words,
       style_name=action.style_name,
       xp_preset=action.xp_preset,
       characters_involved=action.characters_involved,
@@ -1856,13 +2097,23 @@ def _execute_chapter_generate(
   )
   if not result.content.strip():
     raise RuntimeError("章节生成没有返回可保存正文")
-  detail = update_chapter_content(
+  detail, review_error = update_chapter_content_with_review_status(
     settings,
     runtime.detail.id,
     action.chapter_id,
     ChapterUpdateRequest(content=result.content, style_name=action.style_name, xp_preset=action.xp_preset),
   )
-  return result, detail
+  detail, review_error, repair_result = auto_repair_chapter_after_review(
+    settings,
+    runtime.detail.id,
+    action.chapter_id,
+    detail,
+    review_error=review_error,
+    style_name=action.style_name,
+    xp_preset=action.xp_preset,
+    instruction=_chapter_generate_instruction(action, knowledge_summary, skill_prompt),
+  )
+  return result, detail, review_error, repair_result
 
 
 def _render_chapter_generate_reply(result, chapter) -> tuple[str, list[str]]:
@@ -1918,21 +2169,308 @@ def _render_consistency_reply(result, chapter) -> str:
   return "\n".join(reply).strip()
 
 
-def _render_rewrite_reply(result, chapter, mode: str) -> tuple[str, list[str]]:
+_LENGTH_CLAIM_PATTERN = re.compile(
+  r"(完整章|完整章节|整章|目标字数|上、中、下|上中下|扩展为|扩写为|[0-9０-９.．零〇一二三四五六七八九十百千万两]+\s*字)"
+)
+
+
+def _rewrite_instruction_targets_chapter_capacity(instruction: str, mode: str = "") -> bool:
+  if instruction_requests_full_chapter(instruction):
+    return True
+  normalized_mode = str(mode or "").strip().lower()
+  if normalized_mode == "humanize":
+    return False
+  if normalized_mode == "finalize":
+    return True
+  normalized = str(instruction or "").strip()
+  if not normalized:
+    return False
+  return bool(re.search(r"(重写|改写|定稿|扩写|扩成正文|扩成完整|扩到完整|补完本章|补完整)", normalized))
+
+
+def _rewrite_target_for_action(runtime: RuntimeState, action: AgentPlanAction, chapter) -> tuple[int, str]:
+  instruction = str(action.instruction or "")
+  explicit_target = explicit_length_target(instruction)
+  if explicit_target > 0:
+    return explicit_target, "用户要求"
+
+  if instruction_requests_explicit_length(instruction):
+    return 0, ""
+
+  if action.target_words > 0:
+    return action.target_words, "计划目标"
+
+  if instruction_requests_full_chapter(instruction):
+    target = full_chapter_generation_target(runtime.detail, chapter)
+    if target > 0:
+      return target, "完整章目标"
+
+  if not _rewrite_instruction_targets_chapter_capacity(instruction, action.mode):
+    return 0, ""
+
+  average = chapter_average_word_target(runtime.detail)
+  if average >= 9_000:
+    return average, "项目单章均值"
+
+  return 0, ""
+
+
+def _rewrite_length_status(chapter, *, target_words: int, target_basis: str) -> dict[str, object]:
+  saved_words = chapter_text_length(chapter)
+  status = "checked"
+  message = f"保存校验：当前正文约 {saved_words} 字。"
+  if target_words > 0:
+    basis = f"{target_basis}约" if target_basis else "约"
+    if saved_words < int(target_words * 0.9):
+      status = "under_target"
+      message = (
+        f"保存校验：当前正文约 {saved_words} 字，低于{basis} {target_words} 字；"
+        "本次不能标为完整章。"
+      )
+    else:
+      message = f"保存校验：当前正文约 {saved_words} 字，已接近{basis} {target_words} 字。"
+  return {
+    "saved_words": saved_words,
+    "target_words": target_words,
+    "target_basis": target_basis,
+    "status": status,
+    "message": message,
+  }
+
+
+def _filter_unverified_rewrite_changes(
+  changes: list[str],
+  length_status: dict[str, object],
+  *,
+  force: bool = False,
+) -> list[str]:
+  if not force and length_status.get("status") != "under_target":
+    return list(changes)
+  return [
+    item
+    for item in changes
+    if not _LENGTH_CLAIM_PATTERN.search(str(item or ""))
+  ]
+
+
+def _render_rewrite_reply(
+  result,
+  chapter,
+  mode: str,
+  *,
+  changes: list[str] | None = None,
+  length_status: dict[str, object] | None = None,
+) -> tuple[str, list[str]]:
   label = {
     "finalize": "定稿",
     "humanize": "去 AI",
     "polish": "润色",
   }.get(mode, "修订")
-  change_lines = [f"- {item}" for item in result.changes]
+  status = dict(length_status or {})
+  header = f"第 {chapter.index} 章《{chapter.title}》已经完成{label}并写回项目。"
+  if status.get("restored_original"):
+    header = f"第 {chapter.index} 章《{chapter.title}》本轮未覆盖原章节；自动补足失败，已恢复改稿前正文。"
+  elif status.get("status") == "under_target":
+    header = f"第 {chapter.index} 章《{chapter.title}》已写回项目；按完整章目标看仍明显偏短。"
+
+  display_changes = list(changes if changes is not None else result.changes)
+  status_message = str(status.get("message") or "").strip()
+  if status_message:
+    display_changes.append(status_message)
+  change_lines = [f"- {item}" for item in display_changes]
+  summary_text = (
+    "本轮模型改稿未提交到章节正文，因为完整章补足没有成功。"
+    if status.get("restored_original")
+    else result.summary
+  )
   reply = [
-    f"第 {chapter.index} 章《{chapter.title}》已经完成{label}并写回项目。",
+    header,
     "",
-    result.summary,
+    summary_text,
   ]
   if change_lines:
     reply.extend(["", "本轮处理：", *change_lines])
-  return "\n".join(reply).strip(), [f"已写回第 {chapter.index} 章《{chapter.title}》{label}稿"]
+
+  changes_for_trace = (
+    [f"未覆盖第 {chapter.index} 章《{chapter.title}》；已恢复改稿前正文"]
+    if status.get("restored_original")
+    else [f"已写回第 {chapter.index} 章《{chapter.title}》{label}稿"]
+  )
+  if status_message:
+    changes_for_trace.append(status_message)
+  return "\n".join(reply).strip(), changes_for_trace
+
+
+def _rewrite_completion_instruction(
+  action: AgentPlanAction,
+  length_status: dict[str, object],
+  *,
+  knowledge_summary: str = "",
+  skill_prompt: str = "",
+) -> str:
+  saved_words = int(length_status.get("saved_words") or 0)
+  target_words = int(length_status.get("target_words") or 0)
+  remaining_words = max(300, target_words - saved_words)
+  base_instruction = _compose_execution_instruction(
+    action.instruction,
+    knowledge_summary=knowledge_summary,
+    skill_prompt=skill_prompt,
+    limit=1100,
+  )
+  parts = [
+    base_instruction,
+    f"上一轮写回后正文长度约 {saved_words}，仍明显不足。",
+    f"请保留当前章节标题和已保存正文，从当前正文末尾继续扩写一个小节，缺口约 {remaining_words} 字。",
+    "必须写成连续正文，不要输出梗概、说明、修改报告或章节分析。",
+    "补足场景推进、人物行动、冲突升级、信息揭示和段尾钩子，使本章接近项目单章容量。",
+  ]
+  return _compose_execution_instruction("\n".join(item for item in parts if item.strip()), limit=1900)
+
+
+def _complete_underfilled_rewrite(
+  settings: Settings,
+  *,
+  project_id: str,
+  action: AgentPlanAction,
+  original_content: str,
+  detail,
+  review_error: str,
+  repair_result: ChapterAutoRepairResult | None,
+  length_status: dict[str, object],
+  target_words: int,
+  target_basis: str,
+  knowledge_summary: str = "",
+  skill_prompt: str = "",
+) -> tuple[object, str, ChapterAutoRepairResult | None, dict[str, object], dict[str, object]]:
+  completion_info: dict[str, object] = {
+    "attempted": False,
+    "applied": False,
+    "rounds_attempted": 0,
+    "rounds_applied": 0,
+    "summaries": [],
+    "error": "",
+  }
+  current_detail = detail
+  current_review_error = review_error
+  current_repair_result = repair_result
+  current_status = dict(length_status)
+  current_chapter = next((item for item in current_detail.chapters if item.id == action.chapter_id), None)
+  if current_chapter is None:
+    completion_info["error"] = "自动续写前目标章节不存在"
+    return current_detail, current_review_error, current_repair_result, current_status, completion_info
+  chapter_path = Path(current_detail.path) / "chapters" / f"{current_chapter.index:03d}.md"
+  support_text = build_prompt_support(
+    settings,
+    task_key="chapter",
+    style_name=action.style_name,
+    style_task_type="chapter",
+    style_query=action.instruction,
+    xp_name=action.xp_preset,
+  )
+
+  target_for_rounds = max(0, int(target_words or current_status.get("target_words") or 0))
+  max_rounds = min(24, max(4, ((target_for_rounds + 1_199) // 1_200) + 2))
+  for round_index in range(1, max_rounds + 1):
+    if current_status.get("status") != "under_target":
+      break
+    saved_words = int(current_status.get("saved_words") or 0)
+    target = int(current_status.get("target_words") or target_words or 0)
+    if target <= 0:
+      break
+    remaining_words = max(300, target - saved_words)
+    chunk_target = min(4_500, remaining_words)
+    completion_info["attempted"] = True
+    completion_info["rounds_attempted"] = int(completion_info["rounds_attempted"] or 0) + 1
+
+    try:
+      pipeline = _run_continuation_pipeline(
+        settings,
+        project_id=project_id,
+        chapter_id=action.chapter_id,
+        instruction=_rewrite_completion_instruction(
+          action,
+          current_status,
+          knowledge_summary=knowledge_summary,
+          skill_prompt=skill_prompt,
+        ),
+        target_words=chunk_target,
+        support_text=support_text,
+        task_name_prefix=f"rewrite_completion:{round_index}",
+        candidate_count=1,
+        prefer_project_budget=False,
+      )
+    except Exception as error:
+      completion_info["error"] = str(error)
+      break
+
+    completed_content = str(pipeline.get("content") or "").strip()
+    if len(completed_content) <= saved_words + 100:
+      completion_info["error"] = "自动续写没有产生足够的新正文"
+      break
+
+    atomic_write_text(chapter_path, completed_content)
+    current_detail = get_project_detail(settings, project_id)
+    completion_info["rounds_applied"] = int(completion_info["rounds_applied"] or 0) + 1
+    summary = str(pipeline.get("summary") or "").strip()
+    if summary:
+      summaries = list(completion_info.get("summaries") or [])
+      summaries.append(summary)
+      completion_info["summaries"] = summaries[:3]
+
+    chapter = next((item for item in current_detail.chapters if item.id == action.chapter_id), None)
+    if chapter is None:
+      completion_info["error"] = "自动续写后目标章节不存在"
+      break
+    current_status = _rewrite_length_status(chapter, target_words=target_words, target_basis=target_basis)
+
+  if completion_info.get("attempted") and current_status.get("status") != "under_target" and int(completion_info.get("rounds_applied") or 0) > 0:
+    final_chapter = next((item for item in current_detail.chapters if item.id == action.chapter_id), None)
+    final_content = str(getattr(final_chapter, "content", "") or "")
+    current_detail, current_review_error = update_chapter_content_with_review_status(
+      settings,
+      project_id,
+      action.chapter_id,
+      ChapterUpdateRequest(content=final_content, style_name=action.style_name, xp_preset=action.xp_preset),
+    )
+    current_detail, current_review_error, current_repair_result = auto_repair_chapter_after_review(
+      settings,
+      project_id,
+      action.chapter_id,
+      current_detail,
+      review_error=current_review_error,
+      style_name=action.style_name,
+      xp_preset=action.xp_preset,
+      instruction=_rewrite_completion_instruction(
+        action,
+        current_status,
+        knowledge_summary=knowledge_summary,
+        skill_prompt=skill_prompt,
+      ),
+    )
+    final_chapter = next((item for item in current_detail.chapters if item.id == action.chapter_id), None)
+    current_status = _rewrite_length_status(final_chapter, target_words=target_words, target_basis=target_basis)
+    if current_status.get("status") != "under_target":
+      completion_info["applied"] = True
+    else:
+      completion_info["error"] = "自动补足完成后仍未达到完整章容量"
+
+  if completion_info.get("attempted") and not completion_info.get("applied") and not completion_info.get("error"):
+    completion_info["error"] = "自动补足后仍未达到完整章容量"
+
+  if completion_info.get("attempted") and not completion_info.get("applied"):
+    current_detail, current_review_error = update_chapter_content_with_review_status(
+      settings,
+      project_id,
+      action.chapter_id,
+      ChapterUpdateRequest(content=original_content, style_name=action.style_name, xp_preset=action.xp_preset),
+    )
+    chapter = next((item for item in current_detail.chapters if item.id == action.chapter_id), None)
+    current_status = _rewrite_length_status(chapter, target_words=target_words, target_basis=target_basis)
+    current_status["restored_original"] = True
+    current_repair_result = None
+    completion_info["restored_original"] = True
+
+  return current_detail, current_review_error, current_repair_result, current_status, completion_info
 
 
 @register_action_handler("review_knowledge")
@@ -2169,7 +2707,7 @@ async def _handle_continue_project(ctx: AgentActionExecutionContext, state: Agen
 
 @register_action_handler("chapter_generate")
 async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
-  result, detail = await asyncio.to_thread(
+  result, detail, review_error, repair_result = await asyncio.to_thread(
     _execute_chapter_generate,
     ctx.settings,
     state.runtime,
@@ -2183,15 +2721,32 @@ async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: Agen
   if chapter is None:
     raise RuntimeError("目标章节不存在")
   state.last_reply, chapter_changes = _render_chapter_generate_reply(result, chapter)
+  review_status = summarize_chapter_review_status(state.runtime.detail, chapter.id, review_error)
+  state.last_reply, chapter_changes, state.suggestions = _apply_review_feedback(
+    reply=state.last_reply,
+    changes=chapter_changes,
+    suggestions=[item for item in [result.next_action] if item] or state.suggestions,
+    review_status=review_status,
+  )
+  state.last_reply, chapter_changes, state.suggestions = _apply_auto_repair_feedback(
+    reply=state.last_reply,
+    changes=chapter_changes,
+    suggestions=state.suggestions,
+    repair_result=repair_result,
+  )
   state.changes.extend(chapter_changes)
-  state.suggestions = [item for item in [result.next_action] if item] or state.suggestions
   _append_artifact(
     state,
     kind="chapter_content",
     title=f"第 {chapter.index} 章《{chapter.title}》",
     summary=result.summary,
-    content_preview=result.content,
-    metadata={"chapter_id": chapter.id, "chapter_index": chapter.index},
+    content_preview=chapter.content or result.content,
+    metadata={
+      "chapter_id": chapter.id,
+      "chapter_index": chapter.index,
+      **_review_metadata(review_status),
+      **_auto_repair_metadata(repair_result),
+    },
   )
   _record_action_completion(
     state,
@@ -2205,7 +2760,7 @@ async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: Agen
 
 @register_action_handler("chapter_workflow")
 async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
-  result, detail = await asyncio.to_thread(
+  result, detail, review_error, repair_result = await asyncio.to_thread(
     _execute_chapter_workflow,
     ctx.settings,
     state.runtime,
@@ -2219,9 +2774,26 @@ async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, stat
   if chapter is None:
     raise RuntimeError("目标章节不存在")
   state.last_reply, workflow_changes = _render_workflow_reply(result, chapter)
+  if result.mode == "draft":
+    review_status = summarize_chapter_review_status(state.runtime.detail, chapter.id, review_error)
+    state.last_reply, workflow_changes, state.suggestions = _apply_review_feedback(
+      reply=state.last_reply,
+      changes=workflow_changes,
+      suggestions=result.checklist or state.suggestions,
+      review_status=review_status,
+    )
+    state.last_reply, workflow_changes, state.suggestions = _apply_auto_repair_feedback(
+      reply=state.last_reply,
+      changes=workflow_changes,
+      suggestions=state.suggestions,
+      repair_result=repair_result,
+    )
+  else:
+    review_status = {}
+    state.suggestions = result.checklist or state.suggestions
+    repair_result = None
   state.changes.extend(workflow_changes)
-  state.suggestions = result.checklist or state.suggestions
-  preview = result.draft or "\n".join(
+  preview = (chapter.content if result.mode == "draft" else "") or result.draft or "\n".join(
     [
       result.summary,
       *[
@@ -2236,7 +2808,13 @@ async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, stat
     title=f"第 {chapter.index} 章《{chapter.title}》",
     summary=result.summary,
     content_preview=preview,
-    metadata={"mode": result.mode, "chapter_id": chapter.id, "chapter_index": chapter.index},
+    metadata={
+      "mode": result.mode,
+      "chapter_id": chapter.id,
+      "chapter_index": chapter.index,
+      **_review_metadata(review_status),
+      **_auto_repair_metadata(repair_result),
+    },
   )
   _record_action_completion(
     state,
@@ -2294,6 +2872,10 @@ async def _handle_consistency_check(ctx: AgentActionExecutionContext, state: Age
 
 @register_action_handler("rewrite_chapter")
 async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
+  original_chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None)
+  if original_chapter is None:
+    raise RuntimeError("目标章节不存在")
+  target_words, target_basis = _rewrite_target_for_action(state.runtime, ctx.action, original_chapter)
   result = await asyncio.to_thread(
     _rewrite_chapter,
     ctx.settings,
@@ -2311,11 +2893,27 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
     ctx.task_id,
     ctx.action.mode or "polish",
   )
-  update_chapter_content(
+  detail, review_error = await asyncio.to_thread(
+    update_chapter_content_with_review_status,
     ctx.settings,
     state.runtime.detail.id,
     ctx.action.chapter_id,
     ChapterUpdateRequest(content=result.revised, style_name=ctx.action.style_name, xp_preset=ctx.action.xp_preset),
+  )
+  detail, review_error, repair_result = await asyncio.to_thread(
+    auto_repair_chapter_after_review,
+    ctx.settings,
+    state.runtime.detail.id,
+    ctx.action.chapter_id,
+    detail,
+    review_error=review_error,
+    style_name=ctx.action.style_name,
+    xp_preset=ctx.action.xp_preset,
+    instruction=_compose_execution_instruction(
+      ctx.action.instruction,
+      knowledge_summary=state.knowledge_summary,
+      skill_prompt=state.skill_prompt_block,
+    ),
   )
   patches: list[StoryDocumentPatch] = []
   if result.updated_summary.strip():
@@ -2328,27 +2926,123 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
       state.runtime.detail.id,
       StoryDocumentBatchUpdateRequest(documents=patches),
     )
-  state.runtime = _build_runtime_state(ctx.settings, ctx.payload.project_id, ctx.payload.selected_chapter_id)
+  state.runtime = _build_runtime_state(ctx.settings, detail.id, ctx.payload.selected_chapter_id)
   chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None)
   if chapter is None:
     raise RuntimeError("目标章节不存在")
-  state.last_reply, rewrite_changes = _render_rewrite_reply(result, chapter, ctx.action.mode or "polish")
+  length_status = _rewrite_length_status(chapter, target_words=target_words, target_basis=target_basis)
+  completion_info: dict[str, object] = {
+    "attempted": False,
+    "applied": False,
+    "rounds_attempted": 0,
+    "rounds_applied": 0,
+    "summaries": [],
+    "error": "",
+  }
+  if length_status.get("status") == "under_target":
+    detail, review_error, repair_result, length_status, completion_info = await asyncio.to_thread(
+      _complete_underfilled_rewrite,
+      ctx.settings,
+      project_id=state.runtime.detail.id,
+      action=ctx.action,
+      original_content=original_chapter.content,
+      detail=detail,
+      review_error=review_error,
+      repair_result=repair_result,
+      length_status=length_status,
+      target_words=target_words,
+      target_basis=target_basis,
+      knowledge_summary=state.knowledge_summary,
+      skill_prompt=state.skill_prompt_block,
+    )
+    state.runtime = _build_runtime_state(ctx.settings, detail.id, ctx.payload.selected_chapter_id)
+    chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None)
+    if chapter is None:
+      raise RuntimeError("目标章节不存在")
+
+  display_changes = _filter_unverified_rewrite_changes(
+    result.changes,
+    length_status,
+    force=bool(completion_info.get("attempted")),
+  )
+  if completion_info.get("restored_original"):
+    display_changes = []
+  if completion_info.get("applied"):
+    display_changes.append(f"自动续写补足章节容量：当前正文约 {length_status.get('saved_words', 0)} 字。")
+  elif completion_info.get("attempted") and completion_info.get("error"):
+    display_changes.append(f"自动续写补足章节容量失败：{completion_info.get('error')}")
+    if completion_info.get("restored_original"):
+      display_changes.append("自动补足失败，已恢复本轮改稿前正文。")
+  if length_status.get("status") == "under_target":
+    _append_ordered_unique(state.suggestions, "继续扩展本章正文，再重新核验完整章容量。")
+  rewrite_suggestions = [*state.suggestions]
+  state.last_reply, rewrite_changes = _render_rewrite_reply(
+    result,
+    chapter,
+    ctx.action.mode or "polish",
+    changes=display_changes,
+    length_status=length_status,
+  )
+  review_status = summarize_chapter_review_status(state.runtime.detail, chapter.id, review_error)
+  state.last_reply, rewrite_changes, state.suggestions = _apply_review_feedback(
+    reply=state.last_reply,
+    changes=rewrite_changes,
+    suggestions=rewrite_suggestions or state.suggestions,
+    review_status=review_status,
+  )
+  state.last_reply, rewrite_changes, state.suggestions = _apply_auto_repair_feedback(
+    reply=state.last_reply,
+    changes=rewrite_changes,
+    suggestions=state.suggestions,
+    repair_result=repair_result,
+  )
   state.changes.extend(rewrite_changes)
-  state.suggestions = result.changes or state.suggestions
+  length_metadata = {
+    "saved_word_count": length_status.get("saved_words", 0),
+    "length_target_words": length_status.get("target_words", 0),
+    "length_target_basis": length_status.get("target_basis", ""),
+    "length_status": length_status.get("status", ""),
+    "length_completion_attempted": bool(completion_info.get("attempted")),
+    "length_completion_applied": bool(completion_info.get("applied")),
+    "length_completion_rounds_attempted": completion_info.get("rounds_attempted", 0),
+    "length_completion_rounds_applied": completion_info.get("rounds_applied", 0),
+    "length_completion_restored_original": bool(completion_info.get("restored_original")),
+  }
+  if completion_info.get("error"):
+    length_metadata["length_completion_error"] = completion_info.get("error")
+  if completion_info.get("summaries"):
+    length_metadata["length_completion_summaries"] = completion_info.get("summaries")
+  trace_summary = (
+    "自动补足失败，已恢复本轮改稿前正文。"
+    if completion_info.get("restored_original")
+    else result.summary
+  )
+  if completion_info.get("applied"):
+    trace_summary = f"{trace_summary}\n已自动续写补足章节容量。".strip()
+  length_message = str(length_status.get("message") or "").strip()
+  if length_message:
+    trace_summary = f"{trace_summary}\n{length_message}".strip()
   _append_artifact(
     state,
     kind="rewrite_report",
     title=f"第 {chapter.index} 章《{chapter.title}》",
-    summary=result.summary,
-    content_preview=result.revised,
-    metadata={"mode": ctx.action.mode or "polish", "chapter_id": chapter.id, "chapter_index": chapter.index},
+    summary=trace_summary,
+    content_preview=chapter.content or result.revised,
+    metadata={
+      "mode": ctx.action.mode or "polish",
+      "chapter_id": chapter.id,
+      "chapter_index": chapter.index,
+      **length_metadata,
+      **_review_metadata(review_status),
+      **_auto_repair_metadata(repair_result),
+    },
   )
   _record_action_completion(
     state,
     ctx.step,
     ctx.action,
     task_pack_kind=ctx.task_pack_kind,
-    summary=result.summary,
+    summary=trace_summary,
     changes=rewrite_changes,
   )
 
@@ -2410,6 +3104,84 @@ def _append_ordered_unique(target: list[str], value: str) -> None:
     target.append(cleaned)
 
 
+def _subtask_specs_for_action(action: AgentPlanAction) -> list[dict[str, str]]:
+  action_id = action.subtask_id or action.kind
+  group = action.parallel_group or f"{action.kind}:{action.chapter_id or action_id}"
+  explicit_role = action.role.strip()
+  explicit_capability = action.capability.strip()
+  if explicit_role or explicit_capability:
+    return [
+      {
+        "subtask_id": action_id,
+        "role": explicit_role or "执行 agent",
+        "capability": explicit_capability or "执行当前 action",
+        "parallel_group": group,
+      }
+    ]
+
+  if action.kind in {"chapter_generate", "chapter_workflow"} and (action.kind == "chapter_generate" or action.mode == "draft"):
+    return [
+      {
+        "subtask_id": f"{action_id}:writer",
+        "role": "写作 agent",
+        "capability": "生成候选正文；允许写正文草稿，不直接写项目记忆",
+        "parallel_group": group,
+      },
+      {
+        "subtask_id": f"{action_id}:continuity",
+        "role": "连续性审校 agent",
+        "capability": "检查人物关系、事件结果、时间地点和道具状态；只产出报告",
+        "parallel_group": group,
+      },
+      {
+        "subtask_id": f"{action_id}:voice",
+        "role": "人物口气审校 agent",
+        "capability": "检查人物声音、对白关系和叙述距离；只产出报告",
+        "parallel_group": group,
+      },
+      {
+        "subtask_id": f"{action_id}:reader",
+        "role": "可读性审校 agent",
+        "capability": "检查节奏、段尾压力和阅读牵引；只产出报告",
+        "parallel_group": group,
+      },
+    ]
+  if action.kind == "review_knowledge":
+    return [
+      {
+        "subtask_id": f"{action_id}:knowledge",
+        "role": "资料分析 agent",
+        "capability": "读取资料并产出 artifact；不能写章节、项目记忆或长期记忆",
+        "parallel_group": group,
+      }
+    ]
+  if action.kind == "consistency_check":
+    return [
+      {
+        "subtask_id": f"{action_id}:continuity",
+        "role": "连续性审校 agent",
+        "capability": "只检查一致性并产出报告；不能改正文",
+        "parallel_group": group,
+      }
+    ]
+  if action.kind == "rewrite_chapter":
+    return [
+      {
+        "subtask_id": f"{action_id}:rewrite",
+        "role": "修订 agent",
+        "capability": "按用户要求修订正文；写回后仍需章节核验",
+        "parallel_group": group,
+      },
+      {
+        "subtask_id": f"{action_id}:review",
+        "role": "核验 agent",
+        "capability": "核验修订结果；只产出报告",
+        "parallel_group": group,
+      },
+    ]
+  return []
+
+
 async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: AgentPlan, task_id: str):
   active_skill_ids = _ordered_unique_strings([
     *_resolve_agent_skill_ids(settings, payload),
@@ -2452,6 +3224,16 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
       "action": action,
       "task_pack_kind": current_task_pack_kind,
     }
+    subtask_specs = _subtask_specs_for_action(action)
+    for spec in subtask_specs:
+      yield {
+        "phase": "subtask_started",
+        "step": index,
+        "total": total,
+        "action": action,
+        "task_pack_kind": current_task_pack_kind,
+        **spec,
+      }
 
     trace_count_before = len(state.execution_trace)
     artifact_count_before = len(state.artifacts)
@@ -2485,10 +3267,31 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
         "message": str(error),
         "trace": state.execution_trace[-1],
       }
+      for spec in subtask_specs:
+        yield {
+          "phase": "subtask_failed",
+          "step": index,
+          "total": total,
+          "action": action,
+          "task_pack_kind": current_task_pack_kind,
+          "message": str(error),
+          **spec,
+        }
       raise
 
     trace_delta = state.execution_trace[trace_count_before:]
     artifact_delta = state.artifacts[artifact_count_before:]
+    action_summary = str(getattr(trace_delta[-1], "summary", "") if trace_delta else "").strip()
+    for spec in subtask_specs:
+      yield {
+        "phase": "subtask_completed",
+        "step": index,
+        "total": total,
+        "action": action,
+        "task_pack_kind": current_task_pack_kind,
+        "summary": action_summary,
+        **spec,
+      }
     yield {
       "phase": "completed",
       "step": index,
@@ -2580,6 +3383,50 @@ def _iter_execution_event_chunks(emitter: AgentEventEmitter, item: object):
   action_kind = str(getattr(action, "kind", ""))
   label = str(getattr(action, "label", ""))
 
+  if phase == "subtask_started":
+    for chunk in emitter.subtask_started(
+      step=step,
+      total=total,
+      action_kind=action_kind,
+      label=label,
+      subtask_id=str(item.get("subtask_id") or ""),
+      role=str(item.get("role") or ""),
+      capability=str(item.get("capability") or ""),
+      parallel_group=str(item.get("parallel_group") or ""),
+    ):
+      yield chunk
+    return
+
+  if phase == "subtask_completed":
+    for chunk in emitter.subtask_result(
+      step=step,
+      total=total,
+      action_kind=action_kind,
+      label=label,
+      subtask_id=str(item.get("subtask_id") or ""),
+      role=str(item.get("role") or ""),
+      capability=str(item.get("capability") or ""),
+      parallel_group=str(item.get("parallel_group") or ""),
+      summary=str(item.get("summary") or ""),
+    ):
+      yield chunk
+    return
+
+  if phase == "subtask_failed":
+    for chunk in emitter.subtask_failed(
+      step=step,
+      total=total,
+      action_kind=action_kind,
+      label=label,
+      subtask_id=str(item.get("subtask_id") or ""),
+      role=str(item.get("role") or ""),
+      capability=str(item.get("capability") or ""),
+      parallel_group=str(item.get("parallel_group") or ""),
+      message=str(item.get("message") or "子任务失败"),
+    ):
+      yield chunk
+    return
+
   if phase == "started":
     for chunk in emitter.action_started(
       step=step,
@@ -2630,6 +3477,7 @@ def _iter_execution_event_chunks(emitter: AgentEventEmitter, item: object):
 
 
 async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
+  payload = _payload_with_thread_context(settings, payload)
   task_id = str(uuid4())
   emitter = AgentEventEmitter(task_id=task_id, thread_id=payload.thread_id)
   for chunk in emitter.session_started():
@@ -2673,6 +3521,7 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
     return
 
   instruction = _append_reference_note(latest_user_message.content, payload.reference_filenames)
+  instruction = _append_thread_context_note(instruction, payload)
 
   try:
     for chunk in emitter.action_started(

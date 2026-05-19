@@ -12,7 +12,7 @@ from novel_backend.models import (
   ProjectMemoryUpdateRequest,
 )
 from novel_backend.services.config_service import initialize_app_storage
-from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support
+from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, explicit_length_target
 from novel_backend.services.project_service import (
   create_project,
   import_project_knowledge,
@@ -80,6 +80,8 @@ class ContextBuilderTestCase(unittest.TestCase):
     )
 
     self.assertIn("核心种子：失踪航线钥匙", bundle.context_text)
+    self.assertIn("章节容量校验：全书目标 50000 字 / 3 章", bundle.context_text)
+    self.assertIn("本章目前明显偏短", bundle.context_text)
     self.assertIn("当前章节：第 1 章《第一章 雨夜靠港》", bundle.context_text)
     self.assertIn("作者明确要求 / 硬规则 / 作者要求", bundle.context_text)
     self.assertIn("系统整理 / 连续性 / 最近推进", bundle.context_text)
@@ -89,6 +91,24 @@ class ContextBuilderTestCase(unittest.TestCase):
     self.assertGreaterEqual(len(bundle.knowledge_hits), 1)
     self.assertIsNotNone(bundle.budget_report)
     self.assertEqual(bundle.budget_report.trimmed_blocks, [])
+
+  def test_explicit_length_target_accepts_common_chinese_word_counts(self) -> None:
+    cases = {
+      "写15000字": 15_000,
+      "写1万字": 10_000,
+      "写1.5万字": 15_000,
+      "写1万5千字": 15_000,
+      "写一万五千字": 15_000,
+      "写一万五字": 15_000,
+      "写三千五百字": 3_500,
+      "写三千五字": 3_500,
+      "写三千零五字": 3_005,
+      "写十万字": 30_000,
+    }
+
+    for instruction, expected in cases.items():
+      with self.subTest(instruction=instruction):
+        self.assertEqual(explicit_length_target(instruction), expected)
 
   def test_project_context_bundle_trims_oversized_chapter_body(self) -> None:
     long_body = "# 第一章 雨夜靠港\n" + "\n".join(

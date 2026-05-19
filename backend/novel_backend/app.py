@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -38,6 +39,29 @@ def _error_payload(message: str, code: str) -> dict[str, object]:
   }
 
 
+def _validation_error_location(loc: object) -> str:
+  if not isinstance(loc, (list, tuple)):
+    return "请求体"
+
+  parts = [str(part) for part in loc if part != "body"]
+  return ".".join(parts) if parts else "请求体"
+
+
+def _validation_error_message(exc: RequestValidationError) -> str:
+  errors = exc.errors()
+  if not errors:
+    return "请求参数不符合接口要求。"
+
+  messages = []
+  for item in errors[:3]:
+    location = _validation_error_location(item.get("loc"))
+    reason = str(item.get("msg") or "格式不正确")
+    messages.append(f"{location}：{reason}")
+
+  suffix = f"；另有 {len(errors) - 3} 个错误" if len(errors) > 3 else ""
+  return f"请求参数不符合接口要求：{'；'.join(messages)}{suffix}"
+
+
 def create_app() -> FastAPI:
   settings = get_settings()
   app = FastAPI(
@@ -71,6 +95,13 @@ def create_app() -> FastAPI:
     return JSONResponse(
       status_code=exc.status_code,
       content=_error_payload(str(exc.detail), "http_error"),
+    )
+
+  @app.exception_handler(RequestValidationError)
+  async def request_validation_exception_handler(_request: Request, exc: RequestValidationError):
+    return JSONResponse(
+      status_code=422,
+      content=_error_payload(_validation_error_message(exc), "validation_error"),
     )
 
   @app.exception_handler(Exception)
