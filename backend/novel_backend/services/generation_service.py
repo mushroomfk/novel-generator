@@ -6,8 +6,6 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 from uuid import uuid4
 
 from novel_backend.config import Settings
@@ -40,6 +38,7 @@ from novel_backend.services.context_builder import (
 )
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.project_service import get_project_detail, search_project_knowledge_evidence
 from novel_backend.utils.sse import encode_sse
@@ -401,30 +400,14 @@ _compact_text = compact_text
 
 
 def _request_chat_completion(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-  request = urllib_request.Request(endpoint, data=body, method="POST")
-  request.add_header("Content-Type", "application/json")
-  request.add_header("Authorization", f"Bearer {api_key}")
-
-  try:
-    with urllib_request.urlopen(request, timeout=120) as response:
-      raw_text = response.read().decode("utf-8")
-  except urllib_error.HTTPError as error:
-    error_text = error.read().decode("utf-8", errors="ignore")
-    message = error_text or str(error)
-    raise RuntimeError(f"模型请求失败: {error.code} {message}") from error
-  except urllib_error.URLError as error:
-    raise RuntimeError(f"模型请求失败: {error.reason}") from error
-
-  try:
-    parsed = json.loads(raw_text)
-  except json.JSONDecodeError as error:
-    raise RuntimeError("模型返回的不是合法 JSON") from error
-
-  if not isinstance(parsed, dict):
-    raise RuntimeError("模型返回格式不正确")
-
-  return parsed
+  return request_json(
+    endpoint,
+    api_key,
+    payload,
+    failure_label="模型请求失败",
+    invalid_json_message="模型返回的不是合法 JSON",
+    invalid_format_message="模型返回格式不正确",
+  )
 
 
 def _model_is_aliyun(model_config: ModelConfig) -> bool:

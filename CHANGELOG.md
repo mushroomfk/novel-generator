@@ -336,3 +336,9 @@
 - 修改摘要：基于当前工作区重新执行 macOS 测试版验证和打包，生成 `release/test-release/macos/稿匣_0.1.0_测试包`，包内包含 DMG、安装说明、测试反馈清单、`SHA256SUMS.txt` 和包信息。
 - 影响范围：macOS arm64 测试包分发产物；不改变应用接口、项目数据格式、许可证格式或模型配置。
 - 验证结果：`npm run release:test:macos` 通过，包含 147 个 backend 用例、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查和 `.app` 主程序 10 秒启动检查；测试包内 `shasum -a 256 -c SHA256SUMS.txt` 通过；`hdiutil verify` 确认 DMG 校验有效。
+
+### 模型网络断连重试
+
+- 修改摘要：模型请求新增统一网络传输层，对 SSL EOF、远端提前断开、连接重置、429 和 5xx 短时错误进行重试；错误分类新增 `network`，不再把 SSL EOF 显示成未知模型错误。
+- 影响范围：聊天模型调用、Embedding、重排序、项目愿景、Prompt 历史错误字段和模型错误提示。
+- 验证结果：`python3 -m py_compile` 通过；`.venv/bin/python -m unittest backend.tests.test_model_transport_service backend.tests.test_model_error_service -v` 通过；`npm run backend:test` 通过，150 个用例通过。

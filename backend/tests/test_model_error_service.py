@@ -21,6 +21,16 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(classify_model_error("模型请求失败: 404 model not found").kind, "model_not_found")
     self.assertEqual(classify_model_error("invalid model name").kind, "model_not_found")
 
+  def test_classifies_ssl_eof_as_network_error(self) -> None:
+    classified = classify_model_error(
+      "模型请求失败: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
+    )
+
+    self.assertEqual(classified.kind, "network")
+    self.assertEqual(classified.title, "模型网络连接中断")
+    self.assertTrue(classified.retryable)
+    self.assertEqual(classify_model_error("Remote end closed connection without response").kind, "network")
+
   def test_invoke_model_records_structured_error_history(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
       settings = Settings(data_dir=Path(temp_dir))

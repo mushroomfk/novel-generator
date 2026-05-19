@@ -63,10 +63,20 @@ _TIMEOUT_PATTERNS = (
   "timed out",
   "timeout",
   "read timed out",
+  "超时",
+)
+_NETWORK_PATTERNS = (
+  "unexpected_eof",
+  "unexpected eof",
+  "eof occurred",
+  "remote end closed",
+  "connection closed",
   "connection reset",
   "connection aborted",
   "network",
-  "超时",
+  "ssl",
+  "tls",
+  "_ssl.c",
   "连接",
 )
 _FORMAT_PATTERNS = (
@@ -144,6 +154,14 @@ def classify_model_error(error: object) -> ModelErrorClassification:
       kind="server_error",
       title="模型服务暂时异常",
       user_action="稍后重试；如果持续出现，换一个供应商或模型。",
+      retryable=True,
+    )
+
+  if _contains_any(lowered, _NETWORK_PATTERNS):
+    return ModelErrorClassification(
+      kind="network",
+      title="模型网络连接中断",
+      user_action="模型供应商或当前网络在连接过程中断开。请直接重试；如果连续出现，再检查代理或切换供应商。",
       retryable=True,
     )
 

@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
 from novel_backend.config import Settings
 from novel_backend.models import EmbeddingConfig
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_transport_service import request_json
 
 
 class EmbeddingConfigError(RuntimeError):
@@ -69,29 +67,14 @@ def _embeddings_endpoint(base_url: str) -> str:
 
 
 def _request_embeddings(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-  request = urllib_request.Request(endpoint, data=body, method="POST")
-  request.add_header("Content-Type", "application/json")
-  request.add_header("Authorization", f"Bearer {api_key}")
-
-  try:
-    with urllib_request.urlopen(request, timeout=120) as response:
-      raw_text = response.read().decode("utf-8")
-  except urllib_error.HTTPError as error:
-    error_text = error.read().decode("utf-8", errors="ignore")
-    message = error_text or str(error)
-    raise RuntimeError(f"Embedding 请求失败: {error.code} {message}") from error
-  except urllib_error.URLError as error:
-    raise RuntimeError(f"Embedding 请求失败: {error.reason}") from error
-
-  try:
-    parsed = json.loads(raw_text)
-  except json.JSONDecodeError as error:
-    raise RuntimeError("Embedding 返回的不是合法 JSON") from error
-
-  if not isinstance(parsed, dict):
-    raise RuntimeError("Embedding 返回格式不正确")
-  return parsed
+  return request_json(
+    endpoint,
+    api_key,
+    payload,
+    failure_label="Embedding 请求失败",
+    invalid_json_message="Embedding 返回的不是合法 JSON",
+    invalid_format_message="Embedding 返回格式不正确",
+  )
 
 
 def _extract_embedding_vectors(payload: dict[str, object], expected_count: int) -> list[list[float]]:
