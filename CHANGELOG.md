@@ -350,3 +350,27 @@
 - 修改摘要：核查运行日志后确认，2026-05-19 的一次第一章重写把“当前正文约 3870 字”误识别成用户目标，导致 `length_target_words=3870` 且未触发 15000 字完整章补足。本次修正字数识别：状态描述、保存校验、现有正文长度不会作为目标；“15000 字目标”“单章均值约 15000 字”这类表达才会作为章节目标。架构完整、单章均值较高的项目里，Agent 收到“继续写第一章”这类未指定短稿的写作请求时，会按当前章节距离单章均值的缺口生成完整章。改稿补足也会把完整剩余缺口交给小节生成流程，超过 5500 字时按小节追加，并在日志里记录小节计划和完成状态。
 - 影响范围：`context_builder` 字数目标解析、Agent 章节生成目标规划、`rewrite_chapter` 自动补足、`generation_service` 小节生成日志、章节生成/改稿说明文档；不改变章节保存路径、SSE 协议、模型配置或项目数据格式。
 - 验证结果：`python3 -m py_compile backend/novel_backend/services/context_builder.py backend/novel_backend/services/agent_service.py backend/novel_backend/services/generation_service.py backend/tests/test_context_builder.py backend/tests/test_agent_service.py` 通过；定向回归 4 个用例通过；`npm run backend:test` 通过，152 个用例通过；`npm run build` 通过；`git diff --check` 通过。
+
+### 模型请求传输机制扩展
+
+- 修改摘要：统一 JSON 传输层支持自定义 method、headers、原始 body 和空响应，除聊天模型、Embedding、重排序和项目愿景外，联网考据与 qwen-doc 文档抽取也改为使用同一套超时、短暂错误重试和 JSON 校验机制。
+- 影响范围：模型相关 HTTP 请求、联网考据、导入资料时的 qwen-doc 文件上传 / 状态查询 / 删除；不改变前端接口、模型配置或项目数据格式。
+- 验证结果：`python3 -m py_compile backend/novel_backend/services/model_transport_service.py backend/novel_backend/services/web_research_service.py backend/novel_backend/services/import_service.py backend/tests/test_model_transport_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_model_transport_service -v` 通过，4 个用例通过；`.venv/bin/python -m unittest backend.tests.test_web_research_service backend.tests.test_import_service -v` 通过，11 个用例通过；`npm run backend:test` 通过，154 个用例通过；`git diff --check` 通过。
+
+### Agent 线程并发保存修复
+
+- 修改摘要：整体核验时发现界面 smoke 在并发保存 Agent 线程时偶发 `FileNotFoundError`，原因是原子写文件固定复用同一个 `.tmp` 临时文件名。本次改为每次写入使用唯一临时文件名，避免同一路径并发写入时互相移除临时文件。
+- 影响范围：所有通过 `atomic_write_text` / `atomic_write_json` 写入的本地 JSON 和文本文件，重点影响 Agent 线程、上下文索引、配置、历史记录、技能和预设保存；不改变文件路径、文件格式或接口协议。
+- 验证结果：`python3 -m py_compile backend/novel_backend/utils/jsonfile.py backend/tests/test_jsonfile.py` 通过；`.venv/bin/python -m unittest backend.tests.test_jsonfile backend.tests.test_project_service.ProjectServiceTestCase.test_save_and_load_project_agent_threads backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_keeps_long_message_and_builds_context_index backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_removes_stale_thread_files -v` 通过，4 个用例通过；`npm run verify` 通过，155 个后端用例通过且前端生产构建通过；`npm run verify:ui` 首次失败并暴露并发保存问题，修复后重跑通过；`npm run verify:desktop` 通过，包含 155 个后端用例、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查和 `.app` 启动检查；`git diff --check` 通过。
+
+### Embedding 单独配置
+
+- 修改摘要：设置页 Embedding 默认继续按当前写作模型推导，并补正阿里 `text-embedding-v4` 默认维度为 2048；新增“单独设置 Embedding”开关，可以独立填写 Embedding 服务商、模型、接口地址、API Key、维度、检索数量和批量大小。后端保存完整配置时保留传入的 `embedding`，不再按写作模型强制覆盖；旧的单独模型保存路径仍会自动推导 Embedding。
+- 影响范围：模型设置页、`AppConfigUpdateRequest` 保存语义、Embedding 配置持久化、README 和核心引擎说明；不改变知识库索引文件格式、模型请求接口或环境变量名称。
+- 验证结果：`python3 -m py_compile backend/novel_backend/services/config_service.py backend/tests/test_config_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_config_service -v` 通过，8 个用例通过；`npm run verify` 通过，156 个后端用例通过且前端生产构建通过；`npm run verify:ui` 首次等待联网考据未配置提示超时，立即重跑通过；`git diff --check` 通过。
+
+### 0.1.1 测试版发布准备
+
+- 修改摘要：版本号提升到 `0.1.1`，同步 `package.json`、`package-lock.json`、Tauri 配置、Cargo 配置和 README Release 链接；Windows 打包说明中的测试包路径和安装程序名同步到 0.1.1；重新生成 macOS arm64 测试包 `release/test-release/macos/稿匣_0.1.1_测试包`。
+- 影响范围：应用版本号、macOS 测试包输出目录、README Release 链接、Windows 打包说明；不改变运行时接口、项目数据格式或许可证格式。
+- 验证结果：`npm run release:test:macos` 通过，包含 156 个后端用例、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查和 `.app` 启动检查；`shasum -a 256 -c SHA256SUMS.txt` 通过；`hdiutil verify 稿匣_0.1.1_aarch64.dmg` 通过。

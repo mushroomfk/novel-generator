@@ -4,13 +4,17 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 def atomic_write_text(path: Path, content: str) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
-  temp_path = path.with_name(f"{path.name}.tmp")
-  temp_path.write_text(content, encoding="utf-8")
-  os.replace(temp_path, path)
+  temp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+  try:
+    temp_path.write_text(content, encoding="utf-8")
+    os.replace(temp_path, path)
+  finally:
+    temp_path.unlink(missing_ok=True)
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:

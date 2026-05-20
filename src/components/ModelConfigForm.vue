@@ -59,6 +59,7 @@ const form = reactive({
 
 const isSaving = ref(false);
 const message = ref('');
+const customEmbeddingEnabled = ref(false);
 
 function inferModelFamily(model) {
   const baseUrl = String(model?.base_url ?? '').trim().toLowerCase();
@@ -97,7 +98,7 @@ function inferEmbeddingConfig(model, fallback) {
       base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
       api_key: apiKey,
       model_name: 'text-embedding-v4',
-      dimensions: null,
+      dimensions: 2048,
       retrieval_k: fallback?.retrieval_k ?? 6,
       batch_size: fallback?.batch_size ?? 8,
     };
@@ -136,6 +137,37 @@ function inferEmbeddingConfig(model, fallback) {
 const autoEmbeddingFamily = computed(() => inferModelFamily(form.model));
 const autoEmbeddingConfig = computed(() => inferEmbeddingConfig(form.model, form.embedding));
 
+function normalizeDimensions(value) {
+  if (value === '' || value === null || value === undefined) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeEmbeddingPayload(embedding) {
+  return {
+    ...embedding,
+    dimensions: normalizeDimensions(embedding.dimensions),
+    retrieval_k: Number(embedding.retrieval_k) || 6,
+    batch_size: Number(embedding.batch_size) || 8,
+  };
+}
+
+function sameEmbeddingConfig(left, right) {
+  const normalizedLeft = normalizeEmbeddingPayload(left ?? {});
+  const normalizedRight = normalizeEmbeddingPayload(right ?? {});
+  return [
+    'provider',
+    'base_url',
+    'api_key',
+    'model_name',
+    'dimensions',
+    'retrieval_k',
+    'batch_size',
+  ].every((key) => String(normalizedLeft[key] ?? '') === String(normalizedRight[key] ?? ''));
+}
+
 watch(
   () => props.config,
   (nextConfig) => {
@@ -150,6 +182,7 @@ watch(
       dimensions: nextConfig.embedding?.dimensions ?? '',
     });
     Object.assign(form.chapter_auto_repair, nextConfig.chapter_auto_repair ?? {});
+    customEmbeddingEnabled.value = !sameEmbeddingConfig(form.embedding, inferEmbeddingConfig(form.model, form.embedding));
   },
   { immediate: true },
 );
@@ -167,9 +200,12 @@ async function save() {
   message.value = '';
 
   try {
+    const embeddingPayload = customEmbeddingEnabled.value
+      ? normalizeEmbeddingPayload(form.embedding)
+      : normalizeEmbeddingPayload(autoEmbeddingConfig.value);
     await updateModelConfig({
       model: { ...form.model },
-      embedding: { ...autoEmbeddingConfig.value },
+      embedding: embeddingPayload,
       chapter_auto_repair: { ...form.chapter_auto_repair },
     });
     message.value = '写作设置已保存';
@@ -270,24 +306,97 @@ async function save() {
         <div class="section-label">
           Embedding / RAG
         </div>
+        <label class="switch-row">
+          <input
+            v-model="customEmbeddingEnabled"
+            type="checkbox"
+          />
+          <span>单独设置 Embedding</span>
+        </label>
         <div class="auto-panel">
           <p class="auto-title">
-            {{ autoEmbeddingConfig.model_name }}
+            {{ customEmbeddingEnabled ? form.embedding.model_name : autoEmbeddingConfig.model_name }}
           </p>
           <p class="auto-copy">
             {{
-              autoEmbeddingFamily === 'aliyun'
-                ? '当前会自动使用阿里的 Embedding 配置。'
-                : autoEmbeddingFamily === 'volcengine'
-                  ? '当前会自动使用豆包的 Embedding 配置。'
-                  : autoEmbeddingFamily === 'openai-compatible'
-                    ? '当前会自动使用 OpenAI-compatible 的 Embedding 配置。'
-                    : '当前服务商没有命中内置整套预设，会沿用现有 Embedding 配置。'
+              customEmbeddingEnabled
+                ? '知识检索会使用下面单独填写的 Embedding 配置。'
+                : autoEmbeddingFamily === 'aliyun'
+                  ? '当前默认使用阿里的 Embedding 配置。'
+                  : autoEmbeddingFamily === 'volcengine'
+                    ? '当前默认使用豆包的 Embedding 配置。'
+                    : autoEmbeddingFamily === 'openai-compatible'
+                      ? '当前默认使用 OpenAI-compatible 的 Embedding 配置。'
+                      : '当前服务商没有命中内置整套预设，会沿用现有 Embedding 配置。'
             }}
           </p>
-          <p class="auto-copy">服务商：{{ autoEmbeddingConfig.provider }}</p>
-          <p class="auto-copy">接口地址：{{ autoEmbeddingConfig.base_url }}</p>
-          <p class="field-helper">不需要单独再填 Embedding。保存写作模型后，知识检索会自动切到对应向量模型；API Key 默认跟随当前写作模型，留空时继续走环境变量。</p>
+          <p class="auto-copy">服务商：{{ customEmbeddingEnabled ? form.embedding.provider : autoEmbeddingConfig.provider }}</p>
+          <p class="auto-copy">接口地址：{{ customEmbeddingEnabled ? form.embedding.base_url : autoEmbeddingConfig.base_url }}</p>
+          <p class="field-helper">默认跟随当前写作模型；打开“单独设置 Embedding”后，可以为知识检索填写独立模型、接口地址和 API Key。</p>
+        </div>
+        <div
+          v-if="customEmbeddingEnabled"
+          class="embedding-fields"
+        >
+          <div class="grid two-columns">
+            <label>
+              <span>Embedding 服务商</span>
+              <input v-model="form.embedding.provider" />
+            </label>
+
+            <label>
+              <span>Embedding 模型</span>
+              <input v-model="form.embedding.model_name" />
+            </label>
+          </div>
+
+          <label>
+            <span>Embedding 接口地址</span>
+            <input v-model="form.embedding.base_url" />
+          </label>
+
+          <label>
+            <span>Embedding API Key</span>
+            <input
+              v-model="form.embedding.api_key"
+              autocomplete="off"
+              placeholder="留空则走环境变量"
+              type="password"
+            />
+          </label>
+
+          <div class="grid three-columns">
+            <label>
+              <span>向量维度</span>
+              <input
+                v-model="form.embedding.dimensions"
+                min="64"
+                max="4096"
+                placeholder="留空则不传"
+                type="number"
+              />
+            </label>
+
+            <label>
+              <span>检索数量</span>
+              <input
+                v-model.number="form.embedding.retrieval_k"
+                min="1"
+                max="20"
+                type="number"
+              />
+            </label>
+
+            <label>
+              <span>批量大小</span>
+              <input
+                v-model.number="form.embedding.batch_size"
+                min="1"
+                max="32"
+                type="number"
+              />
+            </label>
+          </div>
         </div>
 
         <div class="section-label">
@@ -486,6 +595,11 @@ label > span {
   color: #57606a;
   font-size: 13px;
   line-height: 1.6;
+}
+
+.embedding-fields {
+  display: grid;
+  gap: 14px;
 }
 
 input {

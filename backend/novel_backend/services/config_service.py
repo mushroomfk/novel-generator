@@ -661,12 +661,7 @@ def load_config(settings: Settings) -> AppConfig:
     )
 
   parsed = AppConfig.model_validate(payload)
-  normalized = parsed.model_copy(
-    update={"embedding": resolve_embedding_config(parsed.model, parsed.embedding)}
-  )
-  if normalized.model_dump(mode="json") != parsed.model_dump(mode="json"):
-    atomic_write_json(app_config_path(settings), normalized.model_dump(mode="json"))
-  return normalized
+  return parsed
 
 
 def save_config(settings: Settings, config_update: AppConfigUpdateRequest | ModelConfig) -> AppConfig:
@@ -675,7 +670,7 @@ def save_config(settings: Settings, config_update: AppConfigUpdateRequest | Mode
     embedding_config = resolve_embedding_config(model_config)
   else:
     model_config = config_update.model
-    embedding_config = resolve_embedding_config(model_config, config_update.embedding)
+    embedding_config = config_update.embedding
   current = read_json(app_config_path(settings), None)
   if isinstance(config_update, ModelConfig) and isinstance(current, dict):
     chapter_auto_repair = ChapterAutoRepairConfig.model_validate(current.get("chapter_auto_repair") or {})

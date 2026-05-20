@@ -30,18 +30,18 @@ Windows Desktop Release
 从 GitHub Actions 下载的 Windows 测试产物整理到：
 
 ```text
-release/test-release/windows/稿匣_0.1.0_测试包/
+release/test-release/windows/稿匣_0.1.1_测试包/
 ```
 
 目录包含：
 
-- `稿匣_0.1.0_x64-setup.exe`
+- `稿匣_0.1.1_x64-setup.exe`
 - `novel-backend-x86_64-pc-windows-msvc.exe`
 - `SHA256SUMS.txt`
 - `安装说明-先看这个.md`
 - `测试反馈清单.md`
 
-共享给测试用户时优先提供 `稿匣_0.1.0_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
+共享给测试用户时优先提供 `稿匣_0.1.1_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
 
 ## 本地 Windows 打包
 

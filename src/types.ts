@@ -274,6 +274,16 @@ export interface ModelConfig {
   temperature: number;
 }
 
+export interface EmbeddingConfig {
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model_name: string;
+  dimensions: number | null;
+  retrieval_k: number;
+  batch_size: number;
+}
+
 export interface ChapterAutoRepairConfig {
   enabled: boolean;
   score_threshold: number;
@@ -282,6 +292,7 @@ export interface ChapterAutoRepairConfig {
 
 export interface AppConfig {
   model: ModelConfig;
+  embedding: EmbeddingConfig;
   chapter_auto_repair: ChapterAutoRepairConfig;
   updated_at: string;
 }

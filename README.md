@@ -9,7 +9,7 @@
 
 `稿匣` 把作品文件夹、章节正文、设定资料、知识检索、模型生成、改稿技能和桌面打包流程放在同一个应用里。它适合需要长期维护世界观、人物线、章节上下文和参考资料的个人作者，也适合作为本地 AI 写作工具的二次开发底座。
 
-[Release](https://github.com/mushroomfk/novel-generator/releases/tag/v0.1.0) · [文档索引](./docs/README.md) · [更新记录](./CHANGELOG.md) · [许可](./LICENSE)
+[Release](https://github.com/mushroomfk/novel-generator/releases/tag/v0.1.1) · [文档索引](./docs/README.md) · [更新记录](./CHANGELOG.md) · [许可](./LICENSE)
 
 ## 桌面截图
 
@@ -161,7 +161,7 @@ cp .env.example .env
 - `ARK_API_KEY`
 - `OPENAI_API_KEY`
 
-Embedding 检索可单独配置：
+Embedding 检索默认跟随当前写作模型的服务商配置，也可以在设置里打开“单独设置 Embedding”后使用独立模型、接口地址和 API Key。可用环境变量：
 
 - `NOVEL_EMBEDDING_API_KEY`
 - `DASHSCOPE_API_KEY`

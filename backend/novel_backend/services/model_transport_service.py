@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import ssl
 import time
 from urllib import error as urllib_error
@@ -17,13 +18,34 @@ _RETRYABLE_TRANSPORT_PATTERNS = (
   "connection closed",
   "connection reset",
   "connection aborted",
+  "broken pipe",
   "temporarily unavailable",
+  "temporary failure",
   "timed out",
   "timeout",
   "ssl",
   "tls",
   "_ssl.c",
 )
+
+
+def _build_request(
+  endpoint: str,
+  *,
+  method: str,
+  body: bytes | None,
+  api_key: str | None,
+  headers: dict[str, str] | None,
+  content_type: str | None,
+) -> urllib_request.Request:
+  request = urllib_request.Request(endpoint, data=body, method=method)
+  if api_key:
+    request.add_header("Authorization", f"Bearer {api_key}")
+  if body is not None and content_type:
+    request.add_header("Content-Type", content_type)
+  for key, value in (headers or {}).items():
+    request.add_header(key, value)
+  return request
 
 
 def is_retryable_transport_error(error: object) -> bool:
@@ -49,21 +71,36 @@ def _wait_before_retry(attempt: int) -> None:
 
 def request_json(
   endpoint: str,
-  api_key: str,
-  payload: dict[str, object],
+  api_key: str | None = None,
+  payload: dict[str, object] | None = None,
   *,
+  method: str = "POST",
+  body: bytes | None = None,
+  headers: dict[str, str] | None = None,
+  content_type: str | None = "application/json",
   failure_label: str,
   invalid_json_message: str,
   invalid_format_message: str,
+  allow_empty_response: bool = False,
   timeout: int = 120,
 ) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-  request = urllib_request.Request(endpoint, data=body, method="POST")
-  request.add_header("Content-Type", "application/json")
-  request.add_header("Authorization", f"Bearer {api_key}")
+  if payload is not None and body is not None:
+    raise RuntimeError("请求参数冲突")
+  request_body = body if body is not None else (
+    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if payload is not None else None
+  )
 
   raw_text = ""
   for attempt in range(len(_RETRY_DELAYS) + 1):
+    request = _build_request(
+      endpoint,
+      method=method,
+      body=request_body,
+      api_key=api_key,
+      headers=headers,
+      content_type=content_type,
+    )
     try:
       with urllib_request.urlopen(request, timeout=timeout) as response:
         raw_text = response.read().decode("utf-8")
@@ -79,6 +116,9 @@ def request_json(
       urllib_error.URLError,
       TimeoutError,
       ConnectionError,
+      socket.timeout,
+      http.client.IncompleteRead,
+      http.client.HTTPException,
       http.client.RemoteDisconnected,
       ssl.SSLError,
     ) as error:
@@ -87,6 +127,11 @@ def request_json(
         _wait_before_retry(attempt)
         continue
       raise RuntimeError(f"{failure_label}: {reason}") from error
+
+  if not raw_text.strip():
+    if allow_empty_response:
+      return {}
+    raise RuntimeError(invalid_json_message)
 
   try:
     parsed = json.loads(raw_text)
