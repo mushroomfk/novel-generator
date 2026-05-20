@@ -72,6 +72,61 @@ _FULL_CHAPTER_HINTS = (
   "达到目标字数",
   "补到目标字数",
 )
+_LENGTH_TARGET_HINTS = (
+  "写",
+  "生成",
+  "续写",
+  "扩写",
+  "改写",
+  "重写",
+  "目标",
+  "要求",
+  "容量",
+  "完整章",
+  "完整章节",
+  "整章",
+  "扩成",
+  "扩到",
+  "达到",
+  "达成",
+  "补到",
+  "补足",
+  "单章均值",
+)
+_LENGTH_STRONG_TARGET_HINTS = (
+  "目标",
+  "要求",
+  "容量",
+  "完整章",
+  "完整章节",
+  "整章",
+  "扩成",
+  "扩到",
+  "扩展为",
+  "达到",
+  "达成",
+  "补到",
+  "补足",
+  "单章均值",
+  "左右",
+  "以上",
+  "以内",
+)
+_LENGTH_MEASUREMENT_HINTS = (
+  "当前",
+  "现有",
+  "已有",
+  "目前",
+  "现在",
+  "原约",
+  "原文",
+  "保存校验",
+  "当前正文",
+  "正文约",
+  "短稿",
+  "已接近",
+  "低于",
+)
 _FULL_WIDTH_DIGIT_TABLE = str.maketrans("０１２３４５６７８９．", "0123456789.")
 _CHINESE_DIGITS = {
   "零": 0,
@@ -127,7 +182,7 @@ def instruction_requests_explicit_length(text: str) -> bool:
   normalized = str(text or "").strip()
   if not normalized:
     return False
-  if _EXPLICIT_LENGTH_PATTERN.search(normalized):
+  if explicit_length_target(normalized) > 0:
     return True
   return any(hint in normalized for hint in _SHORT_FORM_HINTS)
 
@@ -228,16 +283,51 @@ def _parse_length_amount(text: str) -> int:
   return _parse_chinese_length_amount(normalized)
 
 
+def _contains_any_hint(text: str, hints: tuple[str, ...]) -> bool:
+  return any(hint in text for hint in hints)
+
+
+def _length_candidate_score(text: str, match: re.Match[str]) -> int:
+  before = text[max(0, match.start() - 16) : match.start()]
+  after = text[match.end() : match.end() + 16]
+  around = f"{before}{after}"
+  target_hint = _contains_any_hint(around, _LENGTH_TARGET_HINTS)
+  strong_target_hint = _contains_any_hint(around, _LENGTH_STRONG_TARGET_HINTS)
+  measurement_hint = _contains_any_hint(around, _LENGTH_MEASUREMENT_HINTS)
+
+  if measurement_hint and not strong_target_hint:
+    return -100
+
+  score = 0
+  if target_hint:
+    score += 100
+  if re.search(r"(写|生成|续写|扩写|改写|重写|补写)\s*$", before):
+    score += 50
+  if _contains_any_hint(after, ("目标", "要求", "容量", "左右", "以上", "以内")):
+    score += 40
+  if len(text.strip()) <= 24:
+    score += 20
+  if measurement_hint:
+    score -= 80
+  return score
+
+
 def explicit_length_target(text: str) -> int:
   normalized = str(text or "").strip()
   if not normalized:
     return 0
-  match = _EXPLICIT_LENGTH_PATTERN.search(normalized)
-  if match is None:
+  candidates: list[tuple[int, int, int]] = []
+  for match in _EXPLICIT_LENGTH_PATTERN.finditer(normalized):
+    number = _parse_length_amount(match.group(1))
+    if number <= 0:
+      continue
+    score = _length_candidate_score(normalized, match)
+    if score <= 0:
+      continue
+    candidates.append((score, match.start(), number))
+  if not candidates:
     return 0
-  number = _parse_length_amount(match.group(1))
-  if number <= 0:
-    return 0
+  _score, _position, number = max(candidates, key=lambda item: (item[0], item[1]))
   return max(300, min(number, _EXPLICIT_LENGTH_MAX))
 
 

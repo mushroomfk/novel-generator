@@ -342,3 +342,11 @@
 - 修改摘要：模型请求新增统一网络传输层，对 SSL EOF、远端提前断开、连接重置、429 和 5xx 短时错误进行重试；错误分类新增 `network`，不再把 SSL EOF 显示成未知模型错误。
 - 影响范围：聊天模型调用、Embedding、重排序、项目愿景、Prompt 历史错误字段和模型错误提示。
 - 验证结果：`python3 -m py_compile` 通过；`.venv/bin/python -m unittest backend.tests.test_model_transport_service backend.tests.test_model_error_service -v` 通过；`npm run backend:test` 通过，150 个用例通过。
+
+## 2026-05-20
+
+### 完整章目标字数识别与小节补足复查
+
+- 修改摘要：核查运行日志后确认，2026-05-19 的一次第一章重写把“当前正文约 3870 字”误识别成用户目标，导致 `length_target_words=3870` 且未触发 15000 字完整章补足。本次修正字数识别：状态描述、保存校验、现有正文长度不会作为目标；“15000 字目标”“单章均值约 15000 字”这类表达才会作为章节目标。架构完整、单章均值较高的项目里，Agent 收到“继续写第一章”这类未指定短稿的写作请求时，会按当前章节距离单章均值的缺口生成完整章。改稿补足也会把完整剩余缺口交给小节生成流程，超过 5500 字时按小节追加，并在日志里记录小节计划和完成状态。
+- 影响范围：`context_builder` 字数目标解析、Agent 章节生成目标规划、`rewrite_chapter` 自动补足、`generation_service` 小节生成日志、章节生成/改稿说明文档；不改变章节保存路径、SSE 协议、模型配置或项目数据格式。
+- 验证结果：`python3 -m py_compile backend/novel_backend/services/context_builder.py backend/novel_backend/services/agent_service.py backend/novel_backend/services/generation_service.py backend/tests/test_context_builder.py backend/tests/test_agent_service.py` 通过；定向回归 4 个用例通过；`npm run backend:test` 通过，152 个用例通过；`npm run build` 通过；`git diff --check` 通过。

@@ -26,6 +26,8 @@ from novel_backend.models import (
   ChapterRewriteResult,
   ChapterUpdateRequest,
   CreateProjectRequest,
+  StoryDocumentBatchUpdateRequest,
+  StoryDocumentPatch,
   KnowledgeImportItem,
   KnowledgeImportRequest,
   ModelConfig,
@@ -38,6 +40,7 @@ from novel_backend.services.project_service import (
   save_project_agent_threads,
   get_project_detail,
   import_project_knowledge,
+  update_story_documents,
   update_chapter_content,
 )
 
@@ -205,6 +208,45 @@ class AgentServiceTestCase(unittest.TestCase):
             project_id=self.project.id,
             selected_chapter_id="chapter-001",
             messages=[AgentMessage(role="user", content="把这一章扩成完整章。")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    chapter_action = next(item for item in result_event[1]["plan"]["actions"] if item["kind"] == "chapter_generate")
+    self.assertGreaterEqual(chapter_action["target_words"], 9_000)
+    self.assertLessEqual(chapter_action["target_words"], 10_000)
+
+  def test_write_request_defaults_to_full_remaining_capacity_when_architecture_ready(self) -> None:
+    update_story_documents(
+      self.settings,
+      self.project.id,
+      StoryDocumentBatchUpdateRequest(
+        documents=[
+          StoryDocumentPatch(key="core_seed", content="核心种子"),
+          StoryDocumentPatch(key="character_design", content="人物设定"),
+          StoryDocumentPatch(key="world_building", content="世界设定"),
+          StoryDocumentPatch(key="plot_structure", content="情节骨架"),
+          StoryDocumentPatch(key="blueprint", content="章节蓝图"),
+        ]
+      ),
+    )
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="继续写第一章")],
           ),
         )
       )
@@ -1159,7 +1201,8 @@ class AgentServiceTestCase(unittest.TestCase):
     artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
     self.assertEqual(artifact["metadata"]["length_status"], "checked")
     self.assertTrue(artifact["metadata"]["length_completion_applied"])
-    self.assertLessEqual(captured_completion_target, 4500)
+    self.assertGreater(captured_completion_target, 5500)
+    self.assertLessEqual(captured_completion_target, artifact["metadata"]["length_target_words"])
     self.assertGreaterEqual(
       artifact["metadata"]["saved_word_count"],
       int(artifact["metadata"]["length_target_words"] * 0.9),
@@ -1167,6 +1210,76 @@ class AgentServiceTestCase(unittest.TestCase):
     detail = get_project_detail(self.settings, self.project.id)
     chapter = next(item for item in detail.chapters if item.id == "chapter-001")
     self.assertEqual(chapter.content, completed_text)
+
+  def test_rewrite_uses_target_length_not_saved_length_from_instruction(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+    )
+    plan = AgentPlan(
+      id="plan-rewrite-length-context",
+      title="重写第 1 章",
+      summary="按要求修订正文。",
+      requires_confirmation=True,
+      steps=["修订第 1 章并写回项目"],
+      actions=[
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="修订第 1 章",
+          chapter_id="chapter-001",
+          mode="finalize",
+          instruction="当前正文约3870字，远低于15000字目标，需完整重写。",
+        )
+      ],
+    )
+    completed_text = "# 第一章\n" + ("追兵逼近。" * 3200)
+
+    with patch(
+      "novel_backend.services.agent_service._rewrite_chapter",
+      return_value=ChapterRewriteResult(
+        task_id="rewrite-task",
+        headline="已处理",
+        summary="少年在旧码头遭遇追兵，章节主事件已整理。",
+        original="# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
+        revised="# 第一章\n旧码头重新亮灯，林追把铜钥匙塞进口袋，听见门外有人停步。\n",
+        changes=["新增追兵逼近和铜钥匙异动。"],
+      ),
+    ), patch(
+      "novel_backend.services.agent_service._run_continuation_pipeline",
+      return_value={
+        "headline": "章节已补足",
+        "summary": "已接续短稿补足章节容量。",
+        "content": completed_text,
+        "next_action": "复查本章。",
+        "scenes": [],
+        "checklist": [],
+      },
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[
+                AgentMessage(role="user", content="重写第一章"),
+                AgentMessage(role="assistant", content="修订正文。"),
+                AgentMessage(role="user", content="确认执行"),
+              ],
+              approved_plan=plan,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "rewrite_report")
+    self.assertEqual(artifact["metadata"]["length_target_words"], 15_000)
+    self.assertNotEqual(artifact["metadata"]["length_target_words"], 3_870)
+    self.assertTrue(artifact["metadata"]["length_completion_attempted"])
 
   def test_rewrite_restores_original_when_length_completion_fails_before_any_saved_chunk(self) -> None:
     original_content = "# 第一章\n旧码头重新亮灯，主角被迫回港。\n"

@@ -1737,6 +1737,14 @@ def _run_segmented_continuation_pipeline(
       max(planned_section_count + 2, math.ceil(max(completion_target, target_words) / _CONTINUATION_MIN_SECTION_TARGET) + 2),
     ),
   )
+  append_app_log(
+    settings,
+    "INFO",
+    (
+      f"{task_name_prefix}:segmented planned target={completion_target or target_words} "
+      f"threshold={completion_threshold} segments={section_targets[:planned_section_count]}"
+    ),
+  )
   index = 0
 
   while index < len(section_targets) and index < max_section_count:
@@ -1819,6 +1827,14 @@ def _run_segmented_continuation_pipeline(
   completion_status = ""
   if completion_threshold > 0:
     completion_status = "complete" if actual_words >= completion_threshold else "under_target"
+  append_app_log(
+    settings,
+    "INFO",
+    (
+      f"{task_name_prefix}:segmented completed segments={len(segment_results)} "
+      f"actual={actual_words} status={completion_status or 'checked'}"
+    ),
+  )
   summary_parts = [
     str(canon.get("summary") or "").strip(),
     length_guidance,

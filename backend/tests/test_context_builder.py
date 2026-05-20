@@ -104,11 +104,16 @@ class ContextBuilderTestCase(unittest.TestCase):
       "写三千五字": 3_500,
       "写三千零五字": 3_005,
       "写十万字": 30_000,
+      "当前正文约3870字，远低于15000字目标，需完整重写": 15_000,
+      "将原约2000字短稿扩展为完整章节（约15000字）": 15_000,
     }
 
     for instruction, expected in cases.items():
       with self.subTest(instruction=instruction):
         self.assertEqual(explicit_length_target(instruction), expected)
+
+    self.assertEqual(explicit_length_target("保存校验：当前正文约 3870 字。"), 0)
+    self.assertEqual(explicit_length_target("当前正文仅约3870字，需完整重写"), 0)
 
   def test_project_context_bundle_trims_oversized_chapter_body(self) -> None:
     long_body = "# 第一章 雨夜靠港\n" + "\n".join(

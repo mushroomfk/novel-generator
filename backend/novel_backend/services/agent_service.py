@@ -291,11 +291,15 @@ def _chapter_generation_target_for_action(
     full_target = full_chapter_generation_target(runtime.detail, chapter)
     if full_target > 0:
       requested_target = full_target
+  elif runtime.architecture_ready and chapter_average_word_target(runtime.detail) >= 9_000 and not instruction_requests_explicit_length(instruction):
+    full_target = full_chapter_generation_target(runtime.detail, chapter)
+    if full_target > 0:
+      requested_target = full_target
   return recommended_chapter_generation_target(
     runtime.detail,
     chapter,
     requested_target=requested_target,
-    prefer_project_budget=not instruction_requests_explicit_length(instruction),
+    prefer_project_budget=False if runtime.architecture_ready and requested_target > 0 else not instruction_requests_explicit_length(instruction),
   )
 
 
@@ -2320,7 +2324,8 @@ def _rewrite_completion_instruction(
   parts = [
     base_instruction,
     f"上一轮写回后正文长度约 {saved_words}，仍明显不足。",
-    f"请保留当前章节标题和已保存正文，从当前正文末尾继续扩写一个小节，缺口约 {remaining_words} 字。",
+    f"请保留当前章节标题和已保存正文，从当前正文末尾继续扩写正文，缺口约 {remaining_words} 字。",
+    "如果缺口超过单次安全长度，按多个小节持续承接，直到本章接近目标容量。",
     "必须写成连续正文，不要输出梗概、说明、修改报告或章节分析。",
     "补足场景推进、人物行动、冲突升级、信息揭示和段尾钩子，使本章接近项目单章容量。",
   ]
@@ -2378,7 +2383,6 @@ def _complete_underfilled_rewrite(
     if target <= 0:
       break
     remaining_words = max(300, target - saved_words)
-    chunk_target = min(4_500, remaining_words)
     completion_info["attempted"] = True
     completion_info["rounds_attempted"] = int(completion_info["rounds_attempted"] or 0) + 1
 
@@ -2393,7 +2397,7 @@ def _complete_underfilled_rewrite(
           knowledge_summary=knowledge_summary,
           skill_prompt=skill_prompt,
         ),
-        target_words=chunk_target,
+        target_words=remaining_words,
         support_text=support_text,
         task_name_prefix=f"rewrite_completion:{round_index}",
         candidate_count=1,
