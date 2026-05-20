@@ -359,9 +359,9 @@
 
 ### Agent 线程并发保存修复
 
-- 修改摘要：整体核验时发现界面 smoke 在并发保存 Agent 线程时偶发 `FileNotFoundError`，原因是原子写文件固定复用同一个 `.tmp` 临时文件名。本次改为每次写入使用唯一临时文件名，避免同一路径并发写入时互相移除临时文件。
+- 修改摘要：整体核验时发现界面 smoke 在并发保存 Agent 线程时偶发 `FileNotFoundError`，原因是原子写文件固定复用同一个 `.tmp` 临时文件名。本次改为每次写入使用唯一临时文件名，避免同一路径并发写入时互相移除临时文件；Windows 上同一路径并发 `os.replace` 偶发 `PermissionError` 时会做有限短暂重试。
 - 影响范围：所有通过 `atomic_write_text` / `atomic_write_json` 写入的本地 JSON 和文本文件，重点影响 Agent 线程、上下文索引、配置、历史记录、技能和预设保存；不改变文件路径、文件格式或接口协议。
-- 验证结果：`python3 -m py_compile backend/novel_backend/utils/jsonfile.py backend/tests/test_jsonfile.py` 通过；`.venv/bin/python -m unittest backend.tests.test_jsonfile backend.tests.test_project_service.ProjectServiceTestCase.test_save_and_load_project_agent_threads backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_keeps_long_message_and_builds_context_index backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_removes_stale_thread_files -v` 通过，4 个用例通过；`npm run verify` 通过，155 个后端用例通过且前端生产构建通过；`npm run verify:ui` 首次失败并暴露并发保存问题，修复后重跑通过；`npm run verify:desktop` 通过，包含 155 个后端用例、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查和 `.app` 启动检查；`git diff --check` 通过。
+- 验证结果：`python3 -m py_compile backend/novel_backend/utils/jsonfile.py backend/tests/test_jsonfile.py` 通过；`.venv/bin/python -m unittest backend.tests.test_jsonfile backend.tests.test_project_service.ProjectServiceTestCase.test_save_and_load_project_agent_threads backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_keeps_long_message_and_builds_context_index backend.tests.test_project_service.ProjectServiceTestCase.test_save_project_agent_threads_removes_stale_thread_files -v` 通过；`npm run verify` 通过，156 个后端用例通过且前端生产构建通过；`npm run verify:ui` 首次失败并暴露并发保存问题，修复后重跑通过；`npm run release:test:macos` 通过；Windows `verify:desktop:windows` 首次发现并发 `os.replace` 的 `PermissionError`，已补重试并等待重新验证；`git diff --check` 通过。
 
 ### Embedding 单独配置
 
