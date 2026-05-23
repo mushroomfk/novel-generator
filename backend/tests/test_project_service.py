@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -74,7 +75,7 @@ from novel_backend.services.style_service import save_style
 
 class ProjectServiceTestCase(unittest.TestCase):
   def setUp(self) -> None:
-    self._temp_dir = tempfile.TemporaryDirectory()
+    self._temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt")
     self.settings = Settings(data_dir=Path(self._temp_dir.name))
     initialize_app_storage(self.settings)
 
