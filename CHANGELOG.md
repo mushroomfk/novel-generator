@@ -18,6 +18,12 @@
 
 ## 2026-05-23
 
+### 分支合并与文档同步
+
+- 修改摘要：当前开发分支已合入 `origin/main` 和 `origin/codex/xianyu/windows-package-20260519`，并同步 Agent 自学习文档中的主接口说明。
+- 影响范围：主线文档、Windows 打包发布流程、模型请求重试、章节自动修订、Agent 长篇逐章生产、Agent 自学习说明；接口行为不变。
+- 验证结果：合并后 `npm run verify` 通过，后端 156 个 unittest 和前端生产构建通过；文档同步后 `git diff --check` 通过。
+
 ### 提交前检查修正
 
 - 修改摘要：`release/` 发布测试输出目录加入 `.gitignore`，避免本地测试包、`.DS_Store` 和外部测试说明被误提交。
