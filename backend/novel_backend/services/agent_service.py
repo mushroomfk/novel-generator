@@ -158,6 +158,7 @@ JSON 结构固定为：
 9. 可用技能目录只帮助你理解用户说法；真正执行仍然必须选上面的 action kind。
 10. 如果用户明确提到用户沉淀技能，或者技能目录里某个 custom 技能很贴合，把它的 id 放进 action.skill_ids。
 11. 用户说“以后都按这个方式”“把这套规则记住”“保存成技能”“优化这个技能”时，用 skill_optimize；如果是在更新某个用户技能，把该技能 id 放进 skill_ids。
+12. 用户要生成章节正文、长篇逐章生产、续写下一章或改稿入稿时，把写回后的语言去 AI 和一致性复查纳入执行顺序；用户明确只要初稿、不改稿或不检查时除外。
 """.strip()
 
 _NEXT_CHAPTER_HINT_PATTERN = re.compile(r"(下一章|下章|后面一章|下一回|后续一章)")
@@ -169,6 +170,11 @@ _CHAPTER_NUMBER_PATTERN = re.compile(r"第\s*([0-9零一二三四五六七八九
 _CHAPTER_TITLE_PATTERN = re.compile(r"《([^》]{1,40})》")
 _NEW_CHAPTER_COUNT_PATTERN = re.compile(r"(?:新增|增加|扩写|继续规划|后面再加|再加)\s*([0-9零一二三四五六七八九十百两]+)\s*章")
 _KNOWLEDGE_REVIEW_PATTERN = re.compile(r"(资料库|知识库|参考资料|资料分析|分析资料|先看资料|先读资料|通读资料|吃透资料)")
+_LONGFORM_SUPERVISION_SKIP_PATTERN = re.compile(
+  r"(只(?:要|生成|写).{0,12}初稿|先(?:别|不).{0,8}(?:改稿|去\s*ai|检查|复查)|"
+  r"不(?:要|用|需要).{0,8}(?:改稿|去\s*ai|检查|复查)|暂时不(?:改稿|检查|复查))",
+  re.IGNORECASE,
+)
 _SKILL_OPTIMIZE_PATTERN = re.compile(
   r"(记成技能|保存成技能|沉淀成技能|创建技能|新建技能|优化.*技能|更新.*技能|修改.*技能|"
   r"以后.*(按|照|都|就).*(方式|规则|流程|处理|写|改)|每次.*(按|照|都|就).*(方式|规则|流程|处理|写|改)|"
@@ -582,6 +588,36 @@ def _append_artifact(
       content_preview=_compact_text(content_preview, 600),
       metadata=dict(metadata or {}),
     )
+  )
+
+
+def _append_chapter_review_artifact(state: AgentExecutionState, chapter_id: str) -> None:
+  reviews = getattr(getattr(state.runtime.detail, "story_overview", None), "chapter_reviews", []) or []
+  review = next((item for item in reviews if getattr(item, "chapter_id", "") == chapter_id), None)
+  if review is None:
+    return
+
+  issue_lines: list[str] = []
+  for dimension in getattr(review, "dimensions", []) or []:
+    for issue in getattr(dimension, "issues", []) or []:
+      issue_lines.append(
+        f"[{getattr(issue, 'level', 'warning')}] {getattr(dimension, 'label', '')}：{getattr(issue, 'title', '')}｜{getattr(issue, 'detail', '')}"
+      )
+  suggestion_lines = [f"建议：{item}" for item in (getattr(review, "suggestions", []) or [])]
+  _append_artifact(
+    state,
+    kind="chapter_review",
+    title=f"章节核验：第 {getattr(review, 'chapter_index', 0)} 章",
+    summary=getattr(review, "summary", "") or "章节核验已完成。",
+    content_preview="\n".join([getattr(review, "summary", ""), *issue_lines[:8], *suggestion_lines[:6]]),
+    metadata={
+      "chapter_id": chapter_id,
+      "chapter_index": getattr(review, "chapter_index", 0),
+      "status": getattr(review, "status", ""),
+      "overall_score": getattr(review, "overall_score", 0),
+      "issue_count": len(issue_lines),
+      "is_stale": bool(getattr(review, "is_stale", False)),
+    },
   )
 
 
@@ -1110,7 +1146,11 @@ def _ensure_plan_dependencies(runtime: RuntimeState, instruction: str, actions: 
     )
     action_kinds = [item.kind for item in next_actions]
 
-  needs_architecture = any(item.kind in {"chapter_generate", "rewrite_chapter", "continue_project"} for item in next_actions)
+  needs_architecture = any(
+    item.kind in {"chapter_generate", "rewrite_chapter", "continue_project"}
+    or item.kind == "chapter_workflow" and item.mode == "draft"
+    for item in next_actions
+  )
   if needs_architecture and not runtime.architecture_ready and "generate_architecture" not in action_kinds:
     insert_at = 1 if next_actions and next_actions[0].kind == "review_knowledge" else 0
     next_actions.insert(
@@ -1126,8 +1166,148 @@ def _ensure_plan_dependencies(runtime: RuntimeState, instruction: str, actions: 
   return next_actions
 
 
+def _longform_generation_action(action: AgentPlanAction) -> bool:
+  return action.kind == "chapter_generate" or (action.kind == "chapter_workflow" and action.mode == "draft")
+
+
+def _longform_rewrite_action(action: AgentPlanAction) -> bool:
+  return action.kind == "rewrite_chapter"
+
+
+def _longform_content_write_action(action: AgentPlanAction) -> bool:
+  return _longform_generation_action(action) or _longform_rewrite_action(action)
+
+
+def _longform_supervision_enabled(action: AgentPlanAction) -> bool:
+  if not _longform_content_write_action(action) or not action.chapter_id:
+    return False
+  return not bool(_LONGFORM_SUPERVISION_SKIP_PATTERN.search(action.instruction or ""))
+
+
+def _has_later_action_for_chapter(
+  actions: list[AgentPlanAction],
+  start_index: int,
+  *,
+  chapter_id: str,
+  kind: str,
+  mode: str = "",
+) -> bool:
+  for item in actions[start_index + 1:]:
+    if item.kind != kind or item.chapter_id != chapter_id:
+      continue
+    if mode and item.mode != mode:
+      continue
+    return True
+  return False
+
+
+def _has_later_content_write_for_chapter(actions: list[AgentPlanAction], start_index: int, chapter_id: str) -> bool:
+  for item in actions[start_index + 1:]:
+    if item.chapter_id == chapter_id and _longform_content_write_action(item):
+      return True
+  return False
+
+
+def _longform_humanize_instruction(action: AgentPlanAction) -> str:
+  parts = [
+    action.instruction.strip(),
+    "生成后按长篇章节入稿标准做去 AI 改稿：保留剧情事实、人物关系、信息顺序和伏笔，只处理解释腔、模板句、总结句、对白同质化和节奏过匀的问题。",
+  ]
+  return "\n\n".join(item for item in parts if item).strip()
+
+
+def _longform_consistency_instruction(action: AgentPlanAction) -> str:
+  parts = [
+    action.instruction.strip(),
+    "生成并去 AI 后复查这一章是否和前文、项目记忆、架构总览、人物状态、道具线索、时间地点发生冲突；只报告可被项目来源验证的问题。",
+  ]
+  return "\n\n".join(item for item in parts if item).strip()
+
+
+def _supervise_longform_chapter_actions(actions: list[AgentPlanAction]) -> list[AgentPlanAction]:
+  supervised: list[AgentPlanAction] = []
+  for index, action in enumerate(actions):
+    supervised.append(action)
+    if not _longform_supervision_enabled(action):
+      continue
+
+    has_later_rewrite = _has_later_action_for_chapter(
+      actions,
+      index,
+      chapter_id=action.chapter_id,
+      kind="rewrite_chapter",
+    )
+    has_humanize = _has_later_action_for_chapter(
+      actions,
+      index,
+      chapter_id=action.chapter_id,
+      kind="rewrite_chapter",
+      mode="humanize",
+    )
+    has_consistency = _has_later_action_for_chapter(
+      actions,
+      index,
+      chapter_id=action.chapter_id,
+      kind="consistency_check",
+    )
+    has_later_content_write = _has_later_content_write_for_chapter(actions, index, action.chapter_id)
+    should_add_humanize = (
+      _longform_generation_action(action) and not has_humanize and not has_later_rewrite
+      or _longform_rewrite_action(action) and action.mode != "humanize" and not has_humanize and not has_later_rewrite
+    )
+    if should_add_humanize:
+      supervised.append(
+        AgentPlanAction(
+          kind="rewrite_chapter",
+          label="去 AI 并保留剧情事实",
+          task_pack_kind=_task_pack_kind_for_action("rewrite_chapter", action.instruction, "humanize"),
+          chapter_id=action.chapter_id,
+          mode="humanize",
+          instruction=_longform_humanize_instruction(action),
+          style_name=action.style_name,
+          xp_preset=action.xp_preset,
+          skill_ids=action.skill_ids,
+        )
+      )
+    if not has_consistency and not has_later_content_write:
+      supervised.append(
+        AgentPlanAction(
+          kind="consistency_check",
+          label="复查章节连续性",
+          task_pack_kind=_task_pack_kind_for_action("consistency_check", action.instruction),
+          chapter_id=action.chapter_id,
+          instruction=_longform_consistency_instruction(action),
+          skill_ids=action.skill_ids,
+        )
+      )
+  return supervised
+
+
+def _enhance_longform_plan(runtime: RuntimeState, plan: AgentPlan | None) -> AgentPlan | None:
+  if plan is None:
+    return None
+  next_actions = _supervise_longform_chapter_actions(plan.actions)
+  if len(next_actions) == len(plan.actions):
+    return plan
+  return plan.model_copy(
+    update={
+      "summary": (
+        f"{plan.summary.strip()} 已把章节写回后的语言处理和连续性复查纳入执行顺序。"
+        if plan.summary.strip()
+        else "已把章节写回后的语言处理和连续性复查纳入执行顺序。"
+      ),
+      "steps": [_chapter_step_text(action, runtime) for action in next_actions],
+      "actions": next_actions,
+    }
+  )
+
+
 def _default_requires_confirmation(actions: list[AgentPlanAction]) -> bool:
-  return any(item.kind in {"generate_architecture", "continue_project", "chapter_generate", "rewrite_chapter", "skill_optimize"} for item in actions)
+  return any(
+    item.kind in {"generate_architecture", "continue_project", "chapter_generate", "rewrite_chapter", "skill_optimize"}
+    or item.kind == "chapter_workflow" and item.mode == "draft"
+    for item in actions
+  )
 
 
 def _plan_from_payload(
@@ -1226,6 +1406,16 @@ def _heuristic_route(text: str) -> RoutingDecision:
       chapter_title=chapter_title,
       use_next_chapter=use_next_chapter,
       reason="命中技能优化表达",
+    )
+
+  if _LONGFORM_SUPERVISION_SKIP_PATTERN.search(normalized) and re.search(r"(续写|写正文|写这一章|写第.+章|补写|扩成正文)", normalized):
+    return RoutingDecision(
+      intent="write_chapter",
+      objective="生成章节初稿",
+      chapter_index=chapter_index,
+      chapter_title=chapter_title,
+      use_next_chapter=use_next_chapter,
+      reason="用户只要初稿",
     )
 
   if re.search(r"(去\s*ai|去机器味|去模板味|更像人写|人味)", lower_text):
@@ -1700,13 +1890,13 @@ def _resolve_plan(settings: Settings, runtime: RuntimeState, instruction: str, p
     try:
       plan, reply = _plan_with_model(settings, runtime, instruction, payload)
       if plan is not None or reply is not None:
-        return _apply_skill_ids_to_plan(plan, resolved_skill_ids), reply
+        return _enhance_longform_plan(runtime, _apply_skill_ids_to_plan(plan, resolved_skill_ids)), reply
     except Exception:
       pass
 
   decision = _resolve_decision(settings, runtime, payload.messages)
   plan, reply = _build_plan(runtime, decision, instruction, payload)
-  return _apply_skill_ids_to_plan(plan, resolved_skill_ids), reply
+  return _enhance_longform_plan(runtime, _apply_skill_ids_to_plan(plan, resolved_skill_ids)), reply
 
 
 def _brainstorm_request(
@@ -2204,6 +2394,7 @@ async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: Agen
     content_preview=result.content,
     metadata={"chapter_id": chapter.id, "chapter_index": chapter.index},
   )
+  _append_chapter_review_artifact(state, chapter.id)
   _record_action_completion(
     state,
     ctx.step,
@@ -2249,6 +2440,8 @@ async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, stat
     content_preview=preview,
     metadata={"mode": result.mode, "chapter_id": chapter.id, "chapter_index": chapter.index},
   )
+  if result.mode == "draft":
+    _append_chapter_review_artifact(state, chapter.id)
   _record_action_completion(
     state,
     ctx.step,
@@ -2354,6 +2547,7 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
     content_preview=result.revised,
     metadata={"mode": ctx.action.mode or "polish", "chapter_id": chapter.id, "chapter_index": chapter.index},
   )
+  _append_chapter_review_artifact(state, chapter.id)
   _record_action_completion(
     state,
     ctx.step,

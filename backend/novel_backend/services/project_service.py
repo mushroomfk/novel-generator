@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import shutil
 import sys
+import time
 from array import array
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from novel_backend.models import (
   KnowledgeSearchResult,
   LocalHistoryChangedFile,
   LocalHistoryState,
+  ModelConfig,
   ProjectDeleteResult,
   ProjectDirectoryOpenResult,
   ProjectDreamPromoteRequest,
@@ -57,7 +59,9 @@ from novel_backend.models import (
   WorkingTreeStatus,
 )
 from novel_backend.services.embedding_service import embed_texts, embedding_config_signature
-from novel_backend.services.log_service import append_app_log
+from novel_backend.services.log_service import append_app_log, append_prompt_history
+from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_http_service import request_json_with_retries
 from novel_backend.services.rerank_service import rerank_documents
 from novel_backend.services.project_dream_service import (
   build_project_dream_signature,
@@ -86,12 +90,15 @@ from novel_backend.services.project_memory_service import (
   save_project_memory,
   sync_project_memory,
 )
-from novel_backend.services.config_service import project_index_path
+from novel_backend.services.config_service import load_config, project_index_path
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 _LOCAL_HISTORY_DIRNAME = ".novel-history"
 _APP_STATE_DIRNAME = ".gaoxia"
 _AGENT_THREADS_DIRNAME = "threads"
+_MODEL_STORY_OVERVIEW_FILENAME = "story_overview_model.json"
+_MODEL_STORY_OVERVIEW_SCHEMA_VERSION = "1"
+_MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 22000
 _REFERENCE_DIRNAME = "references"
 _SNAPSHOT_FILES_DIRNAME = "files"
 _KNOWLEDGE_SCHEMA_VERSION = "2"
@@ -664,6 +671,10 @@ def _agent_threads_dir(project_dir: Path) -> Path:
 
 def _agent_threads_index_path(project_dir: Path) -> Path:
   return _agent_threads_dir(project_dir) / "index.json"
+
+
+def _model_story_overview_path(project_dir: Path) -> Path:
+  return _app_state_dir(project_dir) / _MODEL_STORY_OVERVIEW_FILENAME
 
 
 def _agent_thread_path(project_dir: Path, thread_id: str) -> Path:
@@ -3339,6 +3350,702 @@ def _extract_json_structured_overview_entities(text: str) -> dict[str, list[tupl
   return _structured_overview_entities_from_payload(payload)
 
 
+def _overview_source_signature(
+  documents: list[StoryDocument],
+  material_payloads: list[dict[str, str]],
+  chapters: list[ChapterSummary],
+) -> str:
+  parts: list[str] = []
+  for item in documents:
+    parts.append(f"document::{item.key}::{(item.content or '').strip()}")
+  for item in material_payloads:
+    parts.append(f"material::{item.get('title', '').strip()}::{item.get('content', '').strip()}::{item.get('updated_at', '')}")
+  for chapter in chapters:
+    if not chapter.exists and not (chapter.content or "").strip():
+      continue
+    parts.append(f"chapter::{chapter.id}::{chapter.title}::{(chapter.content or chapter.preview or '').strip()}")
+  return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _overview_source_blocks(
+  documents: list[StoryDocument],
+  material_payloads: list[dict[str, str]],
+  chapters: list[ChapterSummary],
+) -> list[str]:
+  blocks: list[str] = []
+  for document in documents:
+    content = (document.content or "").strip()
+    if content:
+      blocks.append(f"【设定文件:{document.label} / {document.key}】\n{content}")
+  for material in material_payloads[:20]:
+    title = material.get("title", "").strip() or "未命名资料"
+    content = _material_analysis_text(material.get("content", ""), limit=3000)
+    if content:
+      blocks.append(f"【资料:{title}】\n{content}")
+  for chapter in chapters:
+    if not chapter.exists or not (chapter.content or "").strip():
+      continue
+    content = _material_analysis_text(_extract_chapter_body(chapter), limit=2600)
+    blocks.append(f"【章节:{chapter.index}《{chapter.title}》】\n{content}")
+  return blocks
+
+
+def _split_oversized_source_block(block: str, limit: int) -> list[str]:
+  if len(block) <= limit:
+    return [block]
+
+  chunks: list[str] = []
+  overlap = min(600, max(0, limit // 5))
+  step = max(1, limit - overlap)
+  for index, start in enumerate(range(0, len(block), step), start=1):
+    piece = block[start : start + limit].strip()
+    if piece:
+      chunks.append(f"【长来源片段 {index}】\n{piece}")
+  return chunks
+
+
+def _overview_source_chunks_from_blocks(blocks: list[str], *, limit: int) -> list[str]:
+  chunks: list[str] = []
+  current: list[str] = []
+  current_size = 0
+
+  def flush_current() -> None:
+    nonlocal current, current_size
+    if current:
+      chunks.append("\n\n".join(current).strip())
+      current = []
+      current_size = 0
+
+  for block in blocks:
+    cleaned = block.strip()
+    if not cleaned:
+      continue
+    if len(cleaned) > limit:
+      flush_current()
+      chunks.extend(_split_oversized_source_block(cleaned, limit))
+      continue
+    separator_size = 2 if current else 0
+    if current and current_size + separator_size + len(cleaned) > limit:
+      flush_current()
+    current.append(cleaned)
+    current_size += separator_size + len(cleaned)
+
+  flush_current()
+  return chunks
+
+
+def _chat_completions_endpoint(base_url: str) -> str:
+  normalized = base_url.strip().rstrip("/")
+  return f"{normalized}/chat/completions" if not normalized.endswith("/chat/completions") else normalized
+
+
+def _resolve_model_api_key(config: ModelConfig) -> str:
+  candidates = [
+    config.api_key,
+    os.getenv("NOVEL_MODEL_API_KEY", ""),
+    os.getenv("DASHSCOPE_API_KEY", ""),
+    os.getenv("ARK_API_KEY", ""),
+    os.getenv("NOVEL_API_KEY", ""),
+    os.getenv("OPENAI_API_KEY", ""),
+  ]
+  for item in candidates:
+    value = item.strip()
+    if value:
+      return value
+  return ""
+
+
+def _is_placeholder_model_config(config: ModelConfig, api_key: str) -> bool:
+  base_url = config.base_url.strip().lower()
+  model_name = config.model_name.strip().lower()
+  return "example.com" in base_url or api_key.strip() == "test-key" or model_name in {"demo-model", "test-model"}
+
+
+def _model_overview_enabled(settings: Settings) -> tuple[ModelConfig | None, str]:
+  config = load_config(settings).model
+  api_key = _resolve_model_api_key(config)
+  if not api_key or not config.base_url.strip() or not config.model_name.strip():
+    return None, ""
+  if _is_placeholder_model_config(config, api_key):
+    return None, ""
+  return config, api_key
+
+
+def _strip_json_code_fence(text: str) -> str:
+  stripped = str(text or "").strip()
+  if not stripped.startswith("```"):
+    return stripped
+  lines = stripped.splitlines()
+  if len(lines) >= 3 and lines[-1].strip() == "```":
+    return "\n".join(lines[1:-1]).strip()
+  return stripped
+
+
+def _extract_json_object_from_text(text: str) -> dict[str, object] | None:
+  stripped = _strip_json_code_fence(text)
+  try:
+    payload = json.loads(stripped)
+  except json.JSONDecodeError:
+    payload = None
+  if isinstance(payload, dict):
+    return payload
+  start = stripped.find("{")
+  end = stripped.rfind("}")
+  if start == -1 or end == -1 or end <= start:
+    return None
+  try:
+    embedded = json.loads(stripped[start : end + 1])
+  except json.JSONDecodeError:
+    return None
+  return embedded if isinstance(embedded, dict) else None
+
+
+def _model_overview_messages(source_text: str) -> list[dict[str, str]]:
+  return [
+    {
+      "role": "system",
+      "content": (
+        "你是中文长篇小说资料整理编辑，只能依据用户提供的项目来源整理架构总览。"
+        "必须输出 JSON 对象，不要输出解释、标题或代码块。"
+        "不能把字段名、普通名词、配置项、任务说明误当成故事节点。"
+      ),
+    },
+    {
+      "role": "user",
+      "content": (
+        "请把下面项目来源整理成架构总览。字段固定为：\n"
+        "{\n"
+        '  "characters": [{"name":"","profile":"","current_state":"","relationships":[],"events":[],"locations":[],"props":[],"skills":[],"scenes":[],"organizations":[],"evidence":[]}],\n'
+        '  "events": [{"name":"","summary":"","related_characters":[],"evidence":[]}],\n'
+        '  "locations": [{"name":"","summary":"","related_characters":[],"evidence":[]}],\n'
+        '  "props": [{"name":"","summary":"","related_characters":[],"evidence":[]}],\n'
+        '  "skills": [{"name":"","summary":"","related_characters":[],"evidence":[]}],\n'
+        '  "scenes": [{"name":"","summary":"","related_characters":[],"evidence":[]}],\n'
+        '  "organizations": [{"name":"","summary":"","related_characters":[],"evidence":[]}]\n'
+        "}\n"
+        "准确性要求：\n"
+        "1. 每个节点必须有 evidence，evidence 必须是来源里的短句或原文片段。\n"
+        "2. 找不到证据就不要输出该节点。\n"
+        "3. relationships 写成“对方：关系说明”，对方必须是来源中出现的人物或明确称谓。\n"
+        "4. events、locations、props、skills、scenes、organizations 都只写来源里明确存在的内容。\n"
+        "5. 不要推测、不要补设定、不要为了填满字段编内容。\n\n"
+        f"项目来源：\n{source_text}"
+      ),
+    },
+  ]
+
+
+def _request_model_story_overview(settings: Settings, source_text: str) -> dict[str, object] | None:
+  config, api_key = _model_overview_enabled(settings)
+  if config is None or not api_key:
+    return None
+
+  endpoint = _chat_completions_endpoint(config.base_url)
+  messages = _model_overview_messages(source_text)
+  chat_payload = {
+    "model": config.model_name,
+    "messages": messages,
+    "temperature": 0.1,
+    "max_tokens": min(max(config.max_tokens, 4096), 16000),
+  }
+  prompt_text = "\n\n".join(f"[{item['role']}] {item['content']}" for item in messages)
+  started = time.perf_counter()
+  try:
+    response_payload = request_json_with_retries(
+      endpoint,
+      headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+      },
+      payload=chat_payload,
+      error_prefix="模型请求失败",
+      invalid_json_message="模型返回的不是合法 JSON",
+      invalid_payload_message="模型返回格式不正确",
+    )
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+      raise RuntimeError("模型返回为空")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+      raise RuntimeError("模型没有返回文本内容")
+    content = message["content"].strip()
+    elapsed = round(time.perf_counter() - started, 3)
+    append_prompt_history(
+      settings,
+      {
+        "task": "story_overview_model",
+        "model": config.model_name,
+        "prompt": prompt_text,
+        "response": content,
+        "status": "completed",
+        "elapsed": elapsed,
+      },
+    )
+    append_app_log(settings, f"story_overview_model completed in {elapsed:.3f}s")
+    return _extract_json_object_from_text(content)
+  except Exception as error:
+    elapsed = round(time.perf_counter() - started, 3)
+    classified_error = classify_model_error(error)
+    append_prompt_history(
+      settings,
+      {
+        "task": "story_overview_model",
+        "model": config.model_name,
+        "prompt": prompt_text,
+        "response": "",
+        "status": "failed",
+        "elapsed": elapsed,
+        "error": str(error),
+        "error_kind": classified_error.kind,
+        "error_title": classified_error.title,
+        "error_user_action": classified_error.user_action,
+        "error_retryable": classified_error.retryable,
+      },
+    )
+    append_app_log(settings, f"story_overview_model failed: {classified_error.title}: {error}", level="ERROR")
+    return None
+
+
+def _normalized_evidence_text(text: str) -> str:
+  return " ".join(str(text or "").split())
+
+
+def _source_contains(source_text: str, value: str) -> bool:
+  normalized = _normalized_evidence_text(value)
+  return bool(normalized and normalized in _normalized_evidence_text(source_text))
+
+
+def _model_string_from_keys(payload: dict[str, object], *keys: str) -> str:
+  for key in keys:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+      return value.strip()
+  return ""
+
+
+def _model_string_list(value: object) -> list[str]:
+  if value is None:
+    return []
+  if isinstance(value, str):
+    return _structured_items([value])
+  if isinstance(value, list):
+    items: list[str] = []
+    for item in value:
+      if isinstance(item, str):
+        items.extend(_structured_items([item]))
+      elif isinstance(item, dict):
+        name = _model_string_from_keys(item, "name", "title", "姓名", "名称", "标题")
+        summary = _model_string_from_keys(item, "summary", "description", "detail", "说明", "摘要")
+        if name and summary:
+          items.append(f"{name}：{summary}")
+        elif name:
+          items.append(name)
+        else:
+          text = _json_value_to_text(item)
+          if text:
+            items.append(text)
+      else:
+        text = str(item).strip()
+        if text:
+          items.append(text)
+    return _ordered_unique(items)
+  if isinstance(value, dict):
+    items = []
+    for key, item in value.items():
+      text = _json_value_to_text(item)
+      if text:
+        items.append(f"{key}：{text}")
+    return _ordered_unique(items)
+  text = str(value).strip()
+  return [text] if text else []
+
+
+def _model_evidence_list(payload: dict[str, object]) -> list[str]:
+  return _model_string_list(
+    payload.get("evidence")
+    or payload.get("source_evidence")
+    or payload.get("evidence_snippet")
+    or payload.get("依据")
+    or payload.get("证据")
+  )
+
+
+def _has_supported_evidence(source_text: str, payload: dict[str, object], name: str) -> bool:
+  evidence_items = _model_evidence_list(payload)
+  if any(_source_contains(source_text, item) for item in evidence_items):
+    return True
+  return bool(name and _source_contains(source_text, name) and any(_source_contains(source_text, item) for item in _model_string_list(payload.get("summary") or payload.get("description") or payload.get("说明"))))
+
+
+def _model_entity_name_from_text(value: str) -> str:
+  return _structured_entity_name(value).strip()
+
+
+def _model_entity_records(kind: str, value: object, source_text: str) -> list[tuple[str, str, list[str]]]:
+  records: list[tuple[str, str, list[str]]] = []
+  if isinstance(value, list):
+    values = value
+  elif value is None:
+    values = []
+  else:
+    values = [value]
+
+  for item in values:
+    if isinstance(item, dict):
+      name = _model_string_from_keys(item, "name", "title", "名称", "标题")
+      summary = _model_string_from_keys(item, "summary", "description", "detail", "说明", "摘要")
+      related = _model_string_list(item.get("related_characters") or item.get("characters") or item.get("关联人物"))
+      if not name:
+        continue
+      name = _model_entity_name_from_text(name)
+      if not name or not _has_supported_evidence(source_text, item, name):
+        continue
+      records.append((name, _compact_text(summary or name, limit=140), related))
+      continue
+
+    for raw_name in _model_string_list(item):
+      name = _model_entity_name_from_text(raw_name)
+      if name and _source_contains(source_text, name):
+        records.append((name, _compact_text(raw_name, limit=140), []))
+
+  return records
+
+
+def _model_cache_to_overview(
+  project_dir: Path,
+  documents: list[StoryDocument],
+  source_signature: str,
+) -> StoryOverview | None:
+  payload = read_json(_model_story_overview_path(project_dir), None)
+  if not isinstance(payload, dict):
+    return None
+  if payload.get("schema_version") != _MODEL_STORY_OVERVIEW_SCHEMA_VERSION:
+    return None
+  if payload.get("source_signature") != source_signature:
+    return None
+  overview_payload = payload.get("overview")
+  if not isinstance(overview_payload, dict):
+    return None
+  try:
+    return StoryOverview(
+      documents=documents,
+      materials=_build_knowledge_materials(project_dir),
+      memory_entries=load_project_memory(project_dir),
+      characters=[StoryCharacter.model_validate(item) for item in overview_payload.get("characters", [])],
+      events=[StoryEntityReference.model_validate(item) for item in overview_payload.get("events", [])],
+      locations=[StoryEntityReference.model_validate(item) for item in overview_payload.get("locations", [])],
+      props=[StoryEntityReference.model_validate(item) for item in overview_payload.get("props", [])],
+      skills=[StoryEntityReference.model_validate(item) for item in overview_payload.get("skills", [])],
+      scenes=[StoryEntityReference.model_validate(item) for item in overview_payload.get("scenes", [])],
+      organizations=[StoryEntityReference.model_validate(item) for item in overview_payload.get("organizations", [])],
+    )
+  except Exception:
+    return None
+
+
+def _validated_model_story_overview(
+  payload: dict[str, object],
+  *,
+  project_dir: Path,
+  documents: list[StoryDocument],
+  source_text: str,
+  allow_unmatched_related: bool = False,
+) -> StoryOverview | None:
+  raw_characters = payload.get("characters")
+  if raw_characters is None:
+    raw_characters = []
+  if not isinstance(raw_characters, list):
+    return None
+
+  character_store: dict[str, dict] = {}
+  entity_store = {
+    "events": {},
+    "locations": {},
+    "props": {},
+    "skills": {},
+    "scenes": {},
+    "organizations": {},
+  }
+
+  for raw_item in raw_characters:
+    if not isinstance(raw_item, dict):
+      continue
+    name = _model_string_from_keys(raw_item, "name", "姓名", "人物", "角色")
+    if not _is_character_candidate(name) or not _has_supported_evidence(source_text, raw_item, name):
+      continue
+    profile = _compact_text(_model_string_from_keys(raw_item, "profile", "summary", "description", "身份", "说明"), limit=220)
+    current_state = _compact_text(_model_string_from_keys(raw_item, "current_state", "initial_state", "state", "当前状态", "初始状态"), limit=180)
+    store = _new_character_store_item()
+    store["profile"] = profile
+    store["current_state"] = current_state
+    store["relationships"] = _model_string_list(raw_item.get("relationships") or raw_item.get("relations") or raw_item.get("关系"))
+
+    for kind in ("events", "locations", "props", "skills", "scenes", "organizations"):
+      records = _model_entity_records(kind, raw_item.get(kind), source_text)
+      names = [record_name for record_name, _summary, _related in records]
+      store[kind] = names
+      for record_name, summary, related in records:
+        _register_entity(
+          entity_store[kind],
+          record_name,
+          summary=summary,
+          related_characters=_ordered_unique([name] + related),
+        )
+
+    store["timeline"] = [
+      CharacterTimelineEntry(
+        id=f"{name}-model-overview",
+        source_label="模型总览",
+        summary=profile or current_state or name,
+        relations=store["relationships"],
+        events=store["events"],
+        locations=store["locations"],
+        props=store["props"],
+        skills=store["skills"],
+        scenes=store["scenes"],
+        organizations=store["organizations"],
+      )
+    ]
+    character_store[name] = store
+
+  character_names = list(character_store.keys())
+  for kind in ("events", "locations", "props", "skills", "scenes", "organizations"):
+    for record_name, summary, related in _model_entity_records(kind, payload.get(kind), source_text):
+      related_characters = _ordered_unique(related if allow_unmatched_related else [name for name in related if name in character_store])
+      _register_entity(entity_store[kind], record_name, summary=summary, related_characters=related_characters)
+      for character_name in related_characters:
+        if character_name in character_store:
+          character_store[character_name][kind] = _ordered_unique(character_store[character_name][kind] + [record_name])
+
+  def build_entities(kind: str) -> list[StoryEntityReference]:
+    return [
+      StoryEntityReference(
+        name=name,
+        summary=str(item["summary"]),
+        related_characters=_ordered_unique(
+          list(item["related_characters"])
+          if allow_unmatched_related
+          else [value for value in item["related_characters"] if value in character_names]
+        ),
+        chapter_indexes=[],
+      )
+      for name, item in sorted(
+        entity_store[kind].items(),
+        key=lambda entity: (-(len(entity[1]["related_characters"])), entity[0]),
+      )
+    ]
+
+  if not character_store and not any(entity_store[kind] for kind in entity_store):
+    return None
+
+  return StoryOverview(
+    documents=documents,
+    materials=_build_knowledge_materials(project_dir),
+    memory_entries=load_project_memory(project_dir),
+    characters=[
+      StoryCharacter(
+        name=name,
+        profile=str(character_store[name]["profile"]),
+        current_state=str(character_store[name]["current_state"]),
+        relationships=character_store[name]["relationships"],
+        events=character_store[name]["events"],
+        locations=character_store[name]["locations"],
+        props=character_store[name]["props"],
+        skills=character_store[name]["skills"],
+        scenes=character_store[name]["scenes"],
+        organizations=character_store[name]["organizations"],
+        timeline=character_store[name]["timeline"],
+      )
+      for name in character_names
+    ],
+    events=build_entities("events"),
+    locations=build_entities("locations"),
+    props=build_entities("props"),
+    skills=build_entities("skills"),
+    scenes=build_entities("scenes"),
+    organizations=build_entities("organizations"),
+  )
+
+
+def _merge_model_entity_references(
+  items: list[StoryEntityReference],
+  *,
+  character_names: list[str],
+) -> list[StoryEntityReference]:
+  merged: dict[str, dict[str, object]] = {}
+  for item in items:
+    name = item.name.strip()
+    if not name:
+      continue
+    record = merged.setdefault(
+      name,
+      {
+        "summary": "",
+        "related_characters": set(),
+        "chapter_indexes": set(),
+      },
+    )
+    if item.summary and not record["summary"]:
+      record["summary"] = item.summary
+    record["related_characters"].update(value for value in item.related_characters if value in character_names)
+    record["chapter_indexes"].update(item.chapter_indexes)
+
+  return [
+    StoryEntityReference(
+      name=name,
+      summary=str(item["summary"]),
+      related_characters=_ordered_unique(list(item["related_characters"])),
+      chapter_indexes=sorted(int(value) for value in item["chapter_indexes"]),
+    )
+    for name, item in sorted(
+      merged.items(),
+      key=lambda entity: (-(len(entity[1]["related_characters"]) + len(entity[1]["chapter_indexes"])), entity[0]),
+    )
+  ]
+
+
+def _merge_model_story_overviews(
+  project_dir: Path,
+  documents: list[StoryDocument],
+  overviews: list[StoryOverview],
+) -> StoryOverview | None:
+  if not overviews:
+    return None
+
+  character_store: dict[str, dict[str, object]] = {}
+  for overview_index, overview in enumerate(overviews, start=1):
+    for character in overview.characters:
+      name = character.name.strip()
+      if not name:
+        continue
+      store = character_store.setdefault(name, _new_character_store_item())
+      if character.profile and not store["profile"]:
+        store["profile"] = character.profile
+      if character.current_state and not store["current_state"]:
+        store["current_state"] = character.current_state
+      for field in ("relationships", "events", "locations", "props", "skills", "scenes", "organizations"):
+        store[field] = _ordered_unique(store[field] + getattr(character, field))
+      timeline = store["timeline"]
+      existing_timeline_ids = {item.id for item in timeline}
+      for entry in character.timeline:
+        next_entry = entry
+        if next_entry.id in existing_timeline_ids:
+          next_entry = entry.model_copy(update={"id": f"{entry.id}-{overview_index}"})
+        timeline.append(next_entry)
+        existing_timeline_ids.add(next_entry.id)
+
+  character_names = list(character_store.keys())
+  entity_sources = {
+    "events": [item for overview in overviews for item in overview.events],
+    "locations": [item for overview in overviews for item in overview.locations],
+    "props": [item for overview in overviews for item in overview.props],
+    "skills": [item for overview in overviews for item in overview.skills],
+    "scenes": [item for overview in overviews for item in overview.scenes],
+    "organizations": [item for overview in overviews for item in overview.organizations],
+  }
+  entities = {
+    kind: _merge_model_entity_references(items, character_names=character_names)
+    for kind, items in entity_sources.items()
+  }
+
+  if not character_store and not any(entities.values()):
+    return None
+
+  return StoryOverview(
+    documents=documents,
+    materials=_build_knowledge_materials(project_dir),
+    memory_entries=load_project_memory(project_dir),
+    characters=[
+      StoryCharacter(
+        name=name,
+        profile=str(character_store[name]["profile"]),
+        current_state=str(character_store[name]["current_state"]),
+        relationships=character_store[name]["relationships"],
+        events=character_store[name]["events"],
+        locations=character_store[name]["locations"],
+        props=character_store[name]["props"],
+        skills=character_store[name]["skills"],
+        scenes=character_store[name]["scenes"],
+        organizations=character_store[name]["organizations"],
+        timeline=character_store[name]["timeline"],
+      )
+      for name in character_names
+    ],
+    events=entities["events"],
+    locations=entities["locations"],
+    props=entities["props"],
+    skills=entities["skills"],
+    scenes=entities["scenes"],
+    organizations=entities["organizations"],
+  )
+
+
+def _model_story_overview_or_none(
+  settings: Settings,
+  project_dir: Path,
+  documents: list[StoryDocument],
+  material_payloads: list[dict[str, str]],
+  chapters: list[ChapterSummary],
+) -> StoryOverview | None:
+  source_signature = _overview_source_signature(documents, material_payloads, chapters)
+  cached = _model_cache_to_overview(project_dir, documents, source_signature)
+  if cached is not None:
+    return cached
+  if _model_overview_enabled(settings)[0] is None:
+    return None
+
+  source_blocks = _overview_source_blocks(documents, material_payloads, chapters)
+  full_source_text = "\n\n".join(source_blocks).strip()
+  if not full_source_text:
+    return None
+  source_chunks = _overview_source_chunks_from_blocks(
+    source_blocks,
+    limit=_MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT,
+  )
+  if not source_chunks:
+    return None
+
+  chunk_overviews: list[StoryOverview] = []
+  for index, source_chunk in enumerate(source_chunks, start=1):
+    chunk_text = f"【来源分片 {index}/{len(source_chunks)}】\n{source_chunk}"
+    model_payload = _request_model_story_overview(settings, chunk_text)
+    if model_payload is None:
+      append_app_log(settings, f"story_overview_model chunk {index}/{len(source_chunks)} failed", level="WARNING")
+      return None
+    chunk_overview = _validated_model_story_overview(
+      model_payload,
+      project_dir=project_dir,
+      documents=documents,
+      source_text=full_source_text,
+      allow_unmatched_related=True,
+    )
+    if chunk_overview is not None:
+      chunk_overviews.append(chunk_overview)
+
+  overview = _merge_model_story_overviews(project_dir, documents, chunk_overviews)
+  if overview is None:
+    append_app_log(settings, "story_overview_model returned no validated overview nodes", level="WARNING")
+    return None
+  atomic_write_json(
+    _model_story_overview_path(project_dir),
+    {
+      "schema_version": _MODEL_STORY_OVERVIEW_SCHEMA_VERSION,
+      "source_signature": source_signature,
+      "generated_at": _now_iso(),
+      "overview": {
+        "characters": [item.model_dump(mode="json") for item in overview.characters],
+        "events": [item.model_dump(mode="json") for item in overview.events],
+        "locations": [item.model_dump(mode="json") for item in overview.locations],
+        "props": [item.model_dump(mode="json") for item in overview.props],
+        "skills": [item.model_dump(mode="json") for item in overview.skills],
+        "scenes": [item.model_dump(mode="json") for item in overview.scenes],
+        "organizations": [item.model_dump(mode="json") for item in overview.organizations],
+      },
+    },
+  )
+  return overview
+
+
 def _register_entity(
   entity_map: dict[str, dict[str, set[str] | str | set[int]]],
   name: str,
@@ -3425,9 +4132,13 @@ def _apply_structured_character_fields(
   return structured_entities
 
 
-def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> StoryOverview:
+def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[ChapterSummary]) -> StoryOverview:
   documents = _build_story_documents(project_dir)
   material_payloads = _load_knowledge_material_payloads(project_dir)
+  model_overview = _model_story_overview_or_none(settings, project_dir, documents, material_payloads, chapters)
+  if model_overview is not None:
+    return model_overview
+
   document_map = {item.key: item for item in documents}
   character_design_sections = _extract_character_sections(document_map["character_design"].content)
   character_state_sections = _extract_character_sections(document_map["character_state"].content)
@@ -3866,7 +4577,7 @@ def get_project_detail(settings: Settings, project_id: str) -> ProjectDetail:
     for index in range(1, summary.target_chapters + 1)
   ]
   local_history = _local_history_state(project_dir)
-  overview = _build_story_overview(project_dir, chapters)
+  overview = _build_story_overview(settings, project_dir, chapters)
   auto_entries, memory_signature = build_auto_project_memory(
     documents=overview.documents,
     characters=overview.characters,

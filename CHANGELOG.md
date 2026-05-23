@@ -23,9 +23,10 @@
 - 修改摘要：`release/` 发布测试输出目录加入 `.gitignore`，避免本地测试包、`.DS_Store` 和外部测试说明被误提交。
 - 修复摘要：旧的 `ModelConfig` 保存路径现在会保留已配置的 `review_model`，避免只保存主模型时清空第二审查模型配置；架构生成解析支持模型返回嵌套 JSON 段落，人物名自动识别减少把“项目文档、关键词、养老金、封口费”等词片段误判成人物。
 - 影响范围：`.gitignore`、`config_service.save_config()`、`generation_service` 架构解析、`project_service` 人物名识别，以及对应回归测试。
-- 补充摘要：架构总览现在会优先读取模型结构化输出里的嵌套字段，把人物状态、关系、事件、地点、道具、技能和组织直接挂到总览节点；普通正文里发现的人名只按证据评分进入候选，避免把“项目文档、关键词、养老金”等词片段写成人物。
+- 补充摘要：架构总览新增大模型结构化总览缓存，模型会整理人物、关系、事件、地点、道具、技能、场景和组织；项目来源较长时分片交给模型整理，再合并通过证据校验的节点；缓存保存在 `.gaoxia/story_overview_model.json`，项目来源变化后自动失效。
+- Agent 长篇生产：章节正文写回计划默认扩展为 `生成/续写正文 -> rewrite_chapter(mode=humanize) -> consistency_check`，`chapter_generate`、`chapter_workflow(mode=draft)` 和单独改稿都会进入这套作者确认后的逐章生产流程；作者明确只要初稿、不改稿或不检查时保留单步生成；章节核验报告可作为 Agent 产物返回。
 - 测试修正：Agent、生成服务和 Studio 单测屏蔽不属于目标的章节审查、Embedding 和 rerank 外部请求，避免回归测试误连真实模型。
-- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_model_error_service backend.tests.test_self_evolution_service -v` 通过，14 个用例通过；`npm run backend:test` 通过，123 个后端用例通过；`npm run build` 通过；`npm run verify` 通过；`npm run verify:ui` 通过；`git diff --check` 通过。
+- 验证结果：`npm run verify` 通过，后端 128 个 unittest 和前端生产构建通过；`git diff --check` 通过。
 
 ### Embedding 单独配置恢复
 

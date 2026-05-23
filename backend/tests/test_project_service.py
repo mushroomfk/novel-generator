@@ -294,6 +294,163 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
     self.assertIn("明成集团", [item.name for item in detail.story_overview.organizations])
 
+  def test_story_overview_uses_validated_model_cache_for_all_sections(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="real-key",
+        base_url="https://model.local/v1",
+        model_name="overview-model",
+      ),
+    )
+    summary = self.create_demo_project("模型总览")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      (
+        "林晚在发布会现场被当众羞辱，这场公开羞辱让证据账本落在陈小雨手里。"
+        "林晚隶属明成集团，擅长危机公关。"
+      ),
+      encoding="utf-8",
+    )
+    model_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "林晚",
+            "profile": "明成集团创意总监。",
+            "current_state": "在发布会现场被当众羞辱。",
+            "relationships": ["陈小雨：掌握证据账本"],
+            "events": ["公开羞辱"],
+            "locations": ["发布会现场"],
+            "props": ["证据账本"],
+            "skills": ["危机公关"],
+            "organizations": ["明成集团"],
+            "evidence": ["林晚在发布会现场被当众羞辱"],
+          },
+          {
+            "name": "项目文",
+            "profile": "模型误判。",
+            "evidence": ["不存在的证据"],
+          },
+        ],
+        "events": [
+          {
+            "name": "公开羞辱",
+            "summary": "林晚在发布会现场被当众羞辱。",
+            "related_characters": ["林晚"],
+            "evidence": ["这场公开羞辱让证据账本落在陈小雨手里"],
+          },
+          {
+            "name": "黑箱会议",
+            "summary": "不存在。",
+            "related_characters": ["林晚"],
+            "evidence": ["不存在的证据"],
+          },
+        ],
+        "locations": [{"name": "发布会现场", "related_characters": ["林晚"], "evidence": ["发布会现场被当众羞辱"]}],
+        "props": [{"name": "证据账本", "related_characters": ["林晚"], "evidence": ["证据账本落在陈小雨手里"]}],
+        "skills": [{"name": "危机公关", "related_characters": ["林晚"], "evidence": ["擅长危机公关"]}],
+        "organizations": [{"name": "明成集团", "related_characters": ["林晚"], "evidence": ["林晚隶属明成集团"]}],
+        "scenes": [],
+      },
+      ensure_ascii=False,
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": model_content}}]},
+    ) as mocked_request:
+      detail = get_project_detail(self.settings, summary.id)
+
+    self.assertEqual(mocked_request.call_count, 1)
+    character_names = [item.name for item in detail.story_overview.characters]
+    self.assertIn("林晚", character_names)
+    self.assertNotIn("项目文", character_names)
+    lin_wan = next(item for item in detail.story_overview.characters if item.name == "林晚")
+    self.assertIn("公开羞辱", lin_wan.events)
+    self.assertIn("发布会现场", lin_wan.locations)
+    self.assertIn("证据账本", lin_wan.props)
+    self.assertIn("危机公关", lin_wan.skills)
+    self.assertIn("明成集团", lin_wan.organizations)
+    self.assertIn("公开羞辱", [item.name for item in detail.story_overview.events])
+    self.assertNotIn("黑箱会议", [item.name for item in detail.story_overview.events])
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      side_effect=AssertionError("模型总览缓存有效时不应重复请求"),
+    ):
+      cached_detail = get_project_detail(self.settings, summary.id)
+    self.assertIn("林晚", [item.name for item in cached_detail.story_overview.characters])
+
+  def test_story_overview_model_reads_every_source_chunk(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="real-key",
+        base_url="https://model.local/v1",
+        model_name="overview-model",
+      ),
+    )
+    summary = self.create_demo_project("模型分片总览")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林晚在发布会现场被当众羞辱，危机公关能力被迫公开。\n"
+      + "过渡资料。" * 80
+      + "\n许诺在地下档案室找到城防图，地下档案室属于北境档案馆。",
+      encoding="utf-8",
+    )
+
+    def fake_model_response(_endpoint: str, **kwargs):
+      prompt_text = kwargs["payload"]["messages"][1]["content"]
+      payload = {
+        "characters": [],
+        "events": [],
+        "locations": [],
+        "props": [],
+        "skills": [],
+        "scenes": [],
+        "organizations": [],
+      }
+      if "林晚在发布会现场被当众羞辱" in prompt_text:
+        payload["characters"].append(
+          {
+            "name": "林晚",
+            "current_state": "在发布会现场被当众羞辱。",
+            "skills": ["危机公关"],
+            "evidence": ["林晚在发布会现场被当众羞辱"],
+          }
+        )
+        payload["skills"].append({"name": "危机公关", "related_characters": ["林晚"], "evidence": ["危机公关能力被迫公开"]})
+      if "许诺在地下档案室找到城防图" in prompt_text:
+        payload["characters"].append(
+          {
+            "name": "许诺",
+            "current_state": "在地下档案室找到城防图。",
+            "locations": ["地下档案室"],
+            "props": ["城防图"],
+            "organizations": ["北境档案馆"],
+            "evidence": ["许诺在地下档案室找到城防图"],
+          }
+        )
+        payload["locations"].append({"name": "地下档案室", "related_characters": ["许诺"], "evidence": ["地下档案室属于北境档案馆"]})
+        payload["props"].append({"name": "城防图", "related_characters": ["许诺"], "evidence": ["找到城防图"]})
+        payload["organizations"].append({"name": "北境档案馆", "related_characters": ["许诺"], "evidence": ["属于北境档案馆"]})
+      return {"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]}
+
+    with (
+      patch("novel_backend.services.project_service._MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT", 100),
+      patch("novel_backend.services.project_service.request_json_with_retries", side_effect=fake_model_response) as mocked_request,
+    ):
+      detail = get_project_detail(self.settings, summary.id)
+
+    self.assertGreaterEqual(mocked_request.call_count, 2)
+    character_names = [item.name for item in detail.story_overview.characters]
+    self.assertIn("林晚", character_names)
+    self.assertIn("许诺", character_names)
+    self.assertIn("地下档案室", [item.name for item in detail.story_overview.locations])
+    self.assertIn("城防图", [item.name for item in detail.story_overview.props])
+    self.assertIn("北境档案馆", [item.name for item in detail.story_overview.organizations])
+
   def test_project_detail_includes_distillation_report_and_task_packs(self) -> None:
     summary = self.create_demo_project("蒸馏结构")
     project_dir = Path(summary.path)

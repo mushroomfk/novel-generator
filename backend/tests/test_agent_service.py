@@ -193,7 +193,107 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["plan"]["actions"][0]["task_pack_kind"], "architecture")
     self.assertEqual(result_event[1]["plan"]["actions"][1]["kind"], "chapter_generate")
     self.assertEqual(result_event[1]["plan"]["actions"][1]["task_pack_kind"], "continuation")
+    action_kinds = [item["kind"] for item in result_event[1]["plan"]["actions"]]
+    self.assertEqual(action_kinds, ["generate_architecture", "chapter_generate", "rewrite_chapter", "consistency_check"])
+    self.assertEqual(result_event[1]["plan"]["actions"][2]["mode"], "humanize")
     self.assertIn("计划步骤：", result_event[1]["reply"])
+
+  def test_write_request_can_skip_supervised_longform_steps(self) -> None:
+    self._write_chapter_without_review(
+      "chapter-001",
+      "# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="只生成初稿，不要改稿不要检查。续写这一章")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    action_kinds = [item["kind"] for item in result_event[1]["plan"]["actions"]]
+    self.assertEqual(action_kinds, ["generate_architecture", "chapter_generate"])
+
+  def test_draft_workflow_uses_longform_supervision_steps(self) -> None:
+    self._write_chapter_without_review(
+      "chapter-001",
+      "# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
+    )
+
+    with patch(
+      "novel_backend.services.agent_service._planner_available",
+      return_value=True,
+    ), patch(
+      "novel_backend.services.agent_service._invoke_model",
+      return_value=json.dumps(
+        {
+          "mode": "plan",
+          "title": "续写当前章节",
+          "summary": "用章节工作流续写正文。",
+          "actions": [
+            {
+              "kind": "chapter_workflow",
+              "label": "续写当前章节",
+              "instruction": "续写这一章。",
+              "chapter_target": "selected",
+              "mode": "draft",
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              selected_chapter_id="chapter-001",
+              messages=[AgentMessage(role="user", content="续写这一章正文。")],
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    plan = result_event[1]["plan"]
+    action_kinds = [item["kind"] for item in plan["actions"]]
+    self.assertTrue(plan["requires_confirmation"])
+    self.assertEqual(action_kinds, ["generate_architecture", "chapter_workflow", "rewrite_chapter", "consistency_check"])
+    self.assertEqual(plan["actions"][1]["mode"], "draft")
+    self.assertEqual(plan["actions"][2]["mode"], "humanize")
+
+  def test_rewrite_request_gets_continuity_review_step(self) -> None:
+    self._write_chapter_without_review(
+      "chapter-001",
+      "# 第一章\n林追说：我们不能回头。\n",
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="这次给第一章去 AI，注意对白别写成一个口气。")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    action_kinds = [item["kind"] for item in result_event[1]["plan"]["actions"]]
+    self.assertEqual(action_kinds, ["generate_architecture", "rewrite_chapter", "consistency_check"])
+    self.assertEqual(result_event[1]["plan"]["actions"][1]["mode"], "humanize")
 
   def test_empty_project_can_start_architecture_plan_from_execution_panel(self) -> None:
     events = asyncio.run(

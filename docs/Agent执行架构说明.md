@@ -124,6 +124,14 @@
 - 现在会优先规划成 `review_knowledge -> generate_architecture`
 - 不会再因为句子里有“续写”两个字就跳去写下一章
 
+面向长篇逐章生产的正文写回计划会自动变成受监督流程：
+
+- `chapter_generate` 或 `chapter_workflow(mode=draft)` 生成正文并写回章节
+- `rewrite_chapter(mode=humanize)` 保留剧情事实，只处理模板腔、解释腔、总结句、对白同质化和节奏过匀
+- `consistency_check` 在去 AI 后复查人物关系、事件结果、时间地点、道具状态和信息揭示顺序
+
+如果用户先要求普通改稿或定稿，Agent 会在最后一次写回后补上去 AI 或一致性复查；作者明确说“只要初稿”“不要改稿”“不要检查”时，不会自动加入这些后续步骤。
+
 ### 4. 执行结果模型
 
 `models.py` 里补了这些结构：
@@ -142,6 +150,7 @@
 - `execution_trace` 给执行链路
 - `event_blocks` 给计划和阶段性事件
 - `artifacts` 给结果产物和历史回看
+- 写回章节后，如果章节核验报告可用，Agent 会把 `chapter_review` 作为产物返回，前端可以直接展示核验摘要、评分和问题数。
 
 ### 5. 执行轨迹、经验候选与自学习复盘
 
