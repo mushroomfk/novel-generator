@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from novel_backend.config import Settings
-from novel_backend.models import AppConfig, AppConfigUpdateRequest, EmbeddingConfig, ModelConfig
+from novel_backend.models import AppConfig, AppConfigUpdateRequest, EmbeddingConfig, ModelConfig, ReviewModelConfig
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 
@@ -652,16 +652,26 @@ def load_config(settings: Settings) -> AppConfig:
   return normalized
 
 
+def _existing_review_model_config(settings: Settings) -> ReviewModelConfig:
+  payload = read_json(app_config_path(settings), None)
+  if isinstance(payload, dict) and isinstance(payload.get("review_model"), dict):
+    return ReviewModelConfig.model_validate(payload["review_model"])
+  return ReviewModelConfig()
+
+
 def save_config(settings: Settings, config_update: AppConfigUpdateRequest | ModelConfig) -> AppConfig:
   if isinstance(config_update, ModelConfig):
     model_config = config_update
     embedding_config = resolve_embedding_config(model_config)
+    review_model_config = _existing_review_model_config(settings)
   else:
     model_config = config_update.model
     embedding_config = resolve_embedding_config(model_config, config_update.embedding)
+    review_model_config = ReviewModelConfig.model_validate(config_update.review_model)
   payload = AppConfig(
     model=model_config,
     embedding=embedding_config,
+    review_model=review_model_config,
     updated_at=_now_iso(),
   )
   atomic_write_json(app_config_path(settings), payload.model_dump(mode="json"))

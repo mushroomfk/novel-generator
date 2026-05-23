@@ -927,11 +927,54 @@ async function runSmoke(previewUrl, backendUrl) {
       return button instanceof HTMLButtonElement && button.disabled;
     });
 
+    log('检查 Agent 自学习面板');
+    await page.getByTestId('skill-use-self-evolution').click();
+    await page.getByTestId('self-evolution-result').waitFor();
+    await page.getByTestId('self-evolution-candidates').waitFor();
+    await page.getByTestId('self-evolution-refresh-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-refresh-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-curate-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-curate-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-regression-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-regression-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-regression').getByText('续写样本').waitFor();
+    await page.getByTestId('self-evolution-model-review-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-model-review-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-model-reviews').getByText(/模型审查|自学习审查/u).first().waitFor();
+    await page.getByTestId('self-evolution-quality-dimensions').waitFor();
+    await page.getByTestId('self-evolution-trends').waitFor();
+    await page.getByTestId('self-evolution-failure-cases').waitFor();
+    await page.getByTestId('self-evolution-skill-versions').waitFor();
+    await page.getByTestId('self-evolution-schedule-save-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-schedule-save-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-schedule-run-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-schedule-run-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+
     await page.getByTestId('return-workspace-button').click();
     await page.getByTestId('workspace-composer-input').waitFor();
 
     await page.getByTestId('open-settings-button').click();
     await page.getByTestId('settings-modal').waitFor();
+    await page.getByTestId('settings-modal').locator('.accordion-summary').click();
+    await page.getByTestId('settings-modal').getByText('自学习审查模型').waitFor();
     await page.keyboard.press('Escape');
     await page.getByTestId('settings-modal').waitFor({ state: 'hidden' });
     await page.getByTestId('new-conversation-button').click();

@@ -18,6 +18,7 @@ from novel_backend.models import (
   PromptPresetCreateRequest,
   PromptPresetUpdateRequest,
   SkillMaterializeRequest,
+  SkillPackageImportRequest,
   StyleAnalyzeRequest,
   StyleCalibrateRequest,
   StyleDNAAnalyzeRequest,
@@ -56,7 +57,15 @@ from novel_backend.services.preset_service import (
   update_prompt_preset,
   update_xp_preset,
 )
-from novel_backend.services.skill_service import list_skill_catalog, materialize_skill
+from novel_backend.services.skill_service import (
+  list_skill_catalog,
+  list_skill_versions,
+  export_skill_package,
+  import_skill_package,
+  materialize_skill,
+  promote_skill_to_global,
+  rollback_skill_version,
+)
 from novel_backend.services.style_service import (
   clear_style_references,
   delete_style,
@@ -108,6 +117,36 @@ def get_skill_catalog(request: Request):
 def post_materialize_skill(request: Request, payload: SkillMaterializeRequest):
   settings = request.app.state.settings
   return {"ok": True, "data": materialize_skill(settings, payload).model_dump(mode="json")}
+
+
+@router.post("/skills/import-package")
+def post_skill_package_import(request: Request, payload: SkillPackageImportRequest):
+  settings = request.app.state.settings
+  return {"ok": True, "data": import_skill_package(settings, payload)}
+
+
+@router.get("/skills/{skill_id}/versions")
+def get_skill_versions(request: Request, skill_id: str):
+  settings = request.app.state.settings
+  return {"ok": True, "data": list_skill_versions(settings, skill_id)}
+
+
+@router.get("/skills/{skill_id}/package")
+def get_skill_package(request: Request, skill_id: str):
+  settings = request.app.state.settings
+  return {"ok": True, "data": export_skill_package(settings, skill_id)}
+
+
+@router.post("/skills/{skill_id}/versions/{version_id}/rollback")
+def post_skill_version_rollback(request: Request, skill_id: str, version_id: str):
+  settings = request.app.state.settings
+  return {"ok": True, "data": rollback_skill_version(settings, skill_id, version_id)}
+
+
+@router.post("/skills/{skill_id}/promote-global")
+def post_skill_promote_global(request: Request, skill_id: str):
+  settings = request.app.state.settings
+  return {"ok": True, "data": promote_skill_to_global(settings, skill_id)}
 
 
 @router.post("/brainstorm/stream")

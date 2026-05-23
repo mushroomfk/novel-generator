@@ -222,6 +222,27 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIn("旧式知识分子", fang.profile)
     self.assertIn("阁楼", fang.current_state)
 
+  def test_story_overview_filters_word_fragments_from_discovered_character_names(self) -> None:
+    summary = self.create_demo_project("边界识别")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      (
+        "林晚在事业巅峰期被当众羞辱，导师苏青保持观望。陈小雨曾是其实习生。\n"
+        "林晚在系统性压迫下拒绝封口费，导师苏青继续观察。陈小雨曾经提醒林晚。\n"
+        "林晚对导师苏青仍有戒备，项目文档关键词包含养老金。项目文档关键词包含养老金。"
+      ),
+      encoding="utf-8",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    character_names = [item.name for item in detail.story_overview.characters]
+    self.assertIn("林晚", character_names)
+    self.assertIn("苏青", character_names)
+    self.assertIn("陈小雨", character_names)
+    for wrong_name in ["林晚在", "苏青保", "苏青继", "苏青仍", "习生", "项目文", "关键词", "养老金", "封口费"]:
+      self.assertNotIn(wrong_name, character_names)
+
   def test_project_detail_includes_distillation_report_and_task_packs(self) -> None:
     summary = self.create_demo_project("蒸馏结构")
     project_dir = Path(summary.path)

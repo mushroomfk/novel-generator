@@ -63,11 +63,22 @@ _TIMEOUT_PATTERNS = (
   "timed out",
   "timeout",
   "read timed out",
-  "connection reset",
-  "connection aborted",
   "network",
   "超时",
   "连接",
+)
+_NETWORK_CONNECTION_PATTERNS = (
+  "unexpected_eof",
+  "eof occurred",
+  "_ssl.c",
+  "remote end closed connection",
+  "remote disconnected",
+  "server disconnected",
+  "connection reset",
+  "connection aborted",
+  "connection closed",
+  "connection refused",
+  "connection unexpectedly closed",
 )
 _FORMAT_PATTERNS = (
   "invalid request",
@@ -92,6 +103,11 @@ def _http_status(text: str) -> int | None:
     return int(matched.group(1))
   except ValueError:
     return None
+
+
+def is_transient_model_network_error(error: object) -> bool:
+  lowered = str(error or "").strip().lower()
+  return _contains_any(lowered, _NETWORK_CONNECTION_PATTERNS)
 
 
 def classify_model_error(error: object) -> ModelErrorClassification:
@@ -137,6 +153,14 @@ def classify_model_error(error: object) -> ModelErrorClassification:
       title="模型不可用",
       user_action="检查模型名是否仍可用，或在设置里换成当前供应商支持的模型。",
       retryable=False,
+    )
+
+  if is_transient_model_network_error(error):
+    return ModelErrorClassification(
+      kind="network_connection",
+      title="模型网络连接中断",
+      user_action="模型服务连接被中途断开，通常和网络、代理或供应商临时波动有关。稍后重试；如果持续出现，检查代理/VPN，或切换到更稳定的模型配置。",
+      retryable=True,
     )
 
   if status in {500, 502, 503, 504}:

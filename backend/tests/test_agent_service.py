@@ -297,6 +297,76 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertIn("可用技能目录", joined_context)
     self.assertIn("去 AI", joined_context)
 
+  def test_model_planner_receives_self_evolution_capability_rules(self) -> None:
+    project_dir = Path(self.project.path)
+    learning_dir = project_dir / ".gaoxia" / "learning"
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    (learning_dir / "agent_capability_rules.json").write_text(
+      json.dumps(
+        {
+          "schema_version": 1,
+          "updated_at": "2026-05-22T00:00:00+00:00",
+          "rules": [
+            {
+              "id": "cap-review-knowledge",
+              "title": "资料优先调用规则",
+              "content": "用户要求先看资料时，计划必须先放 review_knowledge。",
+              "confidence": 0.91,
+              "seen_count": 3,
+              "last_seen_at": "2026-05-22T00:00:00+00:00",
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    captured_messages: list[dict[str, str]] = []
+
+    def fake_invoke(_settings, messages, **_kwargs):
+      captured_messages.extend(messages)
+      return json.dumps(
+        {
+          "mode": "plan",
+          "title": "分析资料",
+          "summary": "按自学习规则先分析资料。",
+          "requires_confirmation": True,
+          "actions": [
+            {
+              "kind": "review_knowledge",
+              "label": "分析资料",
+              "instruction": "先看资料再处理。",
+            }
+          ],
+        },
+        ensure_ascii=False,
+      )
+
+    with patch(
+      "novel_backend.services.agent_service._planner_available",
+      return_value=True,
+    ), patch(
+      "novel_backend.services.agent_service._invoke_model",
+      side_effect=fake_invoke,
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              messages=[AgentMessage(role="user", content="先看资料再处理后面的规划。")],
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertEqual(result_event[1]["mode"], "plan")
+    joined_context = "\n".join(item["content"] for item in captured_messages)
+    self.assertIn("Agent 自学习调用规则", joined_context)
+    self.assertIn("用户要求先看资料时，计划必须先放 review_knowledge", joined_context)
+
   def test_model_plan_respects_user_explicit_chapter_over_selected_chapter(self) -> None:
     update_chapter_content(
       self.settings,

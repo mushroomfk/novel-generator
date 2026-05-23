@@ -16,6 +16,35 @@
 - 模型配置、许可证导入校验、整本导出
 - Tauri 桌面壳、sidecar backend、浏览器层 smoke 和桌面发布回归
 
+## 2026-05-23
+
+### 提交前检查修正
+
+- 修改摘要：`release/` 发布测试输出目录加入 `.gitignore`，避免本地测试包、`.DS_Store` 和外部测试说明被误提交。
+- 修复摘要：旧的 `ModelConfig` 保存路径现在会保留已配置的 `review_model`，避免只保存主模型时清空第二审查模型配置；架构生成解析支持模型返回嵌套 JSON 段落，人物名自动识别减少把“项目文档、关键词、养老金、封口费”等词片段误判成人物。
+- 影响范围：`.gitignore`、`config_service.save_config()`、`generation_service` 架构解析、`project_service` 人物名识别，以及对应回归测试。
+- 补充摘要：架构总览的人物发现现在会检查姓名左右语境，可把“林晚在……”识别为“林晚”，并拒绝嵌在“实习生、项目文档、关键词、养老金”等普通词里的片段。
+- 补充验证：`PYTHONPATH=backend python3 -m pytest backend/tests/test_project_service.py backend/tests/test_generation_service.py` 通过，42 个用例通过。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_model_error_service backend.tests.test_self_evolution_service -v` 通过，14 个用例通过；`npm run backend:test` 通过，121 个后端用例通过；`npm run build` 通过；`npm run verify:ui` 通过；`git diff --check` 通过。
+
+## 2026-05-22
+
+### 模型网络中断处理
+
+- 修改摘要：模型请求错误分类新增 `network_connection`，会把 `SSL: UNEXPECTED_EOF_WHILE_READING`、远端提前断开、连接重置等场景显示为“模型网络连接中断”，不再泛化成未知模型请求失败。
+- 影响范围：主模型生成、做梦整理、Embedding 检索和阿里百炼 `qwen3-rerank` 重排序共用新的 JSON 请求助手；临时连接中断会做短重试，HTTP 认证、额度、模型名、请求格式类错误仍直接返回。
+- 文档变化：《核心引擎说明》同步更新模型错误分类和请求重试说明。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_model_error_service backend.tests.test_rerank_service -v` 通过，7 个用例通过；`npm run verify` 通过，117 个后端用例和前端生产构建通过；`git diff --check` 通过；已重启本地后端并确认 `/api/app/health` 返回 `status: ok`。
+
+### Agent 自学习复盘
+
+- 修改摘要：Agent 执行完成后新增 `self_evolution_review`，会记录经验候选、调用规则候选、技能使用统计、技能整理报告和写作评价；高置信调用规则和失败案例会进入后续模型路由和模型规划上下文；技能库新增 `Agent 自学习` 面板，用于查看能力看板、确认草案、候选、规则、评价、写作回归、模型审查、技能统计、长期趋势、细分质量维度、失败案例和技能版本记录；显式技能优化创建或更新用户技能时，会同步更新技能统计和技能版本快照。
+- 增强摘要：新增自学习后台排程 worker，应用启动后会扫描已启用排程的作品；设置页新增第二审查模型配置；技能版本区新增左右 diff、技能包导出和技能包导入；失败案例库新增按动作聚合的重复失败视图。
+- 影响范围：新增 `self_evolution_service.py`、`skill_usage_service.py`、`self_evolution_scheduler_service.py`、项目目录 `.gaoxia/learning/self_evolution_candidates.json`、`.gaoxia/learning/self_evolution_reviews.jsonl`、`.gaoxia/learning/agent_capability_rules.json`、`.gaoxia/learning/writing_evaluations.jsonl`、`.gaoxia/learning/self_evolution_drafts.json`、`.gaoxia/learning/writing_regression_runs.jsonl`、`.gaoxia/learning/self_evolution_model_reviews.jsonl`、`.gaoxia/learning/failure_cases.jsonl`、`.gaoxia/learning/self_evolution_schedule.json`，以及应用数据目录 `skills/.usage.json`、`skills/.curator_reports.jsonl`、`skills/.versions/{skill_id}/versions.json`；`app_config.json` 新增 `review_model` 配置；更新技能库面板、设置页、前端 API 封装、Agent 产物摘要和 UI smoke。
+- 接口变化：新增 `GET /api/projects/{project_id}/self-evolution`、`PATCH /api/projects/{project_id}/self-evolution/candidates/{candidate_id}`、`POST /api/projects/{project_id}/self-evolution/curate`、`POST /api/projects/{project_id}/self-evolution/regression`、`POST /api/projects/{project_id}/self-evolution/model-review`、`PUT /api/projects/{project_id}/self-evolution/schedule`、`POST /api/projects/{project_id}/self-evolution/schedule/run`、`PATCH /api/projects/{project_id}/self-evolution/drafts/{draft_id}`、`POST /api/projects/{project_id}/self-evolution/drafts/{draft_id}/apply`、`GET /api/studio/skills/{skill_id}/versions`、`GET /api/studio/skills/{skill_id}/package`、`POST /api/studio/skills/import-package`、`POST /api/studio/skills/{skill_id}/versions/{version_id}/rollback`、`POST /api/studio/skills/{skill_id}/promote-global`。
+- 安全边界：自学习复盘不会自动改章节正文；候选采纳后只生成确认草案，草案应用后才写入作者侧项目记忆、创建或更新用户技能，或把调用规则标为作者采纳；自学习排程默认关闭，手动启用后才按间隔执行；后台 worker 只处理已启用排程且到达间隔的作品；第二审查模型只有设置页启用并填写完整配置，或配置 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 后才会参与。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_self_evolution_service -v` 通过，9 个用例通过；`npm run build` 通过；`npm run verify` 通过，包含 115 个 backend 用例和前端生产构建；`npm run verify:ui` 第一次因设置面板折叠区文本不可见而失败，已调整 smoke 打开折叠区后检查，第二次通过。
+
 ## 2026-04-16
 
 ### 小说文件夹管理

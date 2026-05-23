@@ -19,6 +19,9 @@ from novel_backend.models import (
   KnowledgeImportRequest,
   ProjectMemoryUpdateRequest,
   ProjectExportRequest,
+  SelfEvolutionCandidateUpdateRequest,
+  SelfEvolutionDraftUpdateRequest,
+  SelfEvolutionScheduleUpdateRequest,
   SnapshotCreateRequest,
   SnapshotRestoreRequest,
   StoryDocumentBatchUpdateRequest,
@@ -51,6 +54,17 @@ from novel_backend.services.project_service import (
   update_story_documents,
   update_story_document,
 )
+from novel_backend.services.self_evolution_service import (
+  apply_self_evolution_draft,
+  get_self_evolution_state,
+  run_self_evolution_model_review,
+  run_self_evolution_scheduled_tasks,
+  run_writing_regression_suite,
+  update_self_evolution_candidate_status,
+  update_self_evolution_draft_status,
+  update_self_evolution_schedule,
+)
+from novel_backend.services.skill_usage_service import run_skill_curator
 from novel_backend.services.web_research_service import research_historical_reference
 from novel_backend.utils.sse import encode_sse
 
@@ -211,6 +225,127 @@ def post_project_dream_promote(
 ):
   settings = request.app.state.settings
   payload = promote_project_dream(settings, project_id, promote_request).model_dump(mode="json")
+  return {"ok": True, "data": payload}
+
+
+@router.get("/{project_id}/self-evolution")
+def get_project_self_evolution(request: Request, project_id: str):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  payload = get_self_evolution_state(settings, Path(detail.path))
+  return {"ok": True, "data": payload}
+
+
+@router.patch("/{project_id}/self-evolution/candidates/{candidate_id}")
+def patch_project_self_evolution_candidate(
+  request: Request,
+  project_id: str,
+  candidate_id: str,
+  candidate_request: SelfEvolutionCandidateUpdateRequest,
+):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  try:
+    payload = update_self_evolution_candidate_status(Path(detail.path), candidate_id, candidate_request.status)
+  except FileNotFoundError:
+    raise HTTPException(
+      status_code=404,
+      detail={"code": "self_evolution_candidate_not_found", "message": "自学习候选不存在"},
+    ) from None
+  except ValueError as error:
+    raise HTTPException(
+      status_code=400,
+      detail={"code": "self_evolution_candidate_status_invalid", "message": str(error)},
+    ) from None
+  return {"ok": True, "data": payload}
+
+
+@router.post("/{project_id}/self-evolution/curate")
+def post_project_self_evolution_curate(request: Request, project_id: str):
+  settings = request.app.state.settings
+  get_project_detail(settings, project_id)
+  return {"ok": True, "data": run_skill_curator(settings)}
+
+
+@router.post("/{project_id}/self-evolution/regression")
+def post_project_self_evolution_regression(request: Request, project_id: str):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  return {"ok": True, "data": run_writing_regression_suite(settings, Path(detail.path))}
+
+
+@router.post("/{project_id}/self-evolution/model-review")
+def post_project_self_evolution_model_review(request: Request, project_id: str):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  return {"ok": True, "data": run_self_evolution_model_review(settings, Path(detail.path))}
+
+
+@router.put("/{project_id}/self-evolution/schedule")
+def put_project_self_evolution_schedule(
+  request: Request,
+  project_id: str,
+  schedule_request: SelfEvolutionScheduleUpdateRequest,
+):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  try:
+    payload = update_self_evolution_schedule(Path(detail.path), schedule_request.model_dump(mode="json"))
+  except ValueError as error:
+    raise HTTPException(
+      status_code=400,
+      detail={"code": "self_evolution_schedule_invalid", "message": str(error)},
+    ) from None
+  return {"ok": True, "data": payload}
+
+
+@router.post("/{project_id}/self-evolution/schedule/run")
+def post_project_self_evolution_schedule_run(request: Request, project_id: str):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  return {"ok": True, "data": run_self_evolution_scheduled_tasks(settings, Path(detail.path), force=True)}
+
+
+@router.patch("/{project_id}/self-evolution/drafts/{draft_id}")
+def patch_project_self_evolution_draft(
+  request: Request,
+  project_id: str,
+  draft_id: str,
+  draft_request: SelfEvolutionDraftUpdateRequest,
+):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  try:
+    payload = update_self_evolution_draft_status(Path(detail.path), draft_id, draft_request.status)
+  except FileNotFoundError:
+    raise HTTPException(
+      status_code=404,
+      detail={"code": "self_evolution_draft_not_found", "message": "自学习草案不存在"},
+    ) from None
+  except ValueError as error:
+    raise HTTPException(
+      status_code=400,
+      detail={"code": "self_evolution_draft_status_invalid", "message": str(error)},
+    ) from None
+  return {"ok": True, "data": payload}
+
+
+@router.post("/{project_id}/self-evolution/drafts/{draft_id}/apply")
+def post_project_self_evolution_draft_apply(request: Request, project_id: str, draft_id: str):
+  settings = request.app.state.settings
+  detail = get_project_detail(settings, project_id)
+  try:
+    payload = apply_self_evolution_draft(settings, Path(detail.path), draft_id)
+  except FileNotFoundError:
+    raise HTTPException(
+      status_code=404,
+      detail={"code": "self_evolution_draft_not_found", "message": "自学习草案不存在"},
+    ) from None
+  except ValueError as error:
+    raise HTTPException(
+      status_code=400,
+      detail={"code": "self_evolution_draft_apply_invalid", "message": str(error)},
+    ) from None
   return {"ok": True, "data": payload}
 
 

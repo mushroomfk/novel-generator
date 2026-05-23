@@ -8,6 +8,7 @@ import {
   clearStyleReferences,
   createPromptPreset,
   createXpPreset,
+  applyProjectSelfEvolutionDraft,
   deleteCharacterReplicaProfile,
   deletePromptPreset,
   deleteStyle,
@@ -15,12 +16,16 @@ import {
   getCharacterReplicaProfile,
   getProjectDetail,
   getProjectFileContent,
+  getProjectSelfEvolution,
   getPromptHistory,
   getPromptPresetDetail,
+  exportSkillPackage,
+  getSkillVersions,
   getStudioLogs,
   getStyleDetail,
   importProjectKnowledge,
   importProjectKnowledgeFiles,
+  importSkillPackage,
   importStyleReferenceFiles,
   importStyleReferences,
   listCharacterReplicaProfiles,
@@ -30,9 +35,14 @@ import {
   listStudioSkills,
   listXpPresets,
   rollbackStyleCalibration,
+  rollbackSkillVersion,
   saveStyle,
   searchStyleReferences,
   searchProjectKnowledge,
+  curateProjectSelfEvolution,
+  runProjectSelfEvolutionModelReview,
+  runProjectSelfEvolutionRegression,
+  runProjectSelfEvolutionSchedule,
   researchHistoricalReferences,
   streamArchitectureStep,
   streamBatchGenerate,
@@ -50,13 +60,17 @@ import {
   streamStyleAnalyzeDna,
   streamStyleCalibrate,
   streamStyleCalibrateNarrative,
-    streamStyleMerge,
-    updateProjectChapter,
-    updateProjectFileContent,
-    updateProjectMemory,
-    updatePromptPreset,
-    saveCharacterReplicaProfile,
-    updateStoryDocument,
+  streamStyleMerge,
+  updateProjectChapter,
+  updateProjectFileContent,
+  updateProjectMemory,
+  updateProjectSelfEvolutionSchedule,
+  updateProjectSelfEvolutionDraft,
+  updateProjectSelfEvolutionCandidate,
+  updatePromptPreset,
+  saveCharacterReplicaProfile,
+  updateStoryDocument,
+  promoteSkillToGlobal,
   updateXpPreset,
 } from '../lib/api.js';
 import { buildImportedFilePayloads, importAcceptValue } from '../lib/importFiles.js';
@@ -90,6 +104,39 @@ const keyword = ref('');
 const activeToolId = ref('');
 const skillFilters = ref([...fallbackFilterOptions]);
 const skillCatalogSections = ref([...fallbackSkillSections]);
+
+const selfEvolutionSkill = Object.freeze({
+  id: 'self-evolution',
+  name: 'Agent 自学习',
+  description: '查看 Agent 任务后的经验候选、调用规则、写作评价和技能统计。',
+  category: '系统',
+  scenes: ['复盘', '技能', '调用规则'],
+  badge: '学',
+  accent: 'olive',
+  requires_project: true,
+  requires_chapter: false,
+  behavior: {
+    panel: 'self-evolution',
+  },
+});
+
+const selfEvolutionStatusOptions = ['全部', 'pending', 'accepted', 'rejected', 'archived'];
+const selfEvolutionStatusLabels = {
+  pending: '待确认',
+  accepted: '已采纳',
+  rejected: '已拒绝',
+  archived: '已归档',
+};
+const selfEvolutionKindLabels = {
+  memory: '记忆',
+  skill: '技能',
+  capability: '调用能力',
+};
+const selfEvolutionDraftKindLabels = {
+  memory: '项目记忆',
+  skill: '用户技能',
+  capability: '调用规则',
+};
 
 const isToolRunning = ref(false);
 const toolTaskId = ref('');
@@ -293,6 +340,110 @@ const styleState = reactive({
   referenceHits: [],
 });
 
+const selfEvolutionState = reactive({
+  data: null,
+  statusFilter: '全部',
+  isLoading: false,
+  isCurating: false,
+  isRegressing: false,
+  isReviewing: false,
+  updatingCandidateId: '',
+  updatingDraftId: '',
+});
+
+const selfEvolutionScheduleForm = reactive({
+  enabled: false,
+  intervalHours: 168,
+  tasks: {
+    curate: true,
+    regression: true,
+    model_review: true,
+  },
+  isSaving: false,
+  isRunning: false,
+});
+
+const skillVersionState = reactive({
+  selectedSkillId: '',
+  data: null,
+  isLoading: false,
+  actionId: '',
+});
+
+const skillPackageState = reactive({
+  text: '',
+  strategy: 'create_copy',
+  isExporting: false,
+  isImporting: false,
+});
+
+const selfEvolutionCandidates = computed(() => {
+  const items = selfEvolutionState.data?.candidates?.items;
+  return Array.isArray(items) ? items : [];
+});
+
+const filteredSelfEvolutionCandidates = computed(() => {
+  if (selfEvolutionState.statusFilter === '全部') {
+    return selfEvolutionCandidates.value;
+  }
+  return selfEvolutionCandidates.value.filter((item) => item.status === selfEvolutionState.statusFilter);
+});
+
+const selfEvolutionRules = computed(() => {
+  const rules = selfEvolutionState.data?.capability_rules?.rules;
+  return Array.isArray(rules) ? rules : [];
+});
+
+const selfEvolutionEvaluations = computed(() => {
+  const evaluations = selfEvolutionState.data?.writing_evaluations;
+  return Array.isArray(evaluations) ? evaluations : [];
+});
+
+const selfEvolutionSkillUsage = computed(() => {
+  const records = selfEvolutionState.data?.skill_usage?.records;
+  return Array.isArray(records) ? records : [];
+});
+
+const selfEvolutionDrafts = computed(() => {
+  const items = selfEvolutionState.data?.drafts?.items;
+  return Array.isArray(items) ? items : [];
+});
+
+const pendingSelfEvolutionDrafts = computed(() => (
+  selfEvolutionDrafts.value.filter((item) => item.status === 'pending')
+));
+
+const selfEvolutionRegressionRuns = computed(() => {
+  const runs = selfEvolutionState.data?.writing_regression_runs;
+  return Array.isArray(runs) ? runs : [];
+});
+
+const selfEvolutionModelReviews = computed(() => {
+  const reviews = selfEvolutionState.data?.model_reviews;
+  return Array.isArray(reviews) ? reviews : [];
+});
+
+const selfEvolutionDashboard = computed(() => selfEvolutionState.data?.dashboard ?? {});
+const selfEvolutionSchedule = computed(() => selfEvolutionState.data?.schedule ?? {});
+const selfEvolutionFailureCases = computed(() => {
+  const cases = selfEvolutionState.data?.failure_cases;
+  return Array.isArray(cases) ? cases : [];
+});
+const selfEvolutionQualityDimensions = computed(() => selfEvolutionDashboard.value.quality_dimensions ?? {});
+const selfEvolutionWritingTrend = computed(() => selfEvolutionDashboard.value.trends?.writing_scores ?? []);
+const selfEvolutionRegressionTrend = computed(() => selfEvolutionDashboard.value.trends?.regression_scores ?? []);
+const selfEvolutionFailureGroups = computed(() => {
+  const groups = selfEvolutionDashboard.value.failure_case_groups;
+  return Array.isArray(groups) ? groups : [];
+});
+
+const selfEvolutionMetrics = computed(() => [
+  { label: '候选', value: selfEvolutionCandidates.value.length },
+  { label: '调用规则', value: selfEvolutionRules.value.length },
+  { label: '写作评价', value: selfEvolutionEvaluations.value.length },
+  { label: '待确认草案', value: pendingSelfEvolutionDrafts.value.length },
+]);
+
 const totalSkillCount = computed(() => (
   skillCatalogSections.value.reduce((sum, section) => sum + section.items.length, 0)
 ));
@@ -369,6 +520,30 @@ const defaultSkillBehaviorById = {
     submit_label: '开始去 AI',
   },
 };
+
+function addSelfEvolutionCatalogEntry(sections) {
+  const normalizedSections = sections.map((section) => ({
+    ...section,
+    items: Array.isArray(section.items) ? section.items : [],
+  }));
+  if (normalizedSections.some((section) => section.items.some((item) => item.id === selfEvolutionSkill.id))) {
+    return normalizedSections;
+  }
+  return [
+    ...normalizedSections,
+    {
+      id: 'agent-system',
+      title: 'Agent 能力',
+      description: '查看 Agent 执行后的自学习记录、调用规则和技能维护状态。',
+      order: 99,
+      items: [selfEvolutionSkill],
+    },
+  ];
+}
+
+function addSelfEvolutionFilter(filters) {
+  return filters.includes('系统') ? filters : [...filters, '系统'];
+}
 
 function normalizeSkillBehavior(skill) {
   if (!skill) {
@@ -700,14 +875,341 @@ async function refreshSkillCatalog() {
     const nextSections = Array.isArray(catalog.sections) && catalog.sections.length > 0
       ? catalog.sections
       : [...fallbackSkillSections];
-    skillFilters.value = nextFilters;
-    skillCatalogSections.value = nextSections;
-    if (!nextFilters.includes(activeFilter.value)) {
+    const resolvedFilters = addSelfEvolutionFilter(nextFilters);
+    skillFilters.value = resolvedFilters;
+    skillCatalogSections.value = addSelfEvolutionCatalogEntry(nextSections);
+    if (!resolvedFilters.includes(activeFilter.value)) {
       activeFilter.value = '全部';
     }
   } catch {
-    skillFilters.value = [...fallbackFilterOptions];
-    skillCatalogSections.value = [...fallbackSkillSections];
+    skillFilters.value = addSelfEvolutionFilter([...fallbackFilterOptions]);
+    skillCatalogSections.value = addSelfEvolutionCatalogEntry([...fallbackSkillSections]);
+  }
+}
+
+function selfEvolutionStatusLabel(status) {
+  return selfEvolutionStatusLabels[status] ?? status ?? '未知';
+}
+
+function selfEvolutionKindLabel(kind) {
+  return selfEvolutionKindLabels[kind] ?? kind ?? '候选';
+}
+
+function selfEvolutionDraftKindLabel(kind) {
+  return selfEvolutionDraftKindLabels[kind] ?? kind ?? '草案';
+}
+
+function qualityDimensionLabel(key) {
+  const labels = {
+    character_consistency: '人物一致性',
+    conflict_progress: '冲突推进',
+    information_release: '信息释放',
+    dialogue_naturalness: '对白自然度',
+    style_stability: '文风稳定性',
+  };
+  return labels[key] ?? key;
+}
+
+function previewListItems(value) {
+  return Array.isArray(value) ? value.filter((item) => String(item ?? '').trim()) : [];
+}
+
+function percentLabel(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return '0%';
+  }
+  return `${Math.round(Math.max(0, Math.min(numeric, 1)) * 100)}%`;
+}
+
+function syncSelfEvolutionScheduleForm(schedule) {
+  selfEvolutionScheduleForm.enabled = Boolean(schedule?.enabled);
+  selfEvolutionScheduleForm.intervalHours = Number(schedule?.interval_hours ?? 168) || 168;
+  const tasks = Array.isArray(schedule?.tasks) ? schedule.tasks : ['curate', 'regression', 'model_review'];
+  selfEvolutionScheduleForm.tasks.curate = tasks.includes('curate');
+  selfEvolutionScheduleForm.tasks.regression = tasks.includes('regression');
+  selfEvolutionScheduleForm.tasks.model_review = tasks.includes('model_review');
+}
+
+async function refreshSelfEvolutionState({ silent = false } = {}) {
+  if (!props.project?.id) {
+    selfEvolutionState.data = null;
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+
+  selfEvolutionState.isLoading = true;
+  try {
+    selfEvolutionState.data = await getProjectSelfEvolution(props.project.id);
+    syncSelfEvolutionScheduleForm(selfEvolutionState.data?.schedule);
+    if (!silent) {
+      setToolMessage('自学习状态已刷新');
+    }
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '读取自学习状态失败';
+  } finally {
+    selfEvolutionState.isLoading = false;
+  }
+}
+
+function selectedScheduleTasks() {
+  return Object.entries(selfEvolutionScheduleForm.tasks)
+    .filter(([, enabled]) => enabled)
+    .map(([task]) => task);
+}
+
+async function updateSelfEvolutionCandidateStatus(candidate, status) {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+  const candidateId = String(candidate?.id ?? '').trim();
+  if (!candidateId) {
+    toolError.value = '候选缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.updatingCandidateId = candidateId;
+  try {
+    await updateProjectSelfEvolutionCandidate(props.project.id, candidateId, { status });
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage(`候选状态已改为${selfEvolutionStatusLabel(status)}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '更新候选状态失败';
+  } finally {
+    selfEvolutionState.updatingCandidateId = '';
+  }
+}
+
+async function runSelfEvolutionCurator() {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+
+  selfEvolutionState.isCurating = true;
+  try {
+    const report = await curateProjectSelfEvolution(props.project.id);
+    await refreshSelfEvolutionState({ silent: true });
+    const checkedCount = Number(report?.checked_count ?? 0);
+    const changeCount = Number(report?.change_count ?? 0);
+    setToolMessage(`技能维护已完成：检查 ${checkedCount} 项，状态变化 ${changeCount} 项`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '技能维护失败';
+  } finally {
+    selfEvolutionState.isCurating = false;
+  }
+}
+
+async function runSelfEvolutionRegression() {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+
+  selfEvolutionState.isRegressing = true;
+  try {
+    const report = await runProjectSelfEvolutionRegression(props.project.id);
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage(`写作回归已完成：平均评分 ${percentLabel(report?.average_score)}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '写作回归失败';
+  } finally {
+    selfEvolutionState.isRegressing = false;
+  }
+}
+
+async function runSelfEvolutionModelReview() {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+
+  selfEvolutionState.isReviewing = true;
+  try {
+    await runProjectSelfEvolutionModelReview(props.project.id);
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('模型审查已完成');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '模型审查失败';
+  } finally {
+    selfEvolutionState.isReviewing = false;
+  }
+}
+
+async function saveSelfEvolutionSchedule() {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+  selfEvolutionScheduleForm.isSaving = true;
+  try {
+    await updateProjectSelfEvolutionSchedule(props.project.id, {
+      enabled: selfEvolutionScheduleForm.enabled,
+      interval_hours: selfEvolutionScheduleForm.intervalHours,
+      tasks: selectedScheduleTasks(),
+    });
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('自学习排程设置已保存');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '保存排程失败';
+  } finally {
+    selfEvolutionScheduleForm.isSaving = false;
+  }
+}
+
+async function runSelfEvolutionScheduleNow() {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+  selfEvolutionScheduleForm.isRunning = true;
+  try {
+    await runProjectSelfEvolutionSchedule(props.project.id);
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('自学习排程任务已执行');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '执行排程任务失败';
+  } finally {
+    selfEvolutionScheduleForm.isRunning = false;
+  }
+}
+
+async function loadSkillVersionsForUsage(skillId) {
+  const resolvedSkillId = String(skillId ?? '').trim();
+  if (!resolvedSkillId) {
+    return;
+  }
+  skillVersionState.selectedSkillId = resolvedSkillId;
+  skillVersionState.isLoading = true;
+  try {
+    skillVersionState.data = await getSkillVersions(resolvedSkillId);
+    setToolMessage('技能版本记录已读取');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '读取技能版本失败';
+  } finally {
+    skillVersionState.isLoading = false;
+  }
+}
+
+async function rollbackSelfEvolutionSkillVersion(versionId) {
+  if (!skillVersionState.selectedSkillId || !versionId) {
+    return;
+  }
+  skillVersionState.actionId = String(versionId);
+  try {
+    await rollbackSkillVersion(skillVersionState.selectedSkillId, versionId);
+    await loadSkillVersionsForUsage(skillVersionState.selectedSkillId);
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('技能已回滚到所选版本');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '技能回滚失败';
+  } finally {
+    skillVersionState.actionId = '';
+  }
+}
+
+async function promoteSelfEvolutionSkill(skillId) {
+  const resolvedSkillId = String(skillId ?? '').trim();
+  if (!resolvedSkillId) {
+    return;
+  }
+  skillVersionState.actionId = `promote-${resolvedSkillId}`;
+  try {
+    await promoteSkillToGlobal(resolvedSkillId);
+    await refreshSelfEvolutionState({ silent: true });
+    await loadSkillVersionsForUsage(resolvedSkillId);
+    setToolMessage('技能已提升为全局技能');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '提升全局技能失败';
+  } finally {
+    skillVersionState.actionId = '';
+  }
+}
+
+async function exportSelfEvolutionSkillPackage(skillId) {
+  const resolvedSkillId = String(skillId ?? skillVersionState.selectedSkillId ?? '').trim();
+  if (!resolvedSkillId) {
+    toolError.value = '先选择一个技能';
+    return;
+  }
+  skillPackageState.isExporting = true;
+  try {
+    const payload = await exportSkillPackage(resolvedSkillId);
+    skillPackageState.text = JSON.stringify(payload, null, 2);
+    setToolMessage('技能包已生成');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '导出技能包失败';
+  } finally {
+    skillPackageState.isExporting = false;
+  }
+}
+
+async function importSelfEvolutionSkillPackage() {
+  const rawText = skillPackageState.text.trim();
+  if (!rawText) {
+    toolError.value = '请先粘贴技能包 JSON';
+    return;
+  }
+  skillPackageState.isImporting = true;
+  try {
+    const parsed = JSON.parse(rawText);
+    const result = await importSkillPackage({
+      package: parsed,
+      strategy: skillPackageState.strategy,
+    });
+    await refreshSkillCatalog();
+    await refreshSelfEvolutionState({ silent: true });
+    if (result?.skill_id) {
+      await loadSkillVersionsForUsage(result.skill_id);
+    }
+    setToolMessage(`技能包已导入：${result?.skill_name || result?.skill_id || '用户技能'}`);
+  } catch (error) {
+    toolError.value = error instanceof SyntaxError
+      ? '技能包 JSON 格式无效'
+      : error instanceof Error
+        ? error.message
+        : '导入技能包失败';
+  } finally {
+    skillPackageState.isImporting = false;
+  }
+}
+
+async function applySelfEvolutionDraft(draft) {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+  const draftId = String(draft?.id ?? '').trim();
+  if (!draftId) {
+    toolError.value = '草案缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.updatingDraftId = draftId;
+  try {
+    await applyProjectSelfEvolutionDraft(props.project.id, draftId);
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('草案已应用');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '应用草案失败';
+  } finally {
+    selfEvolutionState.updatingDraftId = '';
+  }
+}
+
+async function discardSelfEvolutionDraft(draft) {
+  if (!ensureProjectAndChapter()) {
+    return;
+  }
+  const draftId = String(draft?.id ?? '').trim();
+  if (!draftId) {
+    toolError.value = '草案缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.updatingDraftId = draftId;
+  try {
+    await updateProjectSelfEvolutionDraft(props.project.id, draftId, { status: 'discarded' });
+    await refreshSelfEvolutionState({ silent: true });
+    setToolMessage('草案已废弃');
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '更新草案状态失败';
+  } finally {
+    selfEvolutionState.updatingDraftId = '';
   }
 }
 
@@ -759,6 +1261,10 @@ async function loadToolData(tool) {
   }
   if (panel === 'prompt-history') {
     await refreshPromptHistory();
+    return;
+  }
+  if (panel === 'self-evolution') {
+    await refreshSelfEvolutionState({ silent: true });
     return;
   }
   if (panel === 'file-browser' && props.project?.id) {
@@ -3037,6 +3543,146 @@ async function handleStyleReferenceFilesSelected(event) {
             </div>
           </template>
 
+          <template v-else-if="activeToolPanelKey === 'self-evolution'">
+            <div
+              class="field-stack"
+              data-testid="self-evolution-panel"
+            >
+              <div class="subpanel">
+                <div class="subpanel-head">
+                  <h4>学习状态</h4>
+                  <button
+                    :disabled="selfEvolutionState.isLoading"
+                    class="secondary-button small-button"
+                    data-testid="self-evolution-refresh-button"
+                    type="button"
+                    @click="refreshSelfEvolutionState()"
+                  >
+                    {{ selfEvolutionState.isLoading ? '刷新中…' : '刷新' }}
+                  </button>
+                </div>
+                <div class="self-evolution-metrics">
+                  <div
+                    v-for="metric in selfEvolutionMetrics"
+                    :key="metric.label"
+                    class="self-evolution-metric"
+                  >
+                    <strong>{{ metric.value }}</strong>
+                    <span>{{ metric.label }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <label class="form-field">
+                <span>候选状态</span>
+                <select
+                  v-model="selfEvolutionState.statusFilter"
+                  data-testid="self-evolution-status-filter"
+                >
+                  <option
+                    v-for="status in selfEvolutionStatusOptions"
+                    :key="status"
+                    :value="status"
+                  >
+                    {{ status === '全部' ? '全部' : selfEvolutionStatusLabel(status) }}
+                  </option>
+                </select>
+              </label>
+
+              <button
+                :disabled="selfEvolutionState.isCurating"
+                class="secondary-button"
+                data-testid="self-evolution-curate-button"
+                type="button"
+                @click="runSelfEvolutionCurator"
+              >
+                {{ selfEvolutionState.isCurating ? '维护中…' : '检查技能库状态' }}
+              </button>
+              <button
+                :disabled="selfEvolutionState.isRegressing"
+                class="secondary-button"
+                data-testid="self-evolution-regression-button"
+                type="button"
+                @click="runSelfEvolutionRegression"
+              >
+                {{ selfEvolutionState.isRegressing ? '回归中…' : '运行写作回归' }}
+              </button>
+              <button
+                :disabled="selfEvolutionState.isReviewing"
+                class="secondary-button"
+                data-testid="self-evolution-model-review-button"
+                type="button"
+                @click="runSelfEvolutionModelReview"
+              >
+                {{ selfEvolutionState.isReviewing ? '审查中…' : '模型审查' }}
+              </button>
+              <div class="subpanel">
+                <div class="subpanel-head">
+                  <h4>自学习排程</h4>
+                  <span>{{ selfEvolutionSchedule.last_run_at || '未执行' }}</span>
+                </div>
+                <label class="checkbox-field">
+                  <input
+                    v-model="selfEvolutionScheduleForm.enabled"
+                    type="checkbox"
+                  >
+                  启用可选排程
+                </label>
+                <label class="form-field compact-field">
+                  <span>间隔小时</span>
+                  <input
+                    v-model.number="selfEvolutionScheduleForm.intervalHours"
+                    min="1"
+                    type="number"
+                  >
+                </label>
+                <div class="check-grid">
+                  <label class="check-pill">
+                    <input
+                      v-model="selfEvolutionScheduleForm.tasks.curate"
+                      type="checkbox"
+                    >
+                    技能检查
+                  </label>
+                  <label class="check-pill">
+                    <input
+                      v-model="selfEvolutionScheduleForm.tasks.regression"
+                      type="checkbox"
+                    >
+                    写作回归
+                  </label>
+                  <label class="check-pill">
+                    <input
+                      v-model="selfEvolutionScheduleForm.tasks.model_review"
+                      type="checkbox"
+                    >
+                    模型审查
+                  </label>
+                </div>
+                <div class="action-row">
+                  <button
+                    :disabled="selfEvolutionScheduleForm.isSaving"
+                    class="secondary-button small-button"
+                    data-testid="self-evolution-schedule-save-button"
+                    type="button"
+                    @click="saveSelfEvolutionSchedule"
+                  >
+                    保存排程
+                  </button>
+                  <button
+                    :disabled="selfEvolutionScheduleForm.isRunning"
+                    class="secondary-button small-button"
+                    data-testid="self-evolution-schedule-run-button"
+                    type="button"
+                    @click="runSelfEvolutionScheduleNow"
+                  >
+                    执行一次
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+
           <template v-else-if="activeToolPanelKey === 'reader'">
             <div class="field-stack">
               <label class="form-field">
@@ -4073,6 +4719,621 @@ async function handleStyleReferenceFilesSelected(event) {
             </div>
           </template>
 
+          <template v-else-if="activeToolPanelKey === 'self-evolution'">
+            <div
+              class="result-shell"
+              data-testid="self-evolution-result"
+            >
+              <section
+                class="result-section"
+                data-testid="self-evolution-dashboard"
+              >
+                <div class="subpanel-head">
+                  <h4>能力看板</h4>
+                  <p>{{ selfEvolutionDashboard.generated_at || '等待数据' }}</p>
+                </div>
+                <div class="self-evolution-metrics">
+                  <div class="self-evolution-metric">
+                    <strong>{{ percentLabel(selfEvolutionDashboard.latest_writing_score) }}</strong>
+                    <span>最近写作评分</span>
+                  </div>
+                  <div class="self-evolution-metric">
+                    <strong>{{ percentLabel(selfEvolutionDashboard.latest_regression_score) }}</strong>
+                    <span>最近回归评分</span>
+                  </div>
+                  <div class="self-evolution-metric">
+                    <strong>{{ selfEvolutionDashboard.pending_draft_count || 0 }}</strong>
+                    <span>待确认草案</span>
+                  </div>
+                  <div class="self-evolution-metric">
+                    <strong>{{ selfEvolutionDashboard.recent_failure_count || 0 }}</strong>
+                    <span>近期失败</span>
+                  </div>
+                </div>
+                <div
+                  v-if="Object.keys(selfEvolutionQualityDimensions).length"
+                  class="issue-list"
+                  data-testid="self-evolution-quality-dimensions"
+                >
+                  <article
+                    v-for="(score, key) in selfEvolutionQualityDimensions"
+                    :key="key"
+                    class="issue-card"
+                  >
+                    <strong>{{ qualityDimensionLabel(key) }}</strong>
+                    <div class="trend-bar">
+                      <span :style="{ width: percentLabel(score) }" />
+                    </div>
+                    <p>{{ percentLabel(score) }}</p>
+                  </article>
+                </div>
+                <div
+                  v-if="selfEvolutionWritingTrend.length || selfEvolutionRegressionTrend.length"
+                  class="issue-list"
+                  data-testid="self-evolution-trends"
+                >
+                  <article class="issue-card">
+                    <strong>写作评分趋势</strong>
+                    <div class="trend-row">
+                      <span
+                        v-for="(item, index) in selfEvolutionWritingTrend.slice(0, 12).reverse()"
+                        :key="`writing-${index}-${item.generated_at}`"
+                        :style="{ height: percentLabel(item.score) }"
+                      />
+                    </div>
+                  </article>
+                  <article class="issue-card">
+                    <strong>回归评分趋势</strong>
+                    <div class="trend-row">
+                      <span
+                        v-for="(item, index) in selfEvolutionRegressionTrend.slice(0, 12).reverse()"
+                        :key="`regression-${index}-${item.generated_at}`"
+                        :style="{ height: percentLabel(item.score) }"
+                      />
+                    </div>
+                  </article>
+                </div>
+                <div
+                  v-if="selfEvolutionDashboard.failing_actions?.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="item in selfEvolutionDashboard.failing_actions"
+                    :key="item.action"
+                    class="issue-card"
+                  >
+                    <strong>{{ item.action }}</strong>
+                    <p>失败记录 {{ item.count }} 次</p>
+                  </article>
+                </div>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-failure-cases"
+              >
+                <div class="subpanel-head">
+                  <h4>失败案例库</h4>
+                  <p>{{ selfEvolutionFailureCases.length }} 条</p>
+                </div>
+                <div
+                  v-if="selfEvolutionFailureGroups.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="item in selfEvolutionFailureGroups"
+                    :key="`${item.action_kind}-${item.latest_at}`"
+                    class="issue-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ item.action_kind || '失败类型' }}</strong>
+                      <span class="skill-tag">{{ item.status === 'repeated' ? '重复出现' : '单次' }} · {{ item.count || 0 }} 次</span>
+                    </div>
+                    <p>{{ item.latest_summary }}</p>
+                    <p>{{ item.prevention }}</p>
+                  </article>
+                </div>
+                <div
+                  v-if="selfEvolutionFailureCases.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="item in selfEvolutionFailureCases.slice(0, 6)"
+                    :key="item.id"
+                    class="issue-card"
+                  >
+                    <strong>{{ item.action_kind || item.label || '失败案例' }}</strong>
+                    <p>{{ item.summary }}</p>
+                    <p>{{ item.prevention }}</p>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  失败任务会进入这里，后续同类任务会把提醒带进 Agent 上下文。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-drafts"
+              >
+                <div class="subpanel-head">
+                  <h4>确认草案</h4>
+                  <p>{{ pendingSelfEvolutionDrafts.length }} 个待确认</p>
+                </div>
+                <div
+                  v-if="selfEvolutionDrafts.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="draft in selfEvolutionDrafts.slice(0, 8)"
+                    :key="draft.id"
+                    class="issue-card"
+                    data-testid="self-evolution-draft-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ draft.title || '自学习草案' }}</strong>
+                      <span class="skill-tag">{{ selfEvolutionDraftKindLabel(draft.kind) }} · {{ draft.status || 'pending' }}</span>
+                    </div>
+                    <p>{{ draft.summary }}</p>
+                    <div
+                      v-if="draft.diff_preview?.summary || previewListItems(draft.diff_preview?.additions).length || previewListItems(draft.diff_preview?.warnings).length"
+                      class="diff-preview"
+                    >
+                      <strong v-if="draft.diff_preview?.summary">{{ draft.diff_preview.summary }}</strong>
+                      <ul
+                        v-if="previewListItems(draft.diff_preview?.additions).length"
+                        class="plain-list"
+                      >
+                        <li
+                          v-for="item in previewListItems(draft.diff_preview?.additions).slice(0, 3)"
+                          :key="item"
+                        >
+                          {{ item }}
+                        </li>
+                      </ul>
+                      <ul
+                        v-if="previewListItems(draft.diff_preview?.warnings).length"
+                        class="plain-list diff-warning-list"
+                      >
+                        <li
+                          v-for="item in previewListItems(draft.diff_preview?.warnings).slice(0, 3)"
+                          :key="item"
+                        >
+                          {{ item }}
+                        </li>
+                      </ul>
+                    </div>
+                    <pre
+                      v-if="draft.payload?.body_markdown"
+                      class="mini-pre"
+                    >{{ draft.payload.body_markdown }}</pre>
+                    <div class="action-row">
+                      <button
+                        :disabled="draft.status !== 'pending' || selfEvolutionState.updatingDraftId === draft.id"
+                        class="secondary-button small-button"
+                        type="button"
+                        @click="applySelfEvolutionDraft(draft)"
+                      >
+                        应用草案
+                      </button>
+                      <button
+                        :disabled="draft.status !== 'pending' || selfEvolutionState.updatingDraftId === draft.id"
+                        class="secondary-button small-button"
+                        type="button"
+                        @click="discardSelfEvolutionDraft(draft)"
+                      >
+                        废弃
+                      </button>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  把候选改为“已采纳”后，这里会生成待确认草案。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-regression"
+              >
+                <div class="subpanel-head">
+                  <h4>写作回归</h4>
+                  <p>{{ selfEvolutionRegressionRuns.length }} 次</p>
+                </div>
+                <template v-if="selfEvolutionRegressionRuns.length">
+                  <article class="issue-card">
+                    <strong>{{ selfEvolutionRegressionRuns[0].chapter_title || selfEvolutionRegressionRuns[0].chapter_id }}</strong>
+                    <p>平均评分 {{ percentLabel(selfEvolutionRegressionRuns[0].average_score) }} · {{ selfEvolutionRegressionRuns[0].status }}</p>
+                    <div class="issue-list">
+                      <article
+                        v-for="item in selfEvolutionRegressionRuns[0].cases"
+                        :key="item.id"
+                        class="issue-card"
+                      >
+                        <strong>{{ item.label }}</strong>
+                        <p>{{ percentLabel(item.score) }} · {{ item.status }}</p>
+                        <ul
+                          v-if="item.suggestions?.length"
+                          class="plain-list"
+                        >
+                          <li
+                            v-for="suggestion in item.suggestions"
+                            :key="suggestion"
+                          >
+                            {{ suggestion }}
+                          </li>
+                        </ul>
+                      </article>
+                    </div>
+                  </article>
+                </template>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  运行写作回归后，会用同一样本章检查续写、改稿、去 AI 和资料调用。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-model-reviews"
+              >
+                <div class="subpanel-head">
+                  <h4>模型审查</h4>
+                  <p>{{ selfEvolutionModelReviews.length }} 次</p>
+                </div>
+                <article
+                  v-if="selfEvolutionModelReviews.length"
+                  class="issue-card"
+                >
+                  <strong>{{ selfEvolutionModelReviews[0].summary || '模型审查' }}</strong>
+                  <p>{{ selfEvolutionModelReviews[0].status }}</p>
+                  <div
+                    v-if="selfEvolutionModelReviews[0].cross_review"
+                    class="detail-pills"
+                  >
+                    <span class="scene-pill">
+                      审查模型 {{ selfEvolutionModelReviews[0].cross_review.reviewer_count || 1 }} 个
+                    </span>
+                    <span class="scene-pill">
+                      {{ selfEvolutionModelReviews[0].cross_review.status || 'unknown' }}
+                    </span>
+                  </div>
+                  <p v-if="selfEvolutionModelReviews[0].cross_review?.summary">
+                    {{ selfEvolutionModelReviews[0].cross_review.summary }}
+                  </p>
+                  <ul class="plain-list">
+                    <li
+                      v-for="item in [
+                        ...(selfEvolutionModelReviews[0].failure_causes || []),
+                        ...(selfEvolutionModelReviews[0].improvement_suggestions || []),
+                        ...(selfEvolutionModelReviews[0].cross_review?.improvement_suggestions || []),
+                      ].slice(0, 8)"
+                      :key="item"
+                    >
+                      {{ item }}
+                    </li>
+                  </ul>
+                </article>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  点击“模型审查”后，会生成失败原因和改进建议。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-candidates"
+              >
+                <div class="subpanel-head">
+                  <h4>经验候选</h4>
+                  <p>{{ filteredSelfEvolutionCandidates.length }} / {{ selfEvolutionCandidates.length }}</p>
+                </div>
+                <div
+                  v-if="filteredSelfEvolutionCandidates.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="candidate in filteredSelfEvolutionCandidates"
+                    :key="candidate.id"
+                    class="issue-card"
+                    data-testid="self-evolution-candidate-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ candidate.title || '未命名候选' }}</strong>
+                      <span class="skill-tag">{{ selfEvolutionKindLabel(candidate.kind) }} · {{ selfEvolutionStatusLabel(candidate.status) }}</span>
+                    </div>
+                    <p>{{ candidate.content }}</p>
+                    <p v-if="candidate.rationale">{{ candidate.rationale }}</p>
+                    <div class="detail-pills">
+                      <span class="scene-pill">可信度 {{ percentLabel(candidate.confidence) }}</span>
+                      <span class="scene-pill">出现 {{ candidate.seen_count || 1 }} 次</span>
+                      <span
+                        v-if="candidate.last_seen_at"
+                        class="scene-pill"
+                      >
+                        {{ candidate.last_seen_at }}
+                      </span>
+                    </div>
+                    <div class="action-row">
+                      <button
+                        v-for="status in selfEvolutionStatusOptions.filter((item) => item !== '全部')"
+                        :key="`${candidate.id}-${status}`"
+                        :disabled="candidate.status === status || selfEvolutionState.updatingCandidateId === candidate.id"
+                        class="secondary-button small-button"
+                        type="button"
+                        @click="updateSelfEvolutionCandidateStatus(candidate, status)"
+                      >
+                        {{ selfEvolutionStatusLabel(status) }}
+                      </button>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  当前没有符合筛选条件的候选。Agent 完成任务后会在这里显示可复用经验。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-rules"
+              >
+                <div class="subpanel-head">
+                  <h4>调用规则</h4>
+                  <p>{{ selfEvolutionRules.length }} 条</p>
+                </div>
+                <div
+                  v-if="selfEvolutionRules.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="rule in selfEvolutionRules"
+                    :key="rule.id"
+                    class="issue-card"
+                  >
+                    <strong>{{ rule.title || '调用规则' }}</strong>
+                    <p>{{ rule.content }}</p>
+                    <p v-if="rule.rationale">{{ rule.rationale }}</p>
+                    <div class="detail-pills">
+                      <span class="scene-pill">可信度 {{ percentLabel(rule.confidence) }}</span>
+                      <span class="scene-pill">出现 {{ rule.seen_count || 1 }} 次</span>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  还没有高可信调用规则。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-evaluations"
+              >
+                <div class="subpanel-head">
+                  <h4>写作评价</h4>
+                  <p>{{ selfEvolutionEvaluations.length }} 条</p>
+                </div>
+                <div
+                  v-if="selfEvolutionEvaluations.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="item in selfEvolutionEvaluations.slice(0, 6)"
+                    :key="item.id"
+                    class="issue-card"
+                  >
+                    <strong>评分 {{ percentLabel(item.score) }}</strong>
+                    <p>{{ item.latest_user_message || item.task_pack_kind || item.task_id }}</p>
+                    <div class="detail-pills">
+                      <span class="scene-pill">变更 {{ item.project_change_count || 0 }}</span>
+                      <span class="scene-pill">失败 {{ item.failure_count || 0 }}</span>
+                      <span
+                        v-if="item.knowledge_used"
+                        class="scene-pill"
+                      >
+                        已用资料
+                      </span>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  Agent 产生写作任务后会记录评分和执行信号。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-skill-usage"
+              >
+                <div class="subpanel-head">
+                  <h4>技能统计</h4>
+                  <p>{{ selfEvolutionSkillUsage.length }} 项</p>
+                </div>
+                <div
+                  v-if="selfEvolutionSkillUsage.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="item in selfEvolutionSkillUsage.slice(0, 8)"
+                    :key="item.skill_id"
+                    class="issue-card"
+                  >
+                    <strong>{{ item.skill_id }}</strong>
+                    <p>{{ item.state || 'active' }} · 使用 {{ item.use_count || 0 }} 次 · 修改 {{ item.patch_count || 0 }} 次</p>
+                    <p v-if="item.last_used_at">最近使用：{{ item.last_used_at }}</p>
+                    <div class="action-row">
+                      <button
+                        :disabled="skillVersionState.isLoading && skillVersionState.selectedSkillId === item.skill_id"
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-skill-versions-button"
+                        type="button"
+                        @click="loadSkillVersionsForUsage(item.skill_id)"
+                      >
+                        版本记录
+                      </button>
+                      <button
+                        :disabled="skillVersionState.actionId === `promote-${item.skill_id}`"
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-skill-promote-button"
+                        type="button"
+                        @click="promoteSelfEvolutionSkill(item.skill_id)"
+                      >
+                        提升为全局
+                      </button>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  还没有技能使用记录。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-skill-versions"
+              >
+                <div class="subpanel-head">
+                  <h4>技能版本</h4>
+                  <p>{{ skillVersionState.selectedSkillId || '未选择技能' }}</p>
+                </div>
+                <p
+                  v-if="skillVersionState.isLoading"
+                  class="empty-result-copy"
+                >
+                  正在读取版本记录。
+                </p>
+                <template v-else-if="skillVersionState.data">
+                  <article class="issue-card">
+                    <strong>{{ skillVersionState.data.skill_name || skillVersionState.data.skill_id }}</strong>
+                    <p>{{ skillVersionState.data.current_path }}</p>
+                    <div class="action-row">
+                      <button
+                        :disabled="skillPackageState.isExporting"
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-skill-package-export-button"
+                        type="button"
+                        @click="exportSelfEvolutionSkillPackage(skillVersionState.data.skill_id)"
+                      >
+                        导出技能包
+                      </button>
+                    </div>
+                  </article>
+                  <article class="issue-card">
+                    <div class="subpanel-head">
+                      <div>
+                        <strong>技能包迁移</strong>
+                        <p>导出后可复制到其他环境；粘贴技能包 JSON 后可以导入。</p>
+                      </div>
+                    </div>
+                    <label class="form-field">
+                      <span>技能包 JSON</span>
+                      <textarea
+                        v-model="skillPackageState.text"
+                        rows="6"
+                        placeholder="这里显示导出的技能包，也可以粘贴其他环境导出的技能包。"
+                      />
+                    </label>
+                    <label class="form-field compact-field">
+                      <span>导入策略</span>
+                      <select v-model="skillPackageState.strategy">
+                        <option value="create_copy">创建副本</option>
+                        <option value="overwrite">覆盖同 ID 用户技能</option>
+                      </select>
+                    </label>
+                    <div class="action-row">
+                      <button
+                        :disabled="skillPackageState.isImporting"
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-skill-package-import-button"
+                        type="button"
+                        @click="importSelfEvolutionSkillPackage"
+                      >
+                        导入技能包
+                      </button>
+                    </div>
+                  </article>
+                  <div
+                    v-if="skillVersionState.data.items?.length"
+                    class="issue-list"
+                  >
+                    <article
+                      v-for="version in skillVersionState.data.items.slice(0, 8)"
+                      :key="version.id"
+                      class="issue-card"
+                    >
+                      <div class="candidate-title-row">
+                        <strong>{{ version.created_at || version.id }}</strong>
+                        <span class="skill-tag">{{ version.reason || 'snapshot' }}</span>
+                      </div>
+                      <p>{{ version.id }} · {{ version.size || 0 }} 字符</p>
+                      <div
+                        v-if="version.version_markdown || version.current_markdown"
+                        class="diff-columns"
+                      >
+                        <div>
+                          <strong>历史版本</strong>
+                          <pre class="mini-pre diff-pre">{{ version.version_markdown }}</pre>
+                        </div>
+                        <div>
+                          <strong>当前版本</strong>
+                          <pre class="mini-pre diff-pre">{{ version.current_markdown }}</pre>
+                        </div>
+                      </div>
+                      <pre
+                        v-if="version.diff_from_current"
+                        class="mini-pre diff-pre"
+                      >{{ version.diff_from_current }}</pre>
+                      <div class="action-row">
+                        <button
+                          :disabled="skillVersionState.actionId === version.id"
+                          class="secondary-button small-button"
+                          data-testid="self-evolution-skill-rollback-button"
+                          type="button"
+                          @click="rollbackSelfEvolutionSkillVersion(version.id)"
+                        >
+                          回滚到此版本
+                        </button>
+                      </div>
+                    </article>
+                  </div>
+                  <p
+                    v-else
+                    class="empty-result-copy"
+                  >
+                    这个技能还没有历史版本。
+                  </p>
+                </template>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  在技能统计里选择“版本记录”后，这里会显示差异和回滚操作。
+                </p>
+              </section>
+            </div>
+          </template>
+
           <template v-else-if="activeToolPanelKey === 'reader'">
             <div class="result-shell">
               <h4>{{ currentReaderChapter?.title ?? '当前章节' }}</h4>
@@ -4546,6 +5807,110 @@ textarea {
   gap: 8px;
 }
 
+.self-evolution-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.self-evolution-metric {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f6f8fa;
+}
+
+.self-evolution-metric strong {
+  color: #1f2328;
+  font-size: 18px;
+}
+
+.self-evolution-metric span {
+  color: #57606a;
+  font-size: 12px;
+}
+
+.trend-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: #eef2f5;
+  overflow: hidden;
+}
+
+.trend-bar span {
+  display: block;
+  height: 100%;
+  min-width: 3px;
+  border-radius: inherit;
+  background: #1d4ed8;
+}
+
+.trend-row {
+  min-height: 88px;
+  display: flex;
+  align-items: end;
+  gap: 6px;
+  padding: 8px 0 2px;
+}
+
+.trend-row span {
+  width: 14px;
+  min-height: 4px;
+  border-radius: 5px 5px 2px 2px;
+  background: #1d4ed8;
+}
+
+.diff-preview {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #dfe6ec;
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: #f8fafc;
+}
+
+.diff-preview strong {
+  color: #1f2328;
+  font-size: 13px;
+}
+
+.diff-warning-list {
+  color: #8a5a00;
+}
+
+.diff-pre {
+  max-height: 260px;
+}
+
+.diff-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.diff-columns > div {
+  display: grid;
+  gap: 8px;
+}
+
+.diff-columns strong {
+  color: #1f2328;
+  font-size: 13px;
+}
+
+.candidate-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 10px;
+}
+
+.result-section {
+  display: grid;
+  gap: 12px;
+}
+
 .check-pill input {
   margin: 0;
 }
@@ -4682,6 +6047,10 @@ textarea {
   .progress-head {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .diff-columns {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

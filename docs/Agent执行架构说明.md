@@ -27,10 +27,12 @@
    - 先保存题材、目标章节数、目标字数，再走统一的 `sendConversation -> agent session`
    - 整书架构和普通 agent 执行现在共用同一套状态、时间线和结果展示
 
-5. 执行轨迹和经验候选
+5. 执行轨迹、经验候选和自学习复盘
    - Agent 执行完成后会把计划、步骤、产物、建议和状态写入 `logs/agent_trajectories.jsonl`
    - 讨论结论、资料分析结果和可复用技能建议会整理成 `learning_review` 产物
-   - 经验候选只展示和记录，不会直接写入项目记忆，需要作者确认后再保存
+   - `self_evolution_review` 会继续记录技能使用、调用规则候选、写作评价、失败案例和技能整理结果
+   - 技能更新会保留版本快照，面板可查看差异、回滚版本或把用户技能提升为全局技能
+   - 经验候选只展示和记录，不会直接写入作者侧项目记忆，需要作者确认后再保存
 
 ## 后端结构
 
@@ -141,7 +143,7 @@
 - `event_blocks` 给计划和阶段性事件
 - `artifacts` 给结果产物和历史回看
 
-### 5. 执行轨迹与经验候选
+### 5. 执行轨迹、经验候选与自学习复盘
 
 Agent session 结束后，后端会追加一条结构化轨迹：
 
@@ -161,7 +163,48 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 - 资料分析产物里值得复用的结论
 - 可转成用户技能的重复处理方式
 
-这套机制只是把经验整理出来。它不会越过作者确认直接改 `project_memory/author/`。
+自学习复盘会额外维护这些文件：
+
+```text
+<project-dir>/.gaoxia/learning/self_evolution_candidates.json
+<project-dir>/.gaoxia/learning/self_evolution_reviews.jsonl
+<project-dir>/.gaoxia/learning/agent_capability_rules.json
+<project-dir>/.gaoxia/learning/writing_evaluations.jsonl
+<project-dir>/.gaoxia/learning/self_evolution_drafts.json
+<project-dir>/.gaoxia/learning/writing_regression_runs.jsonl
+<project-dir>/.gaoxia/learning/self_evolution_model_reviews.jsonl
+<project-dir>/.gaoxia/learning/failure_cases.jsonl
+<project-dir>/.gaoxia/learning/self_evolution_schedule.json
+<app-data>/skills/.usage.json
+<app-data>/skills/.curator_reports.jsonl
+<app-data>/skills/.versions/{skill_id}/versions.json
+<app-data>/app_config.json              # review_model 存在这里
+```
+
+它会自动写入调用规则和统计信息，但不会越过作者确认直接改 `project_memory/author/`，也不会自动改章节正文。候选被标为已采纳后会先生成确认草案，草案再由作者在技能库里应用：记忆草案写入作者侧项目记忆，技能草案创建或更新用户技能，调用规则草案标为作者采纳。
+
+相关接口：
+
+- `GET /api/projects/{project_id}/self-evolution`
+- `PATCH /api/projects/{project_id}/self-evolution/candidates/{candidate_id}`
+- `POST /api/projects/{project_id}/self-evolution/curate`
+- `POST /api/projects/{project_id}/self-evolution/regression`
+- `POST /api/projects/{project_id}/self-evolution/model-review`
+- `PUT /api/projects/{project_id}/self-evolution/schedule`
+- `POST /api/projects/{project_id}/self-evolution/schedule/run`
+- `PATCH /api/projects/{project_id}/self-evolution/drafts/{draft_id}`
+- `POST /api/projects/{project_id}/self-evolution/drafts/{draft_id}/apply`
+- `GET /api/studio/skills/{skill_id}/versions`
+- `GET /api/studio/skills/{skill_id}/package`
+- `POST /api/studio/skills/import-package`
+- `POST /api/studio/skills/{skill_id}/versions/{version_id}/rollback`
+- `POST /api/studio/skills/{skill_id}/promote-global`
+
+`agent_capability_rules.json` 和 `failure_cases.jsonl` 不是只做归档。后续 Agent 进入模型规划和模型路由时，会把高置信调用规则和失败案例提醒作为 system context 一起传入，用来影响 action 顺序、工具选择和失败前检查。
+
+前端技能库 `Agent 自学习` 面板会读取这些接口展示能力看板、确认草案、草案差异预览、写作回归、模型审查、经验候选、调用规则、写作评价、细分质量维度、长期趋势、失败案例、重复失败聚合、技能统计、技能版本和技能包迁移。技能版本会同时显示历史版本、当前版本和 unified diff。写作回归使用同一章样本检查续写、改稿、去 AI、资料调用四类任务的输入条件和自学习信号，不直接改正文。
+
+自学习排程默认关闭，只有通过面板或接口开启后才按 `interval_hours` 检查；面板里的“执行一次”会强制执行当前任务组。后台 worker 由 FastAPI lifespan 启动，每隔 `NOVEL_SELF_EVOLUTION_WORKER_INTERVAL_SECONDS` 扫描一次已启用排程的作品；`NOVEL_SELF_EVOLUTION_WORKER_ENABLED=false` 可以关闭 worker。多模型交叉审查可以在设置页启用，也可以通过 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 配置；环境变量优先级高于本地配置。
 
 ## 前端结构
 

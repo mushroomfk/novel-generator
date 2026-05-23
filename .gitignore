@@ -29,6 +29,7 @@ venv/
 
 # Build artifacts
 build/
+release/
 target/
 src-tauri/target/
 src-tauri/gen/

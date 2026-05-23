@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import difflib
 import re
 
 from fastapi import HTTPException
@@ -16,6 +17,7 @@ from novel_backend.models import (
   SkillItem,
   SkillMaterializeRequest,
   SkillMaterializeResult,
+  SkillPackageImportRequest,
   SkillSection,
   SkillSuggestion,
   SkillVerificationReport,
@@ -28,13 +30,16 @@ from novel_backend.services.generation_service import (
   _string_from_keys,
   _string_list_from_keys,
 )
+from novel_backend.services.log_service import append_app_log
 from novel_backend.services.project_service import get_project_detail
-from novel_backend.utils.jsonfile import atomic_write_text, read_json
+from novel_backend.services.skill_usage_service import record_skill_patch
+from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 _USER_SKILL_SECTION_ID = "user-skills"
 _USER_SKILL_SECTION_TITLE = "用户沉淀"
 _USER_SKILL_SECTION_DESCRIPTION = "聊天里沉淀下来的可复用技能，会跟着你的新要求继续迭代。"
 _SKILL_BODY_SECTION_TITLES = ("适用场景", "输入要求", "执行步骤", "输出要求", "边界")
+_SKILL_VERSION_LIMIT = 40
 _SKILL_DRAFT_SYSTEM_PROMPT = """
 你是技能设计器。你的任务是参考 OpenHarness 的 SKILL.md 风格，把一段已经验证过的聊天工作流整理成可以长期复用的用户技能。
 
@@ -109,6 +114,22 @@ def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
 
 
+def _version_id() -> str:
+  return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+
+
+def _safe_skill_id(skill_id: str) -> str:
+  return re.sub(r"[^A-Za-z0-9._-]+", "-", skill_id.strip()).strip(".-_") or "skill"
+
+
+def _skill_versions_dir(settings: Settings, skill_id: str) -> Path:
+  return skills_dir(settings) / ".versions" / _safe_skill_id(skill_id)
+
+
+def _skill_versions_index_path(settings: Settings, skill_id: str) -> Path:
+  return _skill_versions_dir(settings, skill_id) / "versions.json"
+
+
 def _ordered_unique(items: list[str]) -> list[str]:
   seen: set[str] = set()
   ordered: list[str] = []
@@ -166,6 +187,7 @@ def _skill_record_from_json(path: Path) -> _SkillRecord | None:
     order=int(payload.get("order") or 0),
     behavior=SkillBehavior.model_validate(payload.get("behavior") or _default_skill_behavior(skill_id)),
     source="builtin",
+    scope=str(payload.get("scope") or "").strip(),
     updated_at=None,
     usage=[],
     limitations=[],
@@ -275,6 +297,7 @@ def _skill_record_from_markdown(path: Path) -> _SkillRecord | None:
       submit_label=str(frontmatter.get("submit_label") or "").strip(),
     ),
     source=str(frontmatter.get("source") or "custom").strip() or "custom",
+    scope=str(frontmatter.get("scope") or "").strip(),
     updated_at=str(frontmatter.get("updated_at") or "").strip() or None,
     usage=_frontmatter_list(frontmatter, "usage"),
     limitations=_frontmatter_list(frontmatter, "limitations"),
@@ -314,6 +337,276 @@ def _find_skill_record(settings: Settings, skill_id: str) -> _SkillRecord | None
     if record.item.id == target:
       return record
   return None
+
+
+def _load_skill_version_index(settings: Settings, skill_id: str) -> dict[str, object]:
+  payload = read_json(_skill_versions_index_path(settings, skill_id), None)
+  if not isinstance(payload, dict):
+    return {"schema_version": 1, "updated_at": _now_iso(), "items": []}
+  if not isinstance(payload.get("items"), list):
+    payload["items"] = []
+  payload.setdefault("schema_version", 1)
+  payload.setdefault("updated_at", _now_iso())
+  return payload
+
+
+def _save_skill_version_index(settings: Settings, skill_id: str, payload: dict[str, object]) -> None:
+  payload["updated_at"] = _now_iso()
+  atomic_write_json(_skill_versions_index_path(settings, skill_id), payload)
+
+
+def _snapshot_skill_version(settings: Settings, skill_id: str, markdown: str, *, reason: str) -> dict[str, object] | None:
+  content = str(markdown or "").strip()
+  if not skill_id.strip() or not content:
+    return None
+  versions_dir = _skill_versions_dir(settings, skill_id)
+  versions_dir.mkdir(parents=True, exist_ok=True)
+  version_id = _version_id()
+  filename = f"{version_id}.md"
+  version_path = versions_dir / filename
+  atomic_write_text(version_path, f"{content}\n")
+  index = _load_skill_version_index(settings, skill_id)
+  items = index.get("items")
+  if not isinstance(items, list):
+    items = []
+  entry = {
+    "id": version_id,
+    "skill_id": skill_id,
+    "reason": reason,
+    "created_at": _now_iso(),
+    "path": str(version_path),
+    "size": len(content),
+  }
+  items.insert(0, entry)
+  index["items"] = items[:_SKILL_VERSION_LIMIT]
+  _save_skill_version_index(settings, skill_id, index)
+  return entry
+
+
+def _read_skill_version_markdown(entry: dict[str, object]) -> str:
+  path = Path(str(entry.get("path") or ""))
+  if not path.exists():
+    return ""
+  return path.read_text(encoding="utf-8")
+
+
+def _diff_text(before: str, after: str, from_label: str, to_label: str, limit: int = 12000) -> str:
+  diff = "\n".join(
+    difflib.unified_diff(
+      before.splitlines(),
+      after.splitlines(),
+      fromfile=from_label,
+      tofile=to_label,
+      lineterm="",
+    )
+  )
+  if len(diff) <= limit:
+    return diff
+  return f"{diff[:limit].rstrip()}\n... diff truncated ..."
+
+
+def _markdown_preview(text: str, limit: int = 12000) -> str:
+  normalized = str(text or "")
+  if len(normalized) <= limit:
+    return normalized
+  return f"{normalized[:limit].rstrip()}\n... markdown truncated ..."
+
+
+def list_skill_versions(settings: Settings, skill_id: str) -> dict[str, object]:
+  record = _find_skill_record(settings, skill_id)
+  if record is None or record.item.source == "builtin":
+    raise HTTPException(status_code=404, detail={"code": "skill_not_found", "message": "用户技能不存在"})
+  current_markdown = record.path.read_text(encoding="utf-8") if record.path.exists() else ""
+  index = _load_skill_version_index(settings, skill_id)
+  items = []
+  for raw_item in index.get("items") or []:
+    if not isinstance(raw_item, dict):
+      continue
+    markdown = _read_skill_version_markdown(raw_item)
+    items.append(
+      {
+        **raw_item,
+        "diff_from_current": _diff_text(markdown, current_markdown, str(raw_item.get("id") or "version"), "current"),
+        "version_markdown": _markdown_preview(markdown),
+        "current_markdown": _markdown_preview(current_markdown),
+      }
+    )
+  return {
+    "skill_id": skill_id,
+    "skill_name": record.item.name,
+    "current_path": str(record.path),
+    "items": items,
+  }
+
+
+def rollback_skill_version(settings: Settings, skill_id: str, version_id: str) -> dict[str, object]:
+  record = _find_skill_record(settings, skill_id)
+  if record is None or record.item.source == "builtin":
+    raise HTTPException(status_code=404, detail={"code": "skill_not_found", "message": "用户技能不存在"})
+  index = _load_skill_version_index(settings, skill_id)
+  matched = next(
+    (
+      item for item in index.get("items") or []
+      if isinstance(item, dict) and str(item.get("id") or "") == version_id
+    ),
+    None,
+  )
+  if matched is None:
+    raise HTTPException(status_code=404, detail={"code": "skill_version_not_found", "message": "技能版本不存在"})
+  target_markdown = _read_skill_version_markdown(matched)
+  if not target_markdown.strip():
+    raise HTTPException(status_code=404, detail={"code": "skill_version_missing", "message": "技能版本文件不存在"})
+  current_markdown = record.path.read_text(encoding="utf-8") if record.path.exists() else ""
+  _snapshot_skill_version(settings, skill_id, current_markdown, reason="before_rollback")
+  atomic_write_text(record.path, target_markdown.strip() + "\n")
+  record_skill_patch(settings, skill_id, action="rollback")
+  refreshed = _find_skill_record(settings, skill_id)
+  if refreshed is None:
+    raise RuntimeError("技能回滚后没有被目录识别")
+  return {
+    "skill_id": skill_id,
+    "skill_name": refreshed.item.name,
+    "rolled_back_to": version_id,
+    "saved_path": str(record.path),
+    "diff": _diff_text(current_markdown, target_markdown, "before_rollback", version_id),
+  }
+
+
+def promote_skill_to_global(settings: Settings, skill_id: str) -> dict[str, object]:
+  record = _find_skill_record(settings, skill_id)
+  if record is None or record.item.source == "builtin":
+    raise HTTPException(status_code=404, detail={"code": "skill_not_found", "message": "用户技能不存在"})
+  if not record.path.exists():
+    raise HTTPException(status_code=404, detail={"code": "skill_file_not_found", "message": "技能文件不存在"})
+
+  current_markdown = record.path.read_text(encoding="utf-8")
+  _snapshot_skill_version(settings, skill_id, current_markdown, reason="before_promote_global")
+  frontmatter, body = _split_frontmatter(current_markdown)
+  next_payload = dict(frontmatter)
+  next_payload["name"] = str(next_payload.get("name") or record.item.name)
+  next_payload["description"] = str(next_payload.get("description") or record.item.description)
+  next_payload["version"] = _bump_version(str(next_payload.get("version") or "0.1.0"))
+  next_payload["skill_id"] = skill_id
+  next_payload["section_id"] = _USER_SKILL_SECTION_ID
+  next_payload["section_title"] = _USER_SKILL_SECTION_TITLE
+  next_payload["section_description"] = _USER_SKILL_SECTION_DESCRIPTION
+  next_payload["category"] = "全局技能"
+  next_payload["badge"] = str(next_payload.get("badge") or "沉")
+  next_payload["accent"] = str(next_payload.get("accent") or "smoke")
+  next_payload["source"] = "custom"
+  next_payload["scope"] = "global"
+  next_payload["panel"] = "conversation-skill"
+  next_payload["updated_at"] = _now_iso()
+  next_payload["promoted_at"] = _now_iso()
+  next_payload["requires_project"] = _as_bool(next_payload.get("requires_project"), True)
+  next_payload["requires_chapter"] = _as_bool(next_payload.get("requires_chapter"), False)
+  next_payload["scenes"] = _ordered_unique(["跨项目", *_coerce_list(next_payload.get("scenes"))])[:4]
+  next_payload["usage"] = _ordered_unique(
+    [
+      "适合在多个小说项目之间复用。",
+      *_coerce_list(next_payload.get("usage")),
+    ]
+  )[:4]
+  next_payload["limitations"] = _ordered_unique(_coerce_list(next_payload.get("limitations")))[:4]
+  final_markdown = f"{_build_frontmatter(next_payload)}\n{body.strip()}\n"
+  atomic_write_text(record.path, final_markdown)
+  record_skill_patch(settings, skill_id, action="promote_global")
+  refreshed = _find_skill_record(settings, skill_id)
+  if refreshed is None:
+    raise RuntimeError("技能提升为全局后没有被目录识别")
+  return {
+    "skill_id": skill_id,
+    "skill_name": refreshed.item.name,
+    "scope": "global",
+    "saved_path": str(record.path),
+    "diff": _diff_text(current_markdown, final_markdown, "before_promote_global", "global"),
+  }
+
+
+def export_skill_package(settings: Settings, skill_id: str) -> dict[str, object]:
+  record = _find_skill_record(settings, skill_id)
+  if record is None or record.item.source == "builtin":
+    raise HTTPException(status_code=404, detail={"code": "skill_not_found", "message": "用户技能不存在"})
+  if not record.path.exists():
+    raise HTTPException(status_code=404, detail={"code": "skill_file_not_found", "message": "技能文件不存在"})
+  markdown = record.path.read_text(encoding="utf-8")
+  versions = list_skill_versions(settings, skill_id)
+  return {
+    "schema_version": 1,
+    "exported_at": _now_iso(),
+    "type": "gaoxia_skill_package",
+    "skill": record.item.model_dump(mode="json"),
+    "markdown": markdown,
+    "version_count": len(versions.get("items") or []),
+  }
+
+
+def import_skill_package(settings: Settings, payload: SkillPackageImportRequest) -> dict[str, object]:
+  package = payload.package
+  if not isinstance(package, dict) or package.get("type") != "gaoxia_skill_package":
+    raise HTTPException(status_code=400, detail={"code": "skill_package_invalid", "message": "技能包格式无效"})
+  markdown = str(package.get("markdown") or "").strip()
+  if not markdown:
+    raise HTTPException(status_code=400, detail={"code": "skill_package_empty", "message": "技能包缺少技能正文"})
+
+  frontmatter, body = _split_frontmatter(markdown)
+  package_skill = package.get("skill") if isinstance(package.get("skill"), dict) else {}
+  source_skill_id = str(frontmatter.get("skill_id") or package_skill.get("id") or "").strip()
+  source_name = str(frontmatter.get("name") or package_skill.get("name") or "导入技能").strip()
+  if not source_skill_id:
+    source_skill_id = _slugify_skill_id(source_name)
+  existing = _find_skill_record(settings, source_skill_id)
+  if payload.strategy == "overwrite" and existing is not None and existing.item.source == "builtin":
+    raise HTTPException(status_code=400, detail={"code": "skill_builtin", "message": "内置技能不能被技能包覆盖"})
+
+  target_skill_id = source_skill_id
+  action = "import"
+  target_path: Path
+  if payload.strategy == "overwrite" and existing is not None:
+    target_path = existing.path
+    current_markdown = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+    _snapshot_skill_version(settings, target_skill_id, current_markdown, reason="before_import_package")
+    action = "import_overwrite"
+  else:
+    target_skill_id = _ensure_unique_skill_id(settings, _safe_skill_id(source_skill_id), None)
+    target_path = _next_skill_path(settings, target_skill_id)
+    if target_skill_id != source_skill_id:
+      action = "import_copy"
+
+  next_payload = dict(frontmatter)
+  next_payload["name"] = source_name
+  next_payload["description"] = str(next_payload.get("description") or package_skill.get("description") or "").strip()
+  next_payload["version"] = str(next_payload.get("version") or "0.1.0")
+  next_payload["skill_id"] = target_skill_id
+  next_payload["section_id"] = _USER_SKILL_SECTION_ID
+  next_payload["section_title"] = _USER_SKILL_SECTION_TITLE
+  next_payload["section_description"] = _USER_SKILL_SECTION_DESCRIPTION
+  next_payload["category"] = str(next_payload.get("category") or package_skill.get("category") or "用户技能")
+  next_payload["badge"] = str(next_payload.get("badge") or package_skill.get("badge") or "沉")
+  next_payload["accent"] = str(next_payload.get("accent") or package_skill.get("accent") or "smoke")
+  next_payload["source"] = "custom"
+  next_payload["panel"] = "conversation-skill"
+  next_payload["updated_at"] = _now_iso()
+  next_payload["requires_project"] = _as_bool(next_payload.get("requires_project"), True)
+  next_payload["requires_chapter"] = _as_bool(next_payload.get("requires_chapter"), False)
+  next_payload["scenes"] = _ordered_unique(_coerce_list(next_payload.get("scenes")) or _coerce_list(package_skill.get("scenes")))[:4]
+  next_payload["usage"] = _ordered_unique(_coerce_list(next_payload.get("usage")) or _coerce_list(package_skill.get("usage")))[:4]
+  next_payload["limitations"] = _ordered_unique(_coerce_list(next_payload.get("limitations")) or _coerce_list(package_skill.get("limitations")))[:4]
+  final_markdown = f"{_build_frontmatter(next_payload)}\n{body.strip()}\n"
+
+  target_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_text(target_path, final_markdown)
+  _snapshot_skill_version(settings, target_skill_id, final_markdown, reason="after_import_package")
+  record_skill_patch(settings, target_skill_id, action=action)
+  refreshed = _find_skill_record(settings, target_skill_id)
+  if refreshed is None:
+    raise RuntimeError("技能包导入后没有被目录识别")
+  return {
+    "skill_id": target_skill_id,
+    "skill_name": refreshed.item.name,
+    "action": action,
+    "saved_path": str(target_path),
+  }
 
 
 def list_skill_catalog(settings: Settings) -> SkillCatalog:
@@ -828,8 +1121,10 @@ def _build_frontmatter(payload: dict[str, object]) -> str:
     "badge",
     "accent",
     "source",
+    "scope",
     "panel",
     "updated_at",
+    "promoted_at",
     "verification_summary",
   ]
   for key in scalar_keys:
@@ -936,6 +1231,8 @@ def materialize_skill(settings: Settings, payload: SkillMaterializeRequest) -> S
   }
   provisional_markdown = f"{_build_frontmatter(frontmatter_payload)}\n{body_markdown.strip()}\n"
   temp_path = existing_record.path if existing_record is not None else _next_skill_path(settings, skill_id)
+  if existing_record is not None and temp_path.exists():
+    _snapshot_skill_version(settings, skill_id, temp_path.read_text(encoding="utf-8"), reason="before_update")
   temp_path.parent.mkdir(parents=True, exist_ok=True)
   atomic_write_text(temp_path, provisional_markdown)
 
@@ -947,11 +1244,16 @@ def materialize_skill(settings: Settings, payload: SkillMaterializeRequest) -> S
   final_body = _attach_verification_section(body_markdown, verification)
   final_markdown = f"{_build_frontmatter(frontmatter_payload)}\n{final_body.strip()}\n"
   atomic_write_text(temp_path, final_markdown)
+  _snapshot_skill_version(settings, skill_id, final_markdown, reason="after_materialize")
 
   final_record = _find_skill_record(settings, skill_id)
   if final_record is None:
     raise RuntimeError("技能二次写回后没有被目录识别")
   action = "iterate" if existing_record is not None or payload.action == "iterate" else "create"
+  try:
+    record_skill_patch(settings, skill_id, action=action, project_id=payload.project_id)
+  except Exception as error:
+    append_app_log(settings, f"技能统计写入失败：{error}", level="WARNING")
   message = f"已{'更新' if action == 'iterate' else '沉淀'}技能「{final_record.item.name}」。"
   return SkillMaterializeResult(
     action=action,

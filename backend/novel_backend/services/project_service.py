@@ -225,7 +225,7 @@ _NON_CHARACTER_NAME_FRAGMENTS = (
   "道具",
   "设定",
 )
-_NON_CHARACTER_NAME_CHARS = frozenset("的了与及为被将把从因却虽而")
+_NON_CHARACTER_NAME_CHARS = frozenset("的了与及为被将把从因却虽而在是有和或并都就向以到给让使会要能须需应")
 _COMMON_SINGLE_CHAR_SURNAMES = (
   "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
   "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费"
@@ -306,6 +306,63 @@ _DISCOVERED_CHARACTER_SUFFIX_BLACKLIST = (
   "医生",
   "学生",
   "朋友",
+)
+_DISCOVERED_NAME_TRAILING_CONTEXT_CHARS = frozenset(
+  "的在对向和与把被将为从到给让使是有会要能可须需应因以跟同由曾仍已正也都只却但后"
+)
+_DISCOVERED_NAME_TRAILING_CONTEXT_PREFIXES = (
+  "保持",
+  "继续",
+  "负责",
+  "主动",
+  "拒绝",
+  "选择",
+  "陷入",
+  "试图",
+  "争取",
+  "证明",
+  "推动",
+  "需要",
+  "必须",
+  "已经",
+  "正在",
+  "仍有",
+  "曾经",
+)
+_DISCOVERED_NAME_RIGHT_CONTEXT_CHARS = frozenset(
+  "的在对向和与把被将为从到给让使说问想看听试选拒陷负曾仍已正会要能可须需应因以跟同靠去来回做冷见后"
+)
+_DISCOVERED_NAME_LEFT_CONTEXT_CHARS = frozenset("问劝叫让给对向和与跟同见找着")
+_DISCOVERED_NAME_LEFT_CONTEXT_TOKENS = (
+  "姓名",
+  "名字",
+  "名为",
+  "叫",
+  "人物",
+  "角色",
+  "主角",
+  "男主",
+  "女主",
+  "反派",
+  "配角",
+  "导师",
+  "上司",
+  "下属",
+  "同事",
+  "同学",
+  "学生",
+  "实习生",
+  "妻子",
+  "丈夫",
+  "父亲",
+  "母亲",
+  "哥哥",
+  "姐姐",
+  "妹妹",
+  "弟弟",
+  "朋友",
+  "对手",
+  "搭档",
 )
 _PROJECT_DIR_PREFIX_PATTERN = re.compile(r"^(\d{8}_\d{6})_(.+)$")
 _LOCATION_PATTERN = re.compile(
@@ -2635,22 +2692,27 @@ def _collect_json_character_sections(container: object) -> dict[str, list[str]]:
 
   if isinstance(container, list):
     for item in container:
-      if not isinstance(item, dict):
-        continue
-      name = _json_character_name(item)
-      if name:
-        sections[name].extend(_json_character_lines(item))
+      if isinstance(item, dict):
+        name = _json_character_name(item)
+        if name:
+          sections[name].extend(_json_character_lines(item))
+          continue
+      for name, lines in _collect_json_character_sections(item).items():
+        sections[name].extend(lines)
     return sections
 
   if isinstance(container, dict):
+    name = _json_character_name(container)
+    if name:
+      sections[name].extend(_json_character_lines(container))
+      return sections
     for key, value in container.items():
       if isinstance(key, str) and _is_character_candidate(key) and isinstance(value, dict):
         sections[key.strip()].extend(_json_character_lines(value))
         continue
-      if isinstance(value, dict):
-        name = _json_character_name(value)
-        if name:
-          sections[name].extend(_json_character_lines(value))
+      if isinstance(value, (dict, list)):
+        for nested_name, lines in _collect_json_character_sections(value).items():
+          sections[nested_name].extend(lines)
     return sections
 
   return sections
@@ -2768,33 +2830,135 @@ def _normalize_discovered_character_name(name: str) -> str:
   return cleaned
 
 
-def _candidate_character_names(text: str) -> list[str]:
-  candidates: list[str] = []
-  source = text or ""
-  for pattern in (_COMPOUND_SURNAME_PATTERN, _SINGLE_SURNAME_PATTERN):
-    for match in pattern.finditer(source):
-      candidate = _normalize_discovered_character_name(match.group(1))
-      if candidate:
-        candidates.append(candidate)
+def _is_cjk_char(value: str) -> bool:
+  return bool(value and re.fullmatch(r"[\u4e00-\u9fff]", value))
+
+
+def _is_name_boundary_char(value: str) -> bool:
+  return not value or not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]", value)
+
+
+def _is_sentence_boundary_char(value: str) -> bool:
+  return not value or value in "。！？!?；;，,、\n\r\t （([{【“‘\"'"
+
+
+def _has_person_left_context(source: str, start: int) -> bool:
+  left = source[max(0, start - 8) : start]
+  return any(left.endswith(token) for token in _DISCOVERED_NAME_LEFT_CONTEXT_TOKENS)
+
+
+def _discovered_name_context_score(source: str, start: int, end: int, candidate: str) -> int:
+  previous_char = source[start - 1] if start > 0 else ""
+  next_char = source[end] if end < len(source) else ""
+  has_left_boundary = start == 0 or _is_name_boundary_char(previous_char)
+  has_left_person_context = previous_char in _DISCOVERED_NAME_LEFT_CONTEXT_CHARS or _has_person_left_context(source, start)
+  if not has_left_boundary and not has_left_person_context:
+    return 0
+
+  score = 0
+  if has_left_person_context:
+    score += 3
+  elif _is_sentence_boundary_char(previous_char):
+    score += 2
+  elif has_left_boundary:
+    score += 1
+
+  if not next_char or _is_name_boundary_char(next_char):
+    score += 2
+  elif next_char in _DISCOVERED_NAME_RIGHT_CONTEXT_CHARS:
+    score += 2
+  elif has_left_person_context and _is_cjk_char(next_char):
+    score += 1
+  else:
+    return 0
+
+  if len(candidate) >= 3:
+    score += 1
+  return score
+
+
+def _should_shorten_discovered_name(source: str, short_end: int) -> bool:
+  if short_end >= len(source):
+    return False
+  next_char = source[short_end]
+  if next_char in _DISCOVERED_NAME_TRAILING_CONTEXT_CHARS:
+    return True
+  return any(source.startswith(prefix, short_end) for prefix in _DISCOVERED_NAME_TRAILING_CONTEXT_PREFIXES)
+
+
+def _candidate_names_from_position(source: str, start: int, surname: str) -> list[tuple[str, int]]:
+  candidates: list[tuple[str, int]] = []
+  surname_len = len(surname)
+
+  for given_len in range(2, 0, -1):
+    end = start + surname_len + given_len
+    if end > len(source):
+      continue
+
+    raw_candidate = source[start:end]
+    candidate_end = end
+    if given_len > 1:
+      short_end = start + surname_len + 1
+      if _should_shorten_discovered_name(source, short_end) or raw_candidate[-1] in _DISCOVERED_NAME_TRAILING_CONTEXT_CHARS:
+        raw_candidate = source[start:short_end]
+        candidate_end = short_end
+
+    candidate = _normalize_discovered_character_name(raw_candidate)
+    if not candidate:
+      continue
+
+    candidate_end = start + len(candidate)
+    score = _discovered_name_context_score(source, start, candidate_end, candidate)
+    if score > 0:
+      candidates.append((candidate, score))
+      break
+
   return candidates
+
+
+def _candidate_character_names(text: str) -> list[str]:
+  return [name for name, _score in _candidate_character_evidence(text)]
+
+
+def _candidate_character_evidence(text: str) -> list[tuple[str, int]]:
+  evidence: list[tuple[str, int]] = []
+  source = text or ""
+  for index, char in enumerate(source):
+    compound_matched = False
+    for surname in _COMPOUND_SURNAMES:
+      if source.startswith(surname, index):
+        evidence.extend(_candidate_names_from_position(source, index, surname))
+        compound_matched = True
+        break
+    if compound_matched:
+      continue
+    if char in _COMMON_SINGLE_CHAR_SURNAMES:
+      evidence.extend(_candidate_names_from_position(source, index, char))
+  return evidence
 
 
 def _discover_character_names(texts: list[str], limit: int = 24) -> list[str]:
   counts: dict[str, int] = {}
+  evidence_scores: dict[str, int] = {}
+  source_indexes: dict[str, set[int]] = defaultdict(set)
   first_seen: dict[str, tuple[int, int]] = {}
 
   for text_index, text in enumerate(texts):
-    for match_index, candidate in enumerate(_candidate_character_names(text)):
+    for match_index, (candidate, score) in enumerate(_candidate_character_evidence(text)):
       counts[candidate] = counts.get(candidate, 0) + 1
+      evidence_scores[candidate] = evidence_scores.get(candidate, 0) + score
+      source_indexes[candidate].add(text_index)
       first_seen.setdefault(candidate, (text_index, match_index))
 
   filtered = [
     name
     for name, count in counts.items()
-    if count >= (2 if len(name) >= 3 else 3)
+    if count >= 2 and evidence_scores.get(name, 0) >= (6 if len(name) >= 3 else 8)
   ]
   filtered.sort(
     key=lambda name: (
+      -len(source_indexes[name]),
+      -evidence_scores[name],
       -counts[name],
       -len(name),
       first_seen[name][0],

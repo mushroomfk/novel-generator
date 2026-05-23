@@ -28,6 +28,7 @@ function artifactKindLabel(kind) {
     continuation_plan: '后续规划',
     user_skill: '用户技能',
     learning_review: '经验候选',
+    self_evolution_review: '自学习复盘',
   };
 
   return labels[normalized] ?? (normalized || '产物');
@@ -58,6 +59,14 @@ function artifactMeta(item) {
     const skillCount = Number(metadata.skill_candidate_count ?? 0);
     const total = memoryCount + skillCount;
     return total > 0 ? `${total} 条候选` : '已记录';
+  }
+  if (item?.kind === 'self_evolution_review') {
+    const candidateCount = Number(metadata.candidate_count ?? 0);
+    const ruleCount = Number(metadata.capability_rule_count ?? 0);
+    if (candidateCount > 0 || ruleCount > 0) {
+      return `${candidateCount} 候选 / ${ruleCount} 规则`;
+    }
+    return metadata.status === 'failed' ? '失败' : '已记录';
   }
   return '';
 }

@@ -50,6 +50,15 @@ const form = reactive({
     retrieval_k: 6,
     batch_size: 8,
   },
+  review_model: {
+    enabled: false,
+    provider: 'openai-compatible',
+    base_url: '',
+    api_key: '',
+    model_name: '',
+    max_tokens: 1800,
+    temperature: 0.2,
+  },
 });
 
 const isSaving = ref(false);
@@ -144,6 +153,10 @@ watch(
       ...(nextConfig.embedding ?? {}),
       dimensions: nextConfig.embedding?.dimensions ?? '',
     });
+    Object.assign(form.review_model, {
+      ...form.review_model,
+      ...(nextConfig.review_model ?? {}),
+    });
   },
   { immediate: true },
 );
@@ -164,6 +177,7 @@ async function save() {
     await updateModelConfig({
       model: { ...form.model },
       embedding: { ...autoEmbeddingConfig.value },
+      review_model: { ...form.review_model },
     });
     message.value = '写作设置已保存';
     emit('updated');
@@ -283,6 +297,69 @@ async function save() {
           <p class="field-helper">不需要单独再填 Embedding。保存写作模型后，知识检索会自动切到对应向量模型；API Key 默认跟随当前写作模型，留空时继续走环境变量。</p>
         </div>
 
+        <div class="section-label">
+          自学习审查模型
+        </div>
+        <label class="checkbox-field">
+          <input
+            v-model="form.review_model.enabled"
+            type="checkbox"
+          />
+          启用第二审查模型
+        </label>
+        <div class="grid two-columns">
+          <label>
+            <span>服务商标识</span>
+            <input v-model="form.review_model.provider" />
+          </label>
+          <label>
+            <span>模型名称</span>
+            <input
+              v-model="form.review_model.model_name"
+              placeholder="例如 gpt-4.1-mini"
+            />
+          </label>
+        </div>
+        <label>
+          <span>接口地址</span>
+          <input
+            v-model="form.review_model.base_url"
+            placeholder="https://api.openai.com/v1"
+          />
+        </label>
+        <label>
+          <span>API Key</span>
+          <input
+            v-model="form.review_model.api_key"
+            autocomplete="off"
+            placeholder="留空则走 NOVEL_REVIEW_MODEL_API_KEY"
+            type="password"
+          />
+          <small class="field-helper">环境变量 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 的优先级高于这里保存的配置。</small>
+        </label>
+        <div class="grid two-columns">
+          <label>
+            <span>审查回复长度</span>
+            <input
+              v-model.number="form.review_model.max_tokens"
+              min="256"
+              max="16000"
+              step="256"
+              type="number"
+            />
+          </label>
+          <label>
+            <span>审查温度</span>
+            <input
+              v-model.number="form.review_model.temperature"
+              min="0"
+              max="2"
+              step="0.1"
+              type="number"
+            />
+          </label>
+        </div>
+
         <p
           v-if="message"
           class="message"
@@ -378,6 +455,19 @@ label {
 label > span {
   color: #57606a;
   font-size: 13px;
+}
+
+.checkbox-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #4f5b66;
+  font-size: 13px;
+}
+
+.checkbox-field input {
+  width: auto;
+  margin: 0;
 }
 
 .field-helper {

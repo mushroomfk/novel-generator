@@ -31,15 +31,27 @@ class EmbeddingConfig(BaseModel):
   batch_size: int = Field(default=8, ge=1, le=32)
 
 
+class ReviewModelConfig(BaseModel):
+  enabled: bool = False
+  provider: str = "openai-compatible"
+  base_url: str = ""
+  api_key: str = ""
+  model_name: str = ""
+  max_tokens: int = Field(default=1800, ge=256, le=16000)
+  temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+
+
 class AppConfig(BaseModel):
   model: ModelConfig = Field(default_factory=ModelConfig)
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+  review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
   updated_at: str
 
 
 class AppConfigUpdateRequest(BaseModel):
   model: ModelConfig = Field(default_factory=ModelConfig)
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+  review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
 
 
 class HealthPayload(BaseModel):
@@ -211,6 +223,20 @@ class ProjectDreamRunRequest(BaseModel):
 
 class ProjectDreamPromoteRequest(BaseModel):
   candidate_ids: list[str] = Field(default_factory=list, min_length=1, max_length=10)
+
+
+class SelfEvolutionCandidateUpdateRequest(BaseModel):
+  status: str = Field(pattern="^(pending|accepted|rejected|archived)$")
+
+
+class SelfEvolutionDraftUpdateRequest(BaseModel):
+  status: str = Field(pattern="^(pending|discarded)$")
+
+
+class SelfEvolutionScheduleUpdateRequest(BaseModel):
+  enabled: bool = False
+  interval_hours: int = Field(default=168, ge=1, le=2160)
+  tasks: list[str] = Field(default_factory=lambda: ["curate", "regression", "model_review"], max_length=3)
 
 
 class DistilledSourceProfile(BaseModel):
@@ -965,6 +991,7 @@ class SkillItem(BaseModel):
   order: int = 0
   behavior: SkillBehavior = Field(default_factory=SkillBehavior)
   source: str = "builtin"
+  scope: str = ""
   updated_at: str | None = None
   usage: list[str] = Field(default_factory=list)
   limitations: list[str] = Field(default_factory=list)
@@ -991,6 +1018,11 @@ class SkillMaterializeRequest(BaseModel):
   skill_id: str = Field(default="", max_length=120)
   skill_name: str = Field(default="", max_length=120)
   selected_chapter_id: str = Field(default="", max_length=120)
+
+
+class SkillPackageImportRequest(BaseModel):
+  package: dict[str, object] = Field(default_factory=dict)
+  strategy: str = Field(default="create_copy", pattern="^(create_copy|overwrite)$")
 
 
 class SkillVerificationReport(BaseModel):

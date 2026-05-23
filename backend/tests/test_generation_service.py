@@ -119,6 +119,49 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["core_seed"], "一把失踪航线钥匙牵出主角的身世和港口权力真相。")
     self.assertIn("港口秩序", result_event[1]["character_design"])
 
+  def test_architecture_stream_flattens_structured_json_sections(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model_name="demo-model",
+      ),
+    )
+
+    with patch(
+      "novel_backend.services.generation_service._request_chat_completion",
+      return_value={
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "core_seed": {"title": "铜钥匙", "summary": "一把铜钥匙牵出旧港口秩序。"},
+                  "character_design": {
+                    "characters": [
+                      {"name": "林追", "role": "追查真相"},
+                      {"name": "苏青", "role": "掌握旧账本"},
+                    ]
+                  },
+                  "world_building": {"rules": ["潮位窗口开启隐秘航线", "港务会封锁证据"]},
+                  "plot_structure": {"acts": [{"title": "追查", "goal": "找到账本"}]},
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      },
+    ):
+      events = asyncio.run(collect_events(self.settings, self.payload))
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertIn("铜钥匙", result_event[1]["core_seed"])
+    self.assertIn("林追", result_event[1]["character_design"])
+    self.assertIn("潮位窗口", result_event[1]["world_building"])
+    self.assertIn("找到账本", result_event[1]["plot_structure"])
+
   def test_architecture_stream_reports_missing_api_key(self) -> None:
     save_config(
       self.settings,
@@ -701,6 +744,78 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertIn("作者明确要求 / 硬规则 / 主角底线", sent_prompt)
     self.assertIn("最近梦境线索：这轮做梦提醒要继续守住铜钥匙、身世和港务会压迫感这三条慢线。", sent_prompt)
     self.assertEqual(events[-1][1]["status"], "completed")
+
+  def test_architecture_step_stream_accepts_structured_content(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model_name="demo-model",
+      ),
+    )
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="结构化架构",
+        genre="都市",
+        target_chapters=6,
+        target_words=120000,
+      ),
+    )
+
+    with patch(
+      "novel_backend.services.generation_service._request_chat_completion",
+      return_value={
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "headline": "人物设定已经整理。",
+                  "summary": "围绕林晚的职业危机展开人物关系。",
+                  "content": [
+                    {
+                      "name": "林晚",
+                      "age": 32,
+                      "role": "创意总监",
+                      "initial_state": "事业巅峰期被当众羞辱。",
+                      "relationships": {"苏青": "需要主动接触。"},
+                    },
+                    {
+                      "name": "陈小雨",
+                      "role": "前实习生",
+                      "initial_state": "掌握关键证据。",
+                    },
+                  ],
+                  "checklist": ["确认证据链", "保留职业尊严主线"],
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      },
+    ):
+      events = asyncio.run(
+        collect_architecture_step_events(
+          self.settings,
+          ArchitectureStepRequest(
+            project_id=project.id,
+            step="character_design",
+            mode="initial",
+            guidance="整理人物设定。",
+            workspace=ArchitectureWorkspace(),
+          ),
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    content = result_event[1]["content"]
+    self.assertTrue(content.startswith("林晚："))
+    self.assertIn("role：创意总监", content)
+    self.assertIn("陈小雨：", content)
+    self.assertNotIn('"headline"', content)
 
   def test_continuity_guard_prefers_manual_memory_and_recent_chapters(self) -> None:
     project = create_project(

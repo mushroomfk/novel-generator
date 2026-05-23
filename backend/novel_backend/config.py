@@ -33,6 +33,8 @@ class Settings(BaseSettings):
   app_name: str = "NovelGenerator"
   app_version: str = "0.1.0"
   started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+  self_evolution_worker_enabled: bool = True
+  self_evolution_worker_interval_seconds: int = Field(default=300, ge=30, le=86400)
   cors_origins: list[str] = Field(
     default_factory=lambda: [
       "http://localhost:1420",

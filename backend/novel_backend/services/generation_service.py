@@ -4,8 +4,6 @@ import asyncio
 import json
 import os
 import time
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 from uuid import uuid4
 
 from novel_backend.config import Settings
@@ -25,6 +23,7 @@ from novel_backend.services.continuity_guard_service import ContinuityGuardConte
 from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, compact_text, project_documents_map
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_http_service import request_json_with_retries
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.project_service import get_project_detail, search_project_knowledge_evidence
 from novel_backend.utils.sse import encode_sse
@@ -358,6 +357,55 @@ def _string_from_keys(payload: dict[str, object], *keys: str) -> str:
   return ""
 
 
+_STRUCTURED_NAME_KEYS = ("name", "姓名", "人物", "角色", "角色名", "title", "标题")
+
+
+def _structured_value_to_text(value: object) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, str):
+    return value.strip()
+  if isinstance(value, (int, float, bool)):
+    return str(value)
+  if isinstance(value, list):
+    return "\n".join(
+      item
+      for item in (_structured_value_to_text(entry) for entry in value)
+      if item
+    ).strip()
+  if isinstance(value, dict):
+    heading = ""
+    for key in _STRUCTURED_NAME_KEYS:
+      raw_heading = value.get(key)
+      if isinstance(raw_heading, str) and raw_heading.strip():
+        heading = raw_heading.strip()
+        break
+
+    lines = [f"{heading}："] if heading else []
+    for key, item in value.items():
+      if heading and key in _STRUCTURED_NAME_KEYS:
+        continue
+      text = _structured_value_to_text(item)
+      if not text:
+        continue
+      if "\n" in text:
+        lines.append(f"{key}：\n{text}")
+      else:
+        lines.append(f"{key}：{text}")
+    return "\n".join(lines).strip()
+  return str(value).strip()
+
+
+def _structured_text_from_keys(payload: dict[str, object], *keys: str) -> str:
+  for key in keys:
+    if key not in payload:
+      continue
+    text = _structured_value_to_text(payload.get(key))
+    if text:
+      return text
+  return ""
+
+
 def _string_list_from_keys(payload: dict[str, object], *keys: str) -> list[str]:
   for key in keys:
     value = payload.get(key)
@@ -381,30 +429,17 @@ _compact_text = compact_text
 
 
 def _request_chat_completion(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-  request = urllib_request.Request(endpoint, data=body, method="POST")
-  request.add_header("Content-Type", "application/json")
-  request.add_header("Authorization", f"Bearer {api_key}")
-
-  try:
-    with urllib_request.urlopen(request, timeout=120) as response:
-      raw_text = response.read().decode("utf-8")
-  except urllib_error.HTTPError as error:
-    error_text = error.read().decode("utf-8", errors="ignore")
-    message = error_text or str(error)
-    raise RuntimeError(f"模型请求失败: {error.code} {message}") from error
-  except urllib_error.URLError as error:
-    raise RuntimeError(f"模型请求失败: {error.reason}") from error
-
-  try:
-    parsed = json.loads(raw_text)
-  except json.JSONDecodeError as error:
-    raise RuntimeError("模型返回的不是合法 JSON") from error
-
-  if not isinstance(parsed, dict):
-    raise RuntimeError("模型返回格式不正确")
-
-  return parsed
+  return request_json_with_retries(
+    endpoint,
+    headers={
+      "Content-Type": "application/json",
+      "Authorization": f"Bearer {api_key}",
+    },
+    payload=payload,
+    error_prefix="模型请求失败",
+    invalid_json_message="模型返回的不是合法 JSON",
+    invalid_payload_message="模型返回格式不正确",
+  )
 
 
 def _model_is_aliyun(model_config: ModelConfig) -> bool:
@@ -558,10 +593,10 @@ def _parse_architecture_payload(text: str) -> dict[str, str]:
   payload = _extract_json_object(text)
   if isinstance(payload, dict):
     parsed = {
-      "core_seed": _string_from_keys(payload, "core_seed", "故事切口", "核心种子"),
-      "character_design": _string_from_keys(payload, "character_design", "人物关系", "角色设计"),
-      "world_building": _string_from_keys(payload, "world_building", "世界氛围", "世界观"),
-      "plot_structure": _string_from_keys(payload, "plot_structure", "推进方向", "情节结构"),
+      "core_seed": _structured_text_from_keys(payload, "core_seed", "故事切口", "核心种子"),
+      "character_design": _structured_text_from_keys(payload, "character_design", "人物关系", "角色设计"),
+      "world_building": _structured_text_from_keys(payload, "world_building", "世界氛围", "世界观"),
+      "plot_structure": _structured_text_from_keys(payload, "plot_structure", "推进方向", "情节结构"),
     }
     if all(parsed.values()):
       return parsed
@@ -685,7 +720,7 @@ def _parse_architecture_step_payload(text: str, payload: ArchitectureStepRequest
     return _fallback_architecture_step_result(text, payload, task_id)
   headline = _string_from_keys(parsed, "headline", "判断", "title")
   summary = _string_from_keys(parsed, "summary", "说明", "analysis")
-  content = _string_from_keys(parsed, "content", "正文", "result")
+  content = _structured_text_from_keys(parsed, "content", "正文", "result")
   checklist = _string_list_from_keys(parsed, "checklist", "要点", "suggestions")
   if not content:
     return _fallback_architecture_step_result(text, payload, task_id)

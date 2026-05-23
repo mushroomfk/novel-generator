@@ -55,6 +55,7 @@ from novel_backend.services.project_service import (
   update_chapter_content,
   update_story_documents,
 )
+from novel_backend.services.self_evolution_service import build_agent_capability_context, run_self_evolution_cycle
 from novel_backend.services.skill_service import (
   custom_skill_names,
   get_custom_skill_prompt_block,
@@ -1187,14 +1188,20 @@ def _plan_with_model(
     (item for item in reversed(payload.messages) if item.role == "user" and item.content.strip()),
     payload.messages[-1],
   )
+  planner_messages = [
+    {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
+    {"role": "system", "content": _build_route_context(runtime, payload.messages)},
+  ]
+  skill_catalog_context = _build_skill_catalog_context(settings)
+  if skill_catalog_context:
+    planner_messages.append({"role": "system", "content": skill_catalog_context})
+  capability_context = build_agent_capability_context(Path(runtime.detail.path))
+  if capability_context:
+    planner_messages.append({"role": "system", "content": capability_context})
+  planner_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"})
   content = _invoke_model(
     settings,
-    [
-      {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
-      {"role": "system", "content": _build_route_context(runtime, payload.messages)},
-      {"role": "system", "content": _build_skill_catalog_context(settings)},
-      {"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"},
-    ],
+    planner_messages,
     task_name="agent_plan",
   )
   planner_payload = _extract_json_object(content)
@@ -1322,13 +1329,17 @@ def _route_with_model(settings: Settings, runtime: RuntimeState, messages: list[
     (item for item in reversed(messages) if item.role == "user" and item.content.strip()),
     messages[-1],
   )
+  route_messages = [
+    {"role": "system", "content": _ROUTE_SYSTEM_PROMPT},
+    {"role": "system", "content": _build_route_context(runtime, messages)},
+  ]
+  capability_context = build_agent_capability_context(Path(runtime.detail.path))
+  if capability_context:
+    route_messages.append({"role": "system", "content": capability_context})
+  route_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"})
   content = _invoke_model(
     settings,
-    [
-      {"role": "system", "content": _ROUTE_SYSTEM_PROMPT},
-      {"role": "system", "content": _build_route_context(runtime, messages)},
-      {"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"},
-    ],
+    route_messages,
     task_name="agent_route",
   )
   payload = _extract_json_object(content)
@@ -2465,6 +2476,29 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
         task_pack_kind=current_task_pack_kind,
         message=str(error),
       )
+      failure_result = AgentChatResult(
+        task_id=task_id,
+        mode="execution",
+        reply=state.last_reply or str(error),
+        state=_state_summary(state.runtime),
+        thread_id=payload.thread_id,
+        task_pack_kind=state.active_task_pack_kind,
+        suggestions=state.suggestions,
+        execution_trace=state.execution_trace,
+        event_blocks=state.event_blocks,
+        artifacts=state.artifacts,
+        changes=state.changes,
+        can_save_discussion_summary=state.can_save_discussion_summary,
+        project_detail=state.runtime.detail,
+      )
+      self_evolution_artifact = run_self_evolution_cycle(
+        settings,
+        Path(state.runtime.detail.path),
+        payload=payload,
+        plan=plan,
+        result=failure_result,
+      )
+      state.artifacts.append(self_evolution_artifact)
       append_agent_trajectory(
         settings,
         _trajectory_record_from_state(
@@ -2534,6 +2568,24 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
     memory_count = int(learning_artifact.metadata.get("memory_candidate_count") or 0)
     if memory_count > 0:
       _append_ordered_unique(state.suggestions, "查看「经验候选」，确认后再写入项目记忆。")
+
+  self_evolution_input = preliminary_result.model_copy(
+    update={
+      "suggestions": state.suggestions,
+      "artifacts": state.artifacts,
+      "changes": state.changes,
+    }
+  )
+  self_evolution_artifact = run_self_evolution_cycle(
+    settings,
+    Path(state.runtime.detail.path),
+    payload=payload,
+    plan=plan,
+    result=self_evolution_input,
+  )
+  state.artifacts.append(self_evolution_artifact)
+  if int(self_evolution_artifact.metadata.get("candidate_count") or 0) > 0:
+    _append_ordered_unique(state.suggestions, "查看「自学习复盘」，处理技能、记忆和调用规则候选。")
 
   result_payload = AgentChatResult(
     task_id=task_id,

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from novel_backend.config import Settings
-from novel_backend.models import AppConfigUpdateRequest, EmbeddingConfig, ModelConfig
+from novel_backend.models import AppConfigUpdateRequest, EmbeddingConfig, ModelConfig, ReviewModelConfig
 from novel_backend.services.config_service import initialize_app_storage, load_config, save_config
 
 
@@ -24,6 +24,7 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertEqual(config.model.model_name, "qwen3.6-plus")
     self.assertEqual(config.embedding.model_name, "text-embedding-v4")
     self.assertEqual(config.embedding.dimensions, 2048)
+    self.assertFalse(config.review_model.enabled)
 
   def test_save_config_auto_uses_aliyun_embedding_for_aliyun_model(self) -> None:
     config = save_config(
@@ -43,6 +44,14 @@ class ConfigServiceTestCase(unittest.TestCase):
           retrieval_k=9,
           batch_size=4,
         ),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          base_url="https://review.example.com/v1",
+          api_key="review-key",
+          model_name="review-model",
+          max_tokens=2048,
+          temperature=0.1,
+        ),
       ),
     )
 
@@ -53,6 +62,8 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertEqual(config.embedding.api_key, "dashscope-key")
     self.assertEqual(config.embedding.retrieval_k, 9)
     self.assertEqual(config.embedding.batch_size, 4)
+    self.assertTrue(config.review_model.enabled)
+    self.assertEqual(config.review_model.model_name, "review-model")
 
   def test_save_config_auto_uses_doubao_embedding_for_volcengine_model(self) -> None:
     config = save_config(
@@ -78,6 +89,39 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertEqual(config.embedding.model_name, "doubao-embedding-vision")
     self.assertIsNone(config.embedding.dimensions)
     self.assertEqual(config.embedding.api_key, "ark-key")
+
+  def test_save_legacy_model_config_preserves_review_model(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(
+          provider="aliyun-bailian",
+          base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+          api_key="dashscope-key",
+          model_name="qwen-max",
+        ),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          base_url="https://review.example.com/v1",
+          api_key="review-key",
+          model_name="review-model",
+        ),
+      ),
+    )
+
+    config = save_config(
+      self.settings,
+      ModelConfig(
+        provider="custom-provider",
+        base_url="https://example.com/v1",
+        api_key="main-key",
+        model_name="main-model",
+      ),
+    )
+
+    self.assertTrue(config.review_model.enabled)
+    self.assertEqual(config.review_model.base_url, "https://review.example.com/v1")
+    self.assertEqual(config.review_model.model_name, "review-model")
 
   def test_load_config_normalizes_embedding_to_match_model_family(self) -> None:
     save_config(

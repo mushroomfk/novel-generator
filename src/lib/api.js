@@ -231,6 +231,88 @@ export async function promoteProjectDreamCandidates(projectId, payload) {
   });
 }
 
+export async function getProjectSelfEvolution(projectId) {
+  return request(`/api/projects/${projectId}/self-evolution`);
+}
+
+export async function updateProjectSelfEvolutionCandidate(projectId, candidateId, payload) {
+  return request(`/api/projects/${projectId}/self-evolution/candidates/${candidateId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function curateProjectSelfEvolution(projectId) {
+  return request(`/api/projects/${projectId}/self-evolution/curate`, {
+    method: 'POST',
+  });
+}
+
+export async function runProjectSelfEvolutionRegression(projectId) {
+  return request(`/api/projects/${projectId}/self-evolution/regression`, {
+    method: 'POST',
+  });
+}
+
+export async function runProjectSelfEvolutionModelReview(projectId) {
+  return request(`/api/projects/${projectId}/self-evolution/model-review`, {
+    method: 'POST',
+  });
+}
+
+export async function updateProjectSelfEvolutionDraft(projectId, draftId, payload) {
+  return request(`/api/projects/${projectId}/self-evolution/drafts/${draftId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function applyProjectSelfEvolutionDraft(projectId, draftId) {
+  return request(`/api/projects/${projectId}/self-evolution/drafts/${draftId}/apply`, {
+    method: 'POST',
+  });
+}
+
+export async function updateProjectSelfEvolutionSchedule(projectId, payload) {
+  return request(`/api/projects/${projectId}/self-evolution/schedule`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function runProjectSelfEvolutionSchedule(projectId) {
+  return request(`/api/projects/${projectId}/self-evolution/schedule/run`, {
+    method: 'POST',
+  });
+}
+
+export async function getSkillVersions(skillId) {
+  return request(`/api/studio/skills/${encodeURIComponent(skillId)}/versions`);
+}
+
+export async function exportSkillPackage(skillId) {
+  return request(`/api/studio/skills/${encodeURIComponent(skillId)}/package`);
+}
+
+export async function importSkillPackage(payload) {
+  return request('/api/studio/skills/import-package', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function rollbackSkillVersion(skillId, versionId) {
+  return request(`/api/studio/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(versionId)}/rollback`, {
+    method: 'POST',
+  });
+}
+
+export async function promoteSkillToGlobal(skillId) {
+  return request(`/api/studio/skills/${encodeURIComponent(skillId)}/promote-global`, {
+    method: 'POST',
+  });
+}
+
 export async function applyProjectArchitectureWorkspace(projectId, payload) {
   return request(`/api/projects/${projectId}/architecture/workspace`, {
     method: 'PUT',
