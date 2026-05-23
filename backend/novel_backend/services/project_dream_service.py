@@ -17,7 +17,7 @@ from novel_backend.models import (
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
-from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_memory_service import append_project_memory, append_system_project_memory
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
 
@@ -293,16 +293,13 @@ def _resolve_api_key(settings: Settings) -> str:
 
 
 def _request_chat_completion(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  return request_json_with_retries(
+  return request_json(
     endpoint,
-    headers={
-      "Content-Type": "application/json",
-      "Authorization": f"Bearer {api_key}",
-    },
-    payload=payload,
-    error_prefix="模型请求失败",
+    api_key,
+    payload,
+    failure_label="模型请求失败",
     invalid_json_message="模型返回的不是合法 JSON",
-    invalid_payload_message="模型返回格式不正确",
+    invalid_format_message="模型返回格式不正确",
   )
 
 

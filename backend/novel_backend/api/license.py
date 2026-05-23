@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 from novel_backend.models import LicenseImportRequest
-from novel_backend.services.license_service import import_license, validate_license
+from novel_backend.services.license_service import collect_device_fingerprints, import_license, validate_license
 
 router = APIRouter(prefix="/api/license", tags=["license"])
 
@@ -13,6 +13,11 @@ def get_license_status(request: Request):
   settings = request.app.state.settings
   payload = validate_license(settings)
   return {"ok": True, "data": payload.model_dump(mode="json")}
+
+
+@router.get("/device-fingerprints")
+def get_license_device_fingerprints():
+  return {"ok": True, "data": {"fingerprints": collect_device_fingerprints()}}
 
 
 @router.post("/import")

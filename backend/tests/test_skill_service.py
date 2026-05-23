@@ -11,7 +11,13 @@ from novel_backend.config import Settings
 from novel_backend.models import BrainstormMessage, CreateProjectRequest, ModelConfig, SkillMaterializeRequest
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.project_service import create_project
-from novel_backend.services.skill_service import list_skill_catalog, materialize_skill, suggest_reusable_skill
+from novel_backend.services.skill_service import (
+  get_custom_skill_prompt,
+  get_skill_curation_report,
+  list_skill_catalog,
+  materialize_skill,
+  suggest_reusable_skill,
+)
 
 
 class SkillServiceTestCase(unittest.TestCase):
@@ -53,6 +59,7 @@ class SkillServiceTestCase(unittest.TestCase):
     self.assertIn("brainstorm", skill_ids)
     self.assertIn("architecture-stepper", skill_ids)
     self.assertIn("character-replica", skill_ids)
+    self.assertIn("self-evolution", skill_ids)
 
     consistency = next(item for section in catalog.sections for item in section.items if item.id == "consistency")
     self.assertTrue(consistency.requires_project)
@@ -248,6 +255,56 @@ class SkillServiceTestCase(unittest.TestCase):
     self.assertIsNotNone(suggestion)
     self.assertEqual(suggestion.action, "iterate")
     self.assertEqual(suggestion.target_skill_id, created.skill.id)
+
+  def test_skill_curation_marks_old_unused_custom_skill_and_records_usage(self) -> None:
+    skill_path = self.settings.data_dir / "skills" / "user-skills" / "user-harbor-rewrite" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text(
+      (
+        "---\n"
+        "name: 港口旧稿整理\n"
+        "description: 处理港口章节旧稿。\n"
+        "version: 0.1.0\n"
+        "skill_id: user-harbor-rewrite\n"
+        "section_id: user-skills\n"
+        "section_title: 用户沉淀\n"
+        "category: 用户技能\n"
+        "badge: 沉\n"
+        "accent: smoke\n"
+        "source: custom\n"
+        "panel: conversation-skill\n"
+        "updated_at: 2000-01-01T00:00:00+00:00\n"
+        "requires_project: true\n"
+        "requires_chapter: true\n"
+        "scenes:\n"
+        "  - 去 AI\n"
+        "usage:\n"
+        "  - 适合旧稿整理。\n"
+        "limitations:\n"
+        "  - 只覆盖港口章节。\n"
+        "---\n"
+        "# 港口旧稿整理\n\n"
+        "## 适用场景\n- 适合旧稿整理。\n\n"
+        "## 输入要求\n- 给出章节。\n\n"
+        "## 执行步骤\n1. 判断旧稿问题。\n2. 整理对白。\n3. 检查事实。\n\n"
+        "## 输出要求\n- 给出改稿建议。\n\n"
+        "## 边界\n- 只覆盖港口章节。\n"
+      ),
+      encoding="utf-8",
+    )
+
+    report = get_skill_curation_report(self.settings)
+    item = next(entry for entry in report.items if entry.skill_id == "user-harbor-rewrite")
+    self.assertEqual(item.status, "archive_candidate")
+    self.assertEqual(item.usage_count, 0)
+
+    prompt = get_custom_skill_prompt(self.settings, "user-harbor-rewrite")
+    self.assertIn("当前启用用户技能", prompt)
+
+    updated_report = get_skill_curation_report(self.settings)
+    updated_item = next(entry for entry in updated_report.items if entry.skill_id == "user-harbor-rewrite")
+    self.assertEqual(updated_item.status, "active")
+    self.assertEqual(updated_item.usage_count, 1)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from novel_backend.models import (
   ProjectMemoryUpdateRequest,
 )
 from novel_backend.services.config_service import initialize_app_storage
-from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support
+from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, explicit_length_target
 from novel_backend.services.project_service import (
   create_project,
   import_project_knowledge,
@@ -80,6 +80,8 @@ class ContextBuilderTestCase(unittest.TestCase):
     )
 
     self.assertIn("核心种子：失踪航线钥匙", bundle.context_text)
+    self.assertIn("章节容量校验：全书目标 50000 字 / 3 章", bundle.context_text)
+    self.assertIn("本章目前明显偏短", bundle.context_text)
     self.assertIn("当前章节：第 1 章《第一章 雨夜靠港》", bundle.context_text)
     self.assertIn("作者明确要求 / 硬规则 / 作者要求", bundle.context_text)
     self.assertIn("系统整理 / 连续性 / 最近推进", bundle.context_text)
@@ -89,6 +91,29 @@ class ContextBuilderTestCase(unittest.TestCase):
     self.assertGreaterEqual(len(bundle.knowledge_hits), 1)
     self.assertIsNotNone(bundle.budget_report)
     self.assertEqual(bundle.budget_report.trimmed_blocks, [])
+
+  def test_explicit_length_target_accepts_common_chinese_word_counts(self) -> None:
+    cases = {
+      "写15000字": 15_000,
+      "写1万字": 10_000,
+      "写1.5万字": 15_000,
+      "写1万5千字": 15_000,
+      "写一万五千字": 15_000,
+      "写一万五字": 15_000,
+      "写三千五百字": 3_500,
+      "写三千五字": 3_500,
+      "写三千零五字": 3_005,
+      "写十万字": 30_000,
+      "当前正文约3870字，远低于15000字目标，需完整重写": 15_000,
+      "将原约2000字短稿扩展为完整章节（约15000字）": 15_000,
+    }
+
+    for instruction, expected in cases.items():
+      with self.subTest(instruction=instruction):
+        self.assertEqual(explicit_length_target(instruction), expected)
+
+    self.assertEqual(explicit_length_target("保存校验：当前正文约 3870 字。"), 0)
+    self.assertEqual(explicit_length_target("当前正文仅约3870字，需完整重写"), 0)
 
   def test_project_context_bundle_trims_oversized_chapter_body(self) -> None:
     long_body = "# 第一章 雨夜靠港\n" + "\n".join(

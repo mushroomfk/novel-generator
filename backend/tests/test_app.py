@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import unittest
 
-from novel_backend.app import LOCAL_ORIGIN_PATTERN
+from fastapi.exceptions import RequestValidationError
+
+from novel_backend.app import LOCAL_ORIGIN_PATTERN, create_app
+from novel_backend.config import reset_settings_cache
 
 
 class AppCorsTestCase(unittest.TestCase):
@@ -20,6 +25,36 @@ class AppCorsTestCase(unittest.TestCase):
 
     self.assertIsNone(pattern.match("https://example.com"))
     self.assertIsNone(pattern.match("http://192.168.1.10:1420"))
+
+
+class AppValidationErrorTestCase(unittest.TestCase):
+  def test_validation_error_uses_error_envelope(self) -> None:
+    try:
+      reset_settings_cache()
+      app = create_app()
+      handler = app.exception_handlers[RequestValidationError]
+      response = asyncio.run(
+        handler(
+          None,
+          RequestValidationError(
+            [
+              {
+                "loc": ("body", "messages", 0, "content"),
+                "msg": "String should have at most 6000 characters",
+                "type": "string_too_long",
+              }
+            ]
+          ),
+        )
+      )
+    finally:
+      reset_settings_cache()
+
+    self.assertEqual(response.status_code, 422)
+    payload = json.loads(response.body)
+    self.assertFalse(payload["ok"])
+    self.assertEqual(payload["error"]["code"], "validation_error")
+    self.assertIn("messages.0.content", payload["error"]["message"])
 
 
 if __name__ == "__main__":

@@ -141,6 +141,91 @@ class AgentEventEmitter:
       },
     )
 
+  def subtask_started(
+    self,
+    *,
+    step: int,
+    total: int,
+    action_kind: str,
+    label: str,
+    subtask_id: str,
+    role: str,
+    capability: str,
+    parallel_group: str = "",
+  ) -> list[str]:
+    return self.emit(
+      "subtask_started",
+      {
+        "step": step,
+        "total": total,
+        "action_kind": action_kind,
+        "label": label,
+        "subtask_id": subtask_id,
+        "role": role,
+        "capability": capability,
+        "parallel_group": parallel_group,
+        "status": "running",
+      },
+    )
+
+  def subtask_result(
+    self,
+    *,
+    step: int,
+    total: int,
+    action_kind: str,
+    label: str,
+    subtask_id: str,
+    role: str,
+    capability: str,
+    parallel_group: str = "",
+    summary: str = "",
+  ) -> list[str]:
+    return self.emit(
+      "subtask_result",
+      {
+        "step": step,
+        "total": total,
+        "action_kind": action_kind,
+        "label": label,
+        "subtask_id": subtask_id,
+        "role": role,
+        "capability": capability,
+        "parallel_group": parallel_group,
+        "summary": summary,
+        "status": "completed",
+      },
+    )
+
+  def subtask_failed(
+    self,
+    *,
+    step: int,
+    total: int,
+    action_kind: str,
+    label: str,
+    subtask_id: str,
+    role: str,
+    capability: str,
+    parallel_group: str = "",
+    message: str = "",
+  ) -> list[str]:
+    return self.emit(
+      "subtask_failed",
+      {
+        "step": step,
+        "total": total,
+        "action_kind": action_kind,
+        "label": label,
+        "subtask_id": subtask_id,
+        "role": role,
+        "capability": capability,
+        "parallel_group": parallel_group,
+        "message": str(message),
+        "status": "failed",
+      },
+    )
+
   def state_updated(self, state: object) -> list[str]:
     return self.emit("state_updated", {"state": state})
 

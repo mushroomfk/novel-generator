@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
 import re
-from urllib import error as urllib_error
 from urllib import parse as urllib_parse
-from urllib import request as urllib_request
 
 from novel_backend.config import Settings
-from novel_backend.models import HistoricalResearchResult, HistoricalResearchSource, KnowledgeSearchResult
+from novel_backend.models import HistoricalResearchResult, HistoricalResearchSource, KnowledgeSearchResult, ModelConfig
+from novel_backend.services.config_service import load_config
 from novel_backend.services.generation_service import _invoke_model
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_service import search_project_knowledge
 
 
@@ -23,6 +22,7 @@ class WebResearchProviderUnavailable(WebResearchProviderError):
 
 
 _BOCHA_SEARCH_ENDPOINT = "https://api.bochaai.com/v1/web-search"
+_ALIYUN_RESPONSES_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
 
 
 def _compact_text(text: str, limit: int = 600) -> str:
@@ -46,28 +46,36 @@ def _request_json(
   payload: dict[str, object],
   timeout: int = 45,
 ) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-  request = urllib_request.Request(endpoint, data=body, method="POST")
-  request.add_header("Content-Type", "application/json")
-  for key, value in headers.items():
-    request.add_header(key, value)
-
   try:
-    with urllib_request.urlopen(request, timeout=timeout) as response:
-      raw_text = response.read().decode("utf-8")
-  except urllib_error.HTTPError as error:
-    error_text = error.read().decode("utf-8", errors="ignore")
-    raise WebResearchProviderError(f"{error.code} {error_text or error.reason}") from error
-  except urllib_error.URLError as error:
-    raise WebResearchProviderError(str(error.reason)) from error
+    return request_json(
+      endpoint,
+      payload=payload,
+      headers=headers,
+      failure_label="搜索服务请求失败",
+      invalid_json_message="搜索服务返回的不是合法 JSON",
+      invalid_format_message="搜索服务返回格式不正确",
+      timeout=timeout,
+    )
+  except RuntimeError as error:
+    raise WebResearchProviderError(str(error)) from error
 
-  try:
-    parsed = json.loads(raw_text)
-  except json.JSONDecodeError as error:
-    raise WebResearchProviderError("搜索服务返回的不是合法 JSON") from error
-  if not isinstance(parsed, dict):
-    raise WebResearchProviderError("搜索服务返回格式不正确")
-  return parsed
+
+def _model_is_aliyun(config: ModelConfig) -> bool:
+  base_url = config.base_url.strip().lower()
+  model_name = config.model_name.strip().lower()
+  return "dashscope.aliyuncs.com" in base_url or model_name.startswith("qwen")
+
+
+def _resolve_aliyun_api_key(config: ModelConfig) -> str:
+  candidates: list[str] = []
+  if _model_is_aliyun(config):
+    candidates.extend([config.api_key, os.getenv("NOVEL_MODEL_API_KEY", "")])
+  candidates.append(os.getenv("DASHSCOPE_API_KEY", ""))
+  for item in candidates:
+    value = item.strip()
+    if value:
+      return value
+  raise WebResearchProviderUnavailable("未配置阿里百炼 API Key")
 
 
 def _resolve_bocha_api_key() -> str:
@@ -77,11 +85,312 @@ def _resolve_bocha_api_key() -> str:
   return value
 
 
+def _chat_completions_endpoint(base_url: str) -> str:
+  normalized = base_url.strip().rstrip("/")
+  if not normalized:
+    return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  if normalized.endswith("/chat/completions"):
+    return normalized
+  if normalized.endswith("/responses"):
+    return f"{normalized.removesuffix('/responses')}/chat/completions"
+  return f"{normalized}/chat/completions"
+
+
+def _responses_endpoint(base_url: str) -> str:
+  normalized = base_url.strip().rstrip("/")
+  if not normalized:
+    return _ALIYUN_RESPONSES_ENDPOINT
+  if normalized.endswith("/responses"):
+    return normalized
+  if normalized.endswith("/chat/completions"):
+    return f"{normalized.removesuffix('/chat/completions')}/responses"
+  return f"{normalized}/responses"
+
+
 def _provider_search_query(query: str) -> str:
   normalized = query.strip()
   if any(keyword in normalized for keyword in ("典故", "出处", "历史", "史实", "年代")):
     return normalized
   return f"{normalized} 历史典故 出处 背景 用法"
+
+
+def _research_prompt(query: str, local_hits: list[KnowledgeSearchResult]) -> str:
+  local_text = "\n".join(f"- {item.section}：{item.preview}" for item in local_hits[:4]) or "无"
+  return f"""
+请联网考据这个小说创作问题：{query}
+
+本项目已有资料命中：
+{local_text}
+
+请只依据联网搜索结果和本地资料输出中文研究简报，必须包含：
+### 可用素材
+### 考据要点
+### 误用风险
+### 写作借鉴
+### 联网来源
+
+要求：
+- 给出典故或史实出处，资料不足就明确写资料不足。
+- 联网来源必须列出资料标题和可打开 URL。
+- 不要编造来源。
+- 重点服务小说创作，不要写成百科词条。
+""".strip()
+
+
+def _extract_chat_answer(payload: dict[str, object]) -> str:
+  output = payload.get("output")
+  if isinstance(output, dict):
+    choices = output.get("choices")
+  else:
+    choices = payload.get("choices")
+  if not isinstance(choices, list) or not choices:
+    return ""
+  first = choices[0]
+  if not isinstance(first, dict):
+    return ""
+  message = first.get("message")
+  if not isinstance(message, dict):
+    return ""
+  content = message.get("content")
+  if isinstance(content, str):
+    return content.strip()
+  if isinstance(content, list):
+    parts = [
+      str(item.get("text") or "").strip()
+      for item in content
+      if isinstance(item, dict) and str(item.get("text") or "").strip()
+    ]
+    return "\n".join(parts).strip()
+  return ""
+
+
+def _extract_chat_search_sources(payload: dict[str, object], provider: str) -> list[HistoricalResearchSource]:
+  output = payload.get("output")
+  search_info = output.get("search_info") if isinstance(output, dict) else payload.get("search_info")
+  if not isinstance(search_info, dict):
+    return []
+  raw_results = search_info.get("search_results")
+  if not isinstance(raw_results, list):
+    return []
+  return _sources_from_search_results(raw_results, provider)
+
+
+def _extract_responses_answer(payload: dict[str, object]) -> str:
+  output_text = payload.get("output_text")
+  if isinstance(output_text, str) and output_text.strip():
+    return output_text.strip()
+
+  parts: list[str] = []
+
+  def visit(value: object) -> None:
+    if isinstance(value, dict):
+      value_type = str(value.get("type") or "")
+      text = value.get("text")
+      if value_type in {"output_text", "text"} and isinstance(text, str) and text.strip():
+        parts.append(text.strip())
+      content = value.get("content")
+      if isinstance(content, str) and value_type == "message" and content.strip():
+        parts.append(content.strip())
+      for child in value.values():
+        visit(child)
+    elif isinstance(value, list):
+      for child in value:
+        visit(child)
+
+  visit(payload.get("output"))
+  return "\n\n".join(parts).strip()
+
+
+def _extract_responses_sources(payload: dict[str, object], provider: str) -> list[HistoricalResearchSource]:
+  sources: list[HistoricalResearchSource] = []
+  seen: set[str] = set()
+
+  def add_source(title: str, url: str, site: str = "") -> None:
+    clean_url = url.strip()
+    if not clean_url or clean_url in seen:
+      return
+    seen.add(clean_url)
+    sources.append(
+      HistoricalResearchSource(
+        title=title.strip() or _site_from_url(clean_url) or "联网来源",
+        url=clean_url,
+        site=site.strip() or _site_from_url(clean_url),
+        provider=provider,
+      )
+    )
+
+  def visit(value: object) -> None:
+    if isinstance(value, dict):
+      url = value.get("url")
+      if isinstance(url, str):
+        add_source(str(value.get("title") or value.get("name") or ""), url, str(value.get("site_name") or ""))
+      urls = value.get("urls")
+      if isinstance(urls, list):
+        for item in urls:
+          if isinstance(item, str):
+            add_source("", item)
+      for child in value.values():
+        visit(child)
+    elif isinstance(value, list):
+      for child in value:
+        visit(child)
+
+  visit(payload.get("output"))
+  return sources
+
+
+def _sources_from_search_results(raw_results: list[object], provider: str) -> list[HistoricalResearchSource]:
+  sources: list[HistoricalResearchSource] = []
+  for item in raw_results:
+    if not isinstance(item, dict):
+      continue
+    url = str(item.get("url") or "").strip()
+    title = str(item.get("title") or item.get("name") or "").strip()
+    site_name = str(item.get("site_name") or item.get("siteName") or "").strip()
+    sources.append(
+      HistoricalResearchSource(
+        title=title or _site_from_url(url) or "搜索结果",
+        url=url,
+        snippet=_compact_text(str(item.get("snippet") or item.get("summary") or ""), 500),
+        summary=_compact_text(str(item.get("summary") or ""), 600),
+        site=site_name or _site_from_url(url),
+        published_at=str(item.get("dateLastCrawled") or item.get("datePublished") or ""),
+        provider=provider,
+      )
+    )
+  return [item for item in sources if item.url or item.title]
+
+
+def _sources_from_answer_links(answer: str, provider: str) -> list[HistoricalResearchSource]:
+  sources: list[HistoricalResearchSource] = []
+  seen: set[str] = set()
+
+  def add(title: str, url: str) -> None:
+    clean_url = url.strip().rstrip("，。；;、)")
+    if not clean_url or clean_url in seen:
+      return
+    seen.add(clean_url)
+    sources.append(
+      HistoricalResearchSource(
+        title=title.strip() or _site_from_url(clean_url) or "联网来源",
+        url=clean_url,
+        site=_site_from_url(clean_url),
+        provider=provider,
+      )
+    )
+
+  for match in re.finditer(r"\[([^\]\n]{1,120})\]\((https?://[^)\s]+)\)", answer):
+    add(match.group(1), match.group(2))
+
+  for match in re.finditer(r"https?://[^\s)）\]，。；;、]+", answer):
+    add("", match.group(0))
+
+  return sources
+
+
+def _merge_sources(
+  primary: list[HistoricalResearchSource],
+  secondary: list[HistoricalResearchSource],
+) -> list[HistoricalResearchSource]:
+  merged: list[HistoricalResearchSource] = []
+  seen: set[str] = set()
+  for item in primary + secondary:
+    key = item.url or f"{item.provider}:{item.title}"
+    if key in seen:
+      continue
+    seen.add(key)
+    merged.append(item)
+  return merged
+
+
+def _model_uses_responses_search(model_name: str) -> bool:
+  normalized = model_name.strip().lower()
+  return normalized.startswith(("qwen3.6-", "qwen3.5-"))
+
+
+def _aliyun_chat_research(
+  settings: Settings,
+  query: str,
+  local_hits: list[KnowledgeSearchResult],
+) -> tuple[str, list[HistoricalResearchSource]]:
+  config = load_config(settings).model
+  if not _model_is_aliyun(config):
+    raise WebResearchProviderUnavailable("当前写作模型不是阿里百炼")
+  api_key = _resolve_aliyun_api_key(config)
+  payload: dict[str, object] = {
+    "model": config.model_name,
+    "messages": [
+      {"role": "system", "content": "你是中文小说考据编辑。"},
+      {"role": "user", "content": _research_prompt(query, local_hits)},
+    ],
+    "temperature": 0.2,
+    "max_tokens": min(config.max_tokens, 1800),
+    "enable_search": True,
+    "search_options": {
+      "search_strategy": "max",
+      "enable_source": True,
+      "enable_citation": True,
+    },
+  }
+  response_payload = _request_json(
+    _chat_completions_endpoint(config.base_url),
+    headers={"Authorization": f"Bearer {api_key}"},
+    payload=payload,
+    timeout=90,
+  )
+  answer = _extract_chat_answer(response_payload)
+  if not answer:
+    raise WebResearchProviderError("阿里百炼联网搜索没有返回可读正文")
+  sources = _merge_sources(
+    _extract_chat_search_sources(response_payload, "aliyun-bailian"),
+    _sources_from_answer_links(answer, "aliyun-bailian"),
+  )
+  return answer, sources
+
+
+def _aliyun_responses_research(
+  settings: Settings,
+  query: str,
+  local_hits: list[KnowledgeSearchResult],
+) -> tuple[str, list[HistoricalResearchSource]]:
+  config = load_config(settings).model
+  if not _model_is_aliyun(config):
+    raise WebResearchProviderUnavailable("当前写作模型不是阿里百炼")
+  api_key = _resolve_aliyun_api_key(config)
+  payload: dict[str, object] = {
+    "model": config.model_name,
+    "input": _research_prompt(query, local_hits),
+    "tools": [
+      {"type": "web_search"},
+      {"type": "web_extractor"},
+    ],
+    "max_output_tokens": min(config.max_tokens, 1800),
+  }
+  response_payload = _request_json(
+    _responses_endpoint(config.base_url),
+    headers={"Authorization": f"Bearer {api_key}"},
+    payload=payload,
+    timeout=120,
+  )
+  answer = _extract_responses_answer(response_payload)
+  if not answer:
+    raise WebResearchProviderError("阿里百炼 Responses 联网搜索没有返回可读正文")
+  sources = _merge_sources(
+    _extract_responses_sources(response_payload, "aliyun-bailian"),
+    _sources_from_answer_links(answer, "aliyun-bailian"),
+  )
+  return answer, sources
+
+
+def _aliyun_research(
+  settings: Settings,
+  query: str,
+  local_hits: list[KnowledgeSearchResult],
+) -> tuple[str, list[HistoricalResearchSource]]:
+  config = load_config(settings).model
+  if _model_uses_responses_search(config.model_name):
+    return _aliyun_responses_research(settings, query, local_hits)
+  return _aliyun_chat_research(settings, query, local_hits)
 
 
 def _bocha_research(query: str, limit: int) -> tuple[str, list[HistoricalResearchSource]]:
@@ -108,25 +417,7 @@ def _bocha_research(query: str, limit: int) -> tuple[str, list[HistoricalResearc
   if not isinstance(web_pages, list) or not web_pages:
     raise WebResearchProviderError("博查没有返回搜索结果")
 
-  sources: list[HistoricalResearchSource] = []
-  for item in web_pages[:limit]:
-    if not isinstance(item, dict):
-      continue
-    url = str(item.get("url") or "").strip()
-    title = str(item.get("name") or item.get("title") or "").strip()
-    snippet = _compact_text(str(item.get("snippet") or item.get("summary") or ""), 500)
-    site_name = str(item.get("siteName") or "").strip()
-    sources.append(
-      HistoricalResearchSource(
-        title=title or _site_from_url(url) or "搜索结果",
-        url=url,
-        snippet=snippet,
-        summary=_compact_text(str(item.get("summary") or ""), 600),
-        site=site_name or _site_from_url(url),
-        published_at=str(item.get("dateLastCrawled") or item.get("datePublished") or ""),
-        provider="bocha",
-      )
-    )
+  sources = _sources_from_search_results(web_pages[:limit], "bocha")
   if not sources:
     raise WebResearchProviderError("博查结果格式不完整")
   return "", sources
@@ -236,25 +527,43 @@ def research_historical_reference(
     local_hits = []
     warnings.append(f"本地资料检索未完成：{error}")
 
+  provider_errors: list[str] = []
+  try:
+    answer, sources = _aliyun_research(settings, normalized, local_hits)
+    return HistoricalResearchResult(
+      query=normalized,
+      provider="aliyun-bailian",
+      answer=answer,
+      sources=sources[:search_limit],
+      local_hits=local_hits,
+      suggestions=_suggestions(normalized),
+      warning="；".join(warnings),
+    )
+  except WebResearchProviderUnavailable as error:
+    provider_errors.append(f"aliyun-bailian: {error}")
+  except WebResearchProviderError as error:
+    append_app_log(settings, f"historical_web_research provider aliyun-bailian failed: {error}", level="WARNING")
+    provider_errors.append(f"aliyun-bailian: {error}")
+
   try:
     provider_answer, sources = _bocha_research(_provider_search_query(normalized), search_limit)
   except WebResearchProviderUnavailable as error:
-    warning = "；".join(warnings + [f"bocha: {error}"])
+    warning = "；".join(warnings + provider_errors + [f"bocha: {error}"])
     return HistoricalResearchResult(
       query=normalized,
       provider="none",
-      answer="没有完成联网搜索。请配置 BOCHA_API_KEY 后再试。",
+      answer="没有完成联网搜索。请先配置阿里百炼 API Key；BOCHA_API_KEY 可作为备用搜索源。",
       local_hits=local_hits,
       suggestions=_suggestions(normalized),
       warning=warning,
     )
   except WebResearchProviderError as error:
     append_app_log(settings, f"historical_web_research provider bocha failed: {error}", level="WARNING")
-    warning = "；".join(warnings + [f"bocha: {error}"])
+    warning = "；".join(warnings + provider_errors + [f"bocha: {error}"])
     return HistoricalResearchResult(
       query=normalized,
       provider="none",
-      answer="国内联网搜索失败。请稍后重试，或检查 BOCHA_API_KEY / BOCHA_SEARCH_ENDPOINT 配置。",
+      answer="国内联网搜索失败。请稍后重试，或检查阿里百炼 API Key / BOCHA_API_KEY / BOCHA_SEARCH_ENDPOINT 配置。",
       local_hits=local_hits,
       suggestions=_suggestions(normalized),
       warning=warning,

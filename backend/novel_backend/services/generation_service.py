@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 from novel_backend.config import Settings
@@ -20,10 +22,23 @@ from novel_backend.models import (
 )
 from novel_backend.services.config_service import load_config
 from novel_backend.services.continuity_guard_service import ContinuityGuardContext, build_continuity_guard_context
-from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, compact_text, project_documents_map
+from novel_backend.services.context_builder import (
+  build_chapter_length_guidance,
+  build_project_context_bundle,
+  build_prompt_support,
+  chapter_average_word_target,
+  chapter_text_length,
+  compact_text,
+  explicit_length_target,
+  full_chapter_generation_target,
+  instruction_requests_explicit_length,
+  instruction_requests_full_chapter,
+  project_documents_map,
+  recommended_chapter_generation_target,
+)
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
-from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.project_service import get_project_detail, search_project_knowledge_evidence
 from novel_backend.utils.sse import encode_sse
@@ -244,6 +259,11 @@ _CONTINUATION_JUDGE_WEIGHTS = {
   "人物口气": 0.30,
   "可读性": 0.25,
 }
+_CONTINUATION_SINGLE_CALL_TARGET = 5_500
+_CONTINUATION_REPAIR_CONTENT_LIMIT = 24_000
+_CONTINUATION_COMPLETION_RATIO = 0.9
+_CONTINUATION_MIN_SECTION_TARGET = 1_200
+_CONTINUATION_MAX_SECTION_COUNT = 24
 
 
 class GenerationConfigError(RuntimeError):
@@ -429,16 +449,13 @@ _compact_text = compact_text
 
 
 def _request_chat_completion(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  return request_json_with_retries(
+  return request_json(
     endpoint,
-    headers={
-      "Content-Type": "application/json",
-      "Authorization": f"Bearer {api_key}",
-    },
-    payload=payload,
-    error_prefix="模型请求失败",
+    api_key,
+    payload,
+    failure_label="模型请求失败",
     invalid_json_message="模型返回的不是合法 JSON",
-    invalid_payload_message="模型返回格式不正确",
+    invalid_format_message="模型返回格式不正确",
   )
 
 
@@ -988,6 +1005,17 @@ def _continuation_prefix(chapter) -> str:
   return f"# {title}\n"
 
 
+def _strip_repeated_partial_prefix(prefix: str, suffix: str) -> str:
+  clean_prefix = str(prefix or "").strip()
+  clean_suffix = str(suffix or "")
+  if not clean_prefix:
+    return clean_suffix
+  suffix_without_left_space = clean_suffix.lstrip()
+  if suffix_without_left_space.startswith(clean_prefix):
+    return suffix_without_left_space[len(clean_prefix) :].lstrip("\n")
+  return clean_suffix
+
+
 def _object_text_list(value: object) -> list[str]:
   if isinstance(value, list):
     return [str(item).strip() for item in value if str(item).strip()]
@@ -1433,41 +1461,32 @@ def _judge_continuation(
   scene_result: ChapterWorkflowResult,
   content: str,
 ) -> dict[str, object]:
-  dimension_results = [
-    _judge_continuation_dimension(
-      settings,
-      system_prompt=_CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT,
-      dimension="承接事实",
-      task_name="continuation_judge:canon",
-      context_text=context_text,
-      evidence_text=evidence_text,
-      canon=canon,
-      scene_result=scene_result,
-      content=content,
-    ),
-    _judge_continuation_dimension(
-      settings,
-      system_prompt=_CONTINUATION_VOICE_JUDGE_SYSTEM_PROMPT,
-      dimension="人物口气",
-      task_name="continuation_judge:voice",
-      context_text=context_text,
-      evidence_text=evidence_text,
-      canon=canon,
-      scene_result=scene_result,
-      content=content,
-    ),
-    _judge_continuation_dimension(
-      settings,
-      system_prompt=_CONTINUATION_READER_JUDGE_SYSTEM_PROMPT,
-      dimension="可读性",
-      task_name="continuation_judge:reader",
-      context_text=context_text,
-      evidence_text=evidence_text,
-      canon=canon,
-      scene_result=scene_result,
-      content=content,
-    ),
+  dimension_specs = [
+    ("承接事实", _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT, "continuation_judge:canon"),
+    ("人物口气", _CONTINUATION_VOICE_JUDGE_SYSTEM_PROMPT, "continuation_judge:voice"),
+    ("可读性", _CONTINUATION_READER_JUDGE_SYSTEM_PROMPT, "continuation_judge:reader"),
   ]
+  dimension_results: list[dict[str, object] | None] = [None] * len(dimension_specs)
+  with ThreadPoolExecutor(max_workers=len(dimension_specs)) as executor:
+    future_map = {
+      executor.submit(
+        _judge_continuation_dimension,
+        settings,
+        system_prompt=system_prompt,
+        dimension=dimension,
+        task_name=task_name,
+        context_text=context_text,
+        evidence_text=evidence_text,
+        canon=canon,
+        scene_result=scene_result,
+        content=content,
+      ): index
+      for index, (dimension, system_prompt, task_name) in enumerate(dimension_specs)
+    }
+    for future in as_completed(future_map):
+      dimension_results[future_map[future]] = future.result()
+
+  ordered_dimension_results = [item for item in dimension_results if item is not None]
 
   summaries: list[str] = []
   issues: list[dict[str, str]] = []
@@ -1476,7 +1495,7 @@ def _judge_continuation(
   next_action = ""
   passed = True
   total_score = 0.0
-  for result in dimension_results:
+  for result in ordered_dimension_results:
     label = str(result.get("dimension") or "").strip() or "审校"
     summary = str(result.get("summary") or "").strip()
     weight = float(_CONTINUATION_JUDGE_WEIGHTS.get(label, 0.0))
@@ -1516,7 +1535,7 @@ def _judge_continuation(
     "issues": issues,
     "rewrite_focus": rewrite_focus[:8],
     "next_action": next_action,
-    "dimensions": dimension_results,
+    "dimensions": ordered_dimension_results,
   }
 
 
@@ -1532,9 +1551,12 @@ def _generate_continuation_candidates(
   target_words: int,
   support_text: str,
   task_name_prefix: str,
+  candidate_count: int | None = None,
 ) -> list[dict[str, object]]:
-  candidates: list[dict[str, object]] = []
-  for index, variant in enumerate(_CONTINUATION_CANDIDATE_VARIANTS, start=1):
+  variants = _CONTINUATION_CANDIDATE_VARIANTS[: max(1, candidate_count or len(_CONTINUATION_CANDIDATE_VARIANTS))]
+  candidates: list[dict[str, object] | None] = [None] * len(variants)
+
+  def build_candidate(index: int, variant: dict[str, object]) -> dict[str, object]:
     write_messages = _continuation_write_messages(
       context_text=context_text,
       evidence_text=evidence_text,
@@ -1555,6 +1577,7 @@ def _generate_continuation_candidates(
       max_tokens=max(1200, target_words * 2),
       enable_thinking=False,
     )
+    suffix = _strip_repeated_partial_prefix(prefix, suffix)
     content = f"{prefix}{suffix}".strip()
     judge = _judge_continuation(
       settings,
@@ -1564,16 +1587,22 @@ def _generate_continuation_candidates(
       scene_result=scene_result,
       content=content,
     )
-    candidates.append(
-      {
-        "index": index,
-        "id": str(variant.get("id") or f"candidate-{index}"),
-        "label": str(variant.get("label") or f"候选 {index}"),
-        "content": content,
-        "judge": judge,
-      }
-    )
-  return candidates
+    return {
+      "index": index,
+      "id": str(variant.get("id") or f"candidate-{index}"),
+      "label": str(variant.get("label") or f"候选 {index}"),
+      "content": content,
+      "judge": judge,
+    }
+
+  with ThreadPoolExecutor(max_workers=len(variants)) as executor:
+    future_map = {
+      executor.submit(build_candidate, index, variant): index - 1
+      for index, variant in enumerate(variants, start=1)
+    }
+    for future in as_completed(future_map):
+      candidates[future_map[future]] = future.result()
+  return [item for item in candidates if item is not None]
 
 
 def _choose_best_continuation_candidate(candidates: list[dict[str, object]]) -> dict[str, object]:
@@ -1650,6 +1679,262 @@ def _repair_continuation(
   return repaired_result["content"]
 
 
+def _continuation_segment_targets(target_words: int) -> list[int]:
+  target = max(0, int(target_words or 0))
+  if target <= _CONTINUATION_SINGLE_CALL_TARGET:
+    return [target or 1_800]
+
+  segment_count = max(2, math.ceil(target / _CONTINUATION_SINGLE_CALL_TARGET))
+  base_target = target // segment_count
+  extra_words = target % segment_count
+  return [
+    base_target + (1 if index < extra_words else 0)
+    for index in range(segment_count)
+  ]
+
+
+def _content_length(text: str) -> int:
+  return len(str(text or "").strip())
+
+
+def _completion_threshold(target_words: int) -> int:
+  target = max(0, int(target_words or 0))
+  if target <= 0:
+    return 0
+  return max(1, int(target * _CONTINUATION_COMPLETION_RATIO))
+
+
+def _next_section_target(current_words: int, completion_target_words: int) -> int:
+  remaining = max(0, int(completion_target_words or 0) - max(0, int(current_words or 0)))
+  if remaining <= 0:
+    return _CONTINUATION_MIN_SECTION_TARGET
+  return min(
+    _CONTINUATION_SINGLE_CALL_TARGET,
+    max(_CONTINUATION_MIN_SECTION_TARGET, remaining),
+  )
+
+
+def _segment_instruction(base_instruction: str, index: int, total: int, target_words: int) -> str:
+  base = str(base_instruction or "").strip() or "请继续写当前章节。"
+  return (
+    f"{base}\n\n"
+    f"分小节生成要求：这是第 {index}/{total} 小节，目标约 {target_words} 字。"
+    "只写当前小节，承接前文继续推进；不要提前结束全章，段尾保留下一小节可继续发展的压力。"
+  )
+
+
+def _merge_segment_content(current_content: str, generated_content: str) -> str:
+  current = str(current_content or "").strip()
+  generated = str(generated_content or "").strip()
+  if not current:
+    return generated
+  if not generated:
+    return current
+  if generated.startswith(current):
+    return generated
+  return f"{current.rstrip()}\n\n{generated.lstrip()}"
+
+
+def _run_segmented_continuation_pipeline(
+  settings: Settings,
+  *,
+  project_id: str,
+  chapter_id: str,
+  instruction: str,
+  target_words: int,
+  segment_targets: list[int],
+  length_guidance: str,
+  completion_target_words: int = 0,
+  support_text: str = "",
+  characters_involved: str = "",
+  key_items: str = "",
+  scene_location: str = "",
+  time_constraint: str = "",
+  task_name_prefix: str = "chapter_generate",
+  candidate_count: int = 1,
+) -> dict[str, object]:
+  plan = _generate_continuation_plan(
+    settings,
+    project_id=project_id,
+    chapter_id=chapter_id,
+    instruction=instruction,
+    target_words=target_words,
+    support_text=support_text,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
+  current_content = _continuation_prefix(plan["chapter"]).strip()
+  canon = dict(plan["canon"])
+  segment_reports: list[str] = []
+  segment_results: list[dict[str, object]] = []
+  total_candidates = 0
+  repair_applied = False
+  last_judge: dict[str, object] = {}
+  last_candidate: dict[str, object] = {}
+  section_targets = [max(1, int(item or 0)) for item in segment_targets if int(item or 0) > 0]
+  if not section_targets:
+    section_targets = [target_words or 1_800]
+  completion_target = max(0, int(completion_target_words or 0))
+  completion_threshold = _completion_threshold(completion_target)
+  planned_section_count = len(section_targets)
+  max_section_count = max(
+    planned_section_count,
+    min(
+      _CONTINUATION_MAX_SECTION_COUNT,
+      max(planned_section_count + 2, math.ceil(max(completion_target, target_words) / _CONTINUATION_MIN_SECTION_TARGET) + 2),
+    ),
+  )
+  append_app_log(
+    settings,
+    "INFO",
+    (
+      f"{task_name_prefix}:segmented planned target={completion_target or target_words} "
+      f"threshold={completion_threshold} segments={section_targets[:planned_section_count]}"
+    ),
+  )
+  index = 0
+
+  while index < len(section_targets) and index < max_section_count:
+    index += 1
+    segment_target = section_targets[index - 1]
+    display_total = max(len(section_targets), index)
+    segment_instruction = _segment_instruction(instruction, index, display_total, segment_target)
+    segment_candidate_count = candidate_count if index == 1 else 1
+    candidates = _generate_continuation_candidates(
+      settings,
+      prefix=current_content if current_content.endswith("\n") else f"{current_content}\n",
+      context_text=plan["bundle"].context_text,
+      evidence_text=str(plan["evidence_text"]),
+      canon=canon,
+      scene_result=plan["scene_result"],
+      instruction=segment_instruction,
+      target_words=segment_target,
+      support_text=support_text,
+      task_name_prefix=f"{task_name_prefix}:segment-{index:02d}",
+      candidate_count=segment_candidate_count,
+    )
+    total_candidates += len(candidates)
+    best_candidate = _choose_best_continuation_candidate(candidates)
+    content = _merge_segment_content(current_content, str(best_candidate.get("content") or ""))
+    judge = dict(best_candidate.get("judge") or {})
+    repair_note = ""
+
+    if not bool(judge.get("passed")) and judge.get("rewrite_focus"):
+      if len(content) <= _CONTINUATION_REPAIR_CONTENT_LIMIT:
+        content = _repair_continuation(
+          settings,
+          context_text=plan["bundle"].context_text,
+          evidence_text=str(plan["evidence_text"]),
+          canon=canon,
+          scene_result=plan["scene_result"],
+          content=content,
+          rewrite_focus=[str(item) for item in judge.get("rewrite_focus") or []],
+          support_text=support_text,
+        )
+        repair_applied = True
+        repair_note = "，审校后已修订"
+        judge = _judge_continuation(
+          settings,
+          context_text=plan["bundle"].context_text,
+          evidence_text=str(plan["evidence_text"]),
+          canon=canon,
+          scene_result=plan["scene_result"],
+          content=content,
+        )
+      else:
+        repair_note = "，正文较长，已保留审校意见"
+
+    current_content = content.strip()
+    last_judge = judge
+    last_candidate = best_candidate
+    segment_summary = str(judge.get("summary") or "").strip()
+    segment_reports.append(
+      f"第 {index}/{display_total} 小节目标约 {segment_target} 字，"
+      f"采用“{best_candidate.get('label') or '候选'}”，审校分 {judge.get('score') or '未知'}{repair_note}。"
+      f"{segment_summary}"
+    )
+    segment_results.append(
+      {
+        "index": index,
+        "target_words": segment_target,
+        "actual_words": _content_length(current_content),
+        "candidate_count": len(candidates),
+        "selected_candidate_id": str(best_candidate.get("id") or ""),
+        "selected_candidate_label": str(best_candidate.get("label") or ""),
+        "judge": judge,
+        "repair_note": repair_note,
+      }
+    )
+    if completion_threshold > 0 and _content_length(current_content) >= completion_threshold:
+      break
+    if index >= len(section_targets) and completion_threshold > 0 and index < max_section_count:
+      section_targets.append(_next_section_target(_content_length(current_content), completion_target))
+
+  actual_words = _content_length(current_content)
+  completion_status = ""
+  if completion_threshold > 0:
+    completion_status = "complete" if actual_words >= completion_threshold else "under_target"
+  append_app_log(
+    settings,
+    "INFO",
+    (
+      f"{task_name_prefix}:segmented completed segments={len(segment_results)} "
+      f"actual={actual_words} status={completion_status or 'checked'}"
+    ),
+  )
+  summary_parts = [
+    str(canon.get("summary") or "").strip(),
+    length_guidance,
+    (
+      f"目标约 {completion_target or target_words} 字，"
+      f"按章节容量先规划 {planned_section_count} 个小节：{', '.join(str(item) for item in segment_targets)} 字。"
+    ),
+    (
+      f"实际生成 {len(segment_results)} 个小节，当前正文约 {actual_words} 字。"
+      if segment_results
+      else ""
+    ),
+    (
+      f"当前仍低于目标容量，建议继续追加小节。"
+      if completion_status == "under_target"
+      else ""
+    ),
+    *segment_reports,
+    "有段落审校后已修订一次。" if repair_applied else "",
+  ]
+  checklist = [
+    *_object_text_list(canon.get("must_keep")),
+    *_object_text_list(canon.get("blocked_changes")),
+  ][:8]
+  return {
+    "content": current_content,
+    "summary": "\n".join(item for item in summary_parts if item),
+    "next_action": str(last_judge.get("next_action") or canon.get("next_action") or "").strip(),
+    "headline": "章节分段初稿已修订" if repair_applied else "章节分段初稿已生成",
+    "scenes": list(getattr(plan["scene_result"], "scenes", []) or []),
+    "checklist": checklist,
+    "brief": canon,
+    "candidate_count": total_candidates,
+    "selected_candidate_id": str(last_candidate.get("id") or ""),
+    "selected_candidate_label": str(last_candidate.get("label") or ""),
+    "candidate_judge": last_judge,
+    "repair_applied": repair_applied,
+    "evidence_hits": plan["evidence_hits"],
+    "segmented": True,
+    "segment_count": len(segment_results),
+    "planned_segment_count": planned_section_count,
+    "segment_targets": section_targets[:len(segment_results)],
+    "planned_segment_targets": segment_targets,
+    "completion_target_words": completion_target,
+    "completion_threshold_words": completion_threshold,
+    "actual_words": actual_words,
+    "completion_status": completion_status,
+    "segments": segment_results,
+  }
+
+
 def _run_continuation_pipeline(
   settings: Settings,
   *,
@@ -1663,7 +1948,145 @@ def _run_continuation_pipeline(
   scene_location: str = "",
   time_constraint: str = "",
   task_name_prefix: str = "chapter_generate",
+  candidate_count: int = 1,
+  prefer_project_budget: bool = False,
+  complete_chapter: bool = False,
 ) -> dict[str, object]:
+  project_detail = get_project_detail(settings, project_id)
+  chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
+  explicit_target = explicit_length_target(instruction)
+  explicit_length_requested = instruction_requests_explicit_length(instruction)
+  full_chapter_requested = instruction_requests_full_chapter(instruction)
+  average_target = chapter_average_word_target(project_detail)
+  current_words = chapter_text_length(chapter_for_length)
+  if explicit_target > 0:
+    target_words = explicit_target
+  elif full_chapter_requested or complete_chapter:
+    full_target = full_chapter_generation_target(project_detail, chapter_for_length)
+    if full_target > 0:
+      target_words = full_target
+  target_words = recommended_chapter_generation_target(
+    project_detail,
+    chapter_for_length,
+    requested_target=target_words,
+    prefer_project_budget=prefer_project_budget and not explicit_length_requested and not complete_chapter,
+  )
+  if complete_chapter and explicit_target <= 0:
+    full_target = full_chapter_generation_target(project_detail, chapter_for_length)
+    if full_target > 0 and target_words < full_target:
+      target_words = full_target
+  length_guidance = build_chapter_length_guidance(project_detail, chapter_for_length, generation_target=target_words)
+  segment_targets = _continuation_segment_targets(target_words)
+  completion_target_words = 0
+  if full_chapter_requested or complete_chapter:
+    if explicit_target > 0 and full_chapter_requested:
+      completion_target_words = explicit_target
+    elif average_target > 0:
+      completion_target_words = average_target
+    else:
+      completion_target_words = current_words + target_words
+  elif len(segment_targets) > 1:
+    completion_target_words = current_words + target_words
+
+  if len(segment_targets) > 1:
+    return _run_segmented_continuation_pipeline(
+      settings,
+      project_id=project_id,
+      chapter_id=chapter_id,
+      instruction=instruction,
+      target_words=target_words,
+      segment_targets=segment_targets,
+      length_guidance=length_guidance,
+      completion_target_words=completion_target_words,
+      support_text=support_text,
+      characters_involved=characters_involved,
+      key_items=key_items,
+      scene_location=scene_location,
+      time_constraint=time_constraint,
+      task_name_prefix=task_name_prefix,
+      candidate_count=candidate_count,
+    )
+
+  if candidate_count > 1:
+    plan = _generate_continuation_plan(
+      settings,
+      project_id=project_id,
+      chapter_id=chapter_id,
+      instruction=instruction,
+      target_words=target_words,
+      support_text=support_text,
+      characters_involved=characters_involved,
+      key_items=key_items,
+      scene_location=scene_location,
+      time_constraint=time_constraint,
+    )
+    prefix = _continuation_prefix(plan["chapter"])
+    candidates = _generate_continuation_candidates(
+      settings,
+      prefix=prefix,
+      context_text=plan["bundle"].context_text,
+      evidence_text=str(plan["evidence_text"]),
+      canon=dict(plan["canon"]),
+      scene_result=plan["scene_result"],
+      instruction=instruction,
+      target_words=target_words,
+      support_text=support_text,
+      task_name_prefix=task_name_prefix,
+      candidate_count=candidate_count,
+    )
+    best_candidate = _choose_best_continuation_candidate(candidates)
+    content = str(best_candidate.get("content") or "").strip()
+    judge = dict(best_candidate.get("judge") or {})
+    repair_applied = False
+    if not bool(judge.get("passed")) and judge.get("rewrite_focus"):
+      content = _repair_continuation(
+        settings,
+        context_text=plan["bundle"].context_text,
+        evidence_text=str(plan["evidence_text"]),
+        canon=dict(plan["canon"]),
+        scene_result=plan["scene_result"],
+        content=content,
+        rewrite_focus=[str(item) for item in judge.get("rewrite_focus") or []],
+        support_text=support_text,
+      )
+      repair_applied = True
+      judge = _judge_continuation(
+        settings,
+        context_text=plan["bundle"].context_text,
+        evidence_text=str(plan["evidence_text"]),
+        canon=dict(plan["canon"]),
+        scene_result=plan["scene_result"],
+        content=content,
+      )
+
+    canon = dict(plan["canon"])
+    summary_parts = [
+      str(canon.get("summary") or "").strip(),
+      length_guidance,
+      f"已并行生成 {len(candidates)} 个候选，并由承接事实、人物口气、可读性三类审校择优。",
+      str(judge.get("summary") or "").strip(),
+      "候选审校后已修订一次。" if repair_applied else "",
+    ]
+    checklist = [
+      *_object_text_list(canon.get("must_keep")),
+      *_object_text_list(canon.get("blocked_changes")),
+    ][:8]
+    return {
+      "content": content,
+      "summary": "\n".join(item for item in summary_parts if item),
+      "next_action": str(judge.get("next_action") or canon.get("next_action") or "").strip(),
+      "headline": "章节初稿已修订" if repair_applied else "章节初稿已生成",
+      "scenes": list(getattr(plan["scene_result"], "scenes", []) or []),
+      "checklist": checklist,
+      "brief": canon,
+      "candidate_count": len(candidates),
+      "selected_candidate_id": str(best_candidate.get("id") or ""),
+      "selected_candidate_label": str(best_candidate.get("label") or ""),
+      "candidate_judge": judge,
+      "repair_applied": repair_applied,
+      "evidence_hits": plan["evidence_hits"],
+    }
+
   plan = _generate_continuation_brief(
     settings,
     project_id=project_id,
@@ -1693,6 +2116,7 @@ def _run_continuation_pipeline(
     max_tokens=max(1200, target_words * 2),
     enable_thinking=False,
   )
+  suffix = _strip_repeated_partial_prefix(prefix, suffix)
   content = f"{prefix}{suffix}".strip()
   conflict_report = _check_continuation_conflicts(
     settings,
@@ -1722,6 +2146,7 @@ def _run_continuation_pipeline(
     )
   summary_parts = [
     str(dict(plan["brief"]).get("summary") or "").strip(),
+    length_guidance,
     str(conflict_report.get("summary") or "").strip(),
     "检测到硬冲突，已修订一次。" if repair_applied else "",
   ]
@@ -1911,6 +2336,7 @@ def _generate_chapter_workflow(
       target_words=normalized_payload.target_words,
       support_text=support,
       task_name_prefix="chapter_workflow:draft",
+      prefer_project_budget=normalized_payload.target_words <= 1_800,
     )
     return ChapterWorkflowResult(
       task_id=task_id,

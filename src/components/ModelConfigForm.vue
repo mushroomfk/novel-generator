@@ -59,6 +59,11 @@ const form = reactive({
     max_tokens: 1800,
     temperature: 0.2,
   },
+  chapter_auto_repair: {
+    enabled: true,
+    score_threshold: 65,
+    max_rounds: 1,
+  },
 });
 
 const isSaving = ref(false);
@@ -189,6 +194,10 @@ watch(
       ...form.review_model,
       ...(nextConfig.review_model ?? {}),
     });
+    Object.assign(form.chapter_auto_repair, {
+      ...form.chapter_auto_repair,
+      ...(nextConfig.chapter_auto_repair ?? {}),
+    });
     customEmbeddingEnabled.value = !sameEmbeddingConfig(
       form.embedding,
       inferEmbeddingConfig(form.model, form.embedding),
@@ -217,6 +226,7 @@ async function save() {
       model: { ...form.model },
       embedding: embeddingPayload,
       review_model: { ...form.review_model },
+      chapter_auto_repair: { ...form.chapter_auto_repair },
     });
     message.value = '写作设置已保存';
     emit('updated');
@@ -472,6 +482,41 @@ async function save() {
           </label>
         </div>
 
+        <div class="section-label">
+          章节核验自动修订
+        </div>
+        <label class="switch-row">
+          <input
+            v-model="form.chapter_auto_repair.enabled"
+            type="checkbox"
+          />
+          <span>核验低分后自动修订</span>
+        </label>
+        <div class="grid two-columns">
+          <label>
+            <span>触发分数</span>
+            <input
+              v-model.number="form.chapter_auto_repair.score_threshold"
+              min="0"
+              max="100"
+              step="1"
+              type="number"
+            />
+          </label>
+
+          <label>
+            <span>最多修订轮数</span>
+            <input
+              v-model.number="form.chapter_auto_repair.max_rounds"
+              min="0"
+              max="3"
+              step="1"
+              type="number"
+            />
+          </label>
+        </div>
+        <small class="field-helper">状态为 risk 会直接触发；其他状态低于触发分数时触发。建议最多 1 到 2 轮，避免正文偏离原章节目标。</small>
+
         <p
           v-if="message"
           class="message"
@@ -562,6 +607,18 @@ async function save() {
 label {
   display: grid;
   gap: 8px;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.switch-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: #2563eb;
 }
 
 label > span {

@@ -25,6 +25,24 @@ Windows Desktop Release
 - `src-tauri/target/release/bundle/nsis/*.exe`
 - `src-tauri/binaries/novel-backend-x86_64-pc-windows-msvc.exe`
 
+## 测试包整理
+
+从 GitHub Actions 下载的 Windows 测试产物整理到：
+
+```text
+release/test-release/windows/稿匣_0.1.1_测试包/
+```
+
+目录包含：
+
+- `稿匣_0.1.1_x64-setup.exe`
+- `novel-backend-x86_64-pc-windows-msvc.exe`
+- `SHA256SUMS.txt`
+- `安装说明-先看这个.md`
+- `测试反馈清单.md`
+
+共享给测试用户时优先提供 `稿匣_0.1.1_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
+
 ## 本地 Windows 打包
 
 环境要求：
@@ -58,7 +76,7 @@ npm run verify:desktop:windows
 - 构建前端
 - 用 PyInstaller 打包 Windows sidecar
 - 拉起 sidecar，检查 `/api/app/health` 和 `/api/app/shutdown`
-- 执行 Tauri release 构建
+- 执行 Tauri NSIS release 构建
 - 检查 NSIS `setup.exe` 是否生成
 
 ## 边界
@@ -69,7 +87,7 @@ npm run verify:desktop:windows
 - 前端生产构建
 - Windows sidecar 打包
 - sidecar 运行级健康检查
-- Tauri Windows NSIS 安装包构建
+- Tauri Windows 安装包构建
 - GitHub Actions 产物上传
 
 还没覆盖：

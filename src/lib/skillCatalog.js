@@ -270,6 +270,15 @@ export const skillSections = [
         scenes: ['历史', 'Prompt', '复盘'],
         accent: 'smoke',
       },
+      {
+        id: 'self-evolution',
+        badge: '进',
+        name: '自我进化',
+        description: '查看经验候选、技能维护和失败样本，决定哪些经验继续沉淀。',
+        category: '工具',
+        scenes: ['经验', '技能', '评测'],
+        accent: 'olive',
+      },
     ].map(withSkillBehavior),
   },
 ];

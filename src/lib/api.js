@@ -144,6 +144,17 @@ export async function materializeConversationSkill(payload) {
   });
 }
 
+export async function getSkillCurationReport() {
+  return request('/api/studio/skills/curation');
+}
+
+export async function getSelfEvolutionReport(projectId) {
+  const params = new URLSearchParams({
+    project_id: projectId,
+  });
+  return request(`/api/studio/self-evolution?${params.toString()}`);
+}
+
 export async function listProjects() {
   return request('/api/projects');
 }
@@ -174,8 +185,13 @@ export async function openProjectDirectory(projectId) {
   });
 }
 
-export async function getProjectDetail(projectId) {
-  return request(`/api/projects/${projectId}`);
+export async function getProjectDetail(projectId, options = {}) {
+  const params = new URLSearchParams();
+  if (options.reviewCharacters) {
+    params.set('review_characters', 'true');
+  }
+  const query = params.toString();
+  return request(`/api/projects/${projectId}${query ? `?${query}` : ''}`);
 }
 
 export async function getProjectAgentThreads(projectId) {
@@ -403,6 +419,10 @@ export async function getLicenseStatus() {
   return request('/api/license/validate');
 }
 
+export async function getLicenseDeviceFingerprints() {
+  return request('/api/license/device-fingerprints');
+}
+
 export async function importLicense(content) {
   return request('/api/license/import', {
     method: 'POST',
@@ -435,7 +455,8 @@ async function streamRequest(path, payload, onEvent, options = {}) {
   }
 
   if (!response.ok || !response.body) {
-    throw new Error(`SSE 建连失败: ${response.status}`);
+    const payload = await readPayload(response);
+    throw new Error(payload.error?.message ?? `SSE 建连失败: ${response.status}`);
   }
 
   const reader = response.body.getReader();

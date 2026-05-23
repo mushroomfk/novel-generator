@@ -99,6 +99,11 @@ _AGENT_THREADS_DIRNAME = "threads"
 _MODEL_STORY_OVERVIEW_FILENAME = "story_overview_model.json"
 _MODEL_STORY_OVERVIEW_SCHEMA_VERSION = "1"
 _MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 22000
+_AGENT_THREAD_CONTEXT_DIRNAME = "thread_context"
+_AGENT_THREAD_CONTEXT_SCHEMA_VERSION = "1"
+_AGENT_THREAD_CHUNK_SIZE = 1200
+_AGENT_THREAD_CHUNK_OVERLAP = 160
+_AGENT_THREAD_CONTEXT_MAX_CHARS = 4800
 _REFERENCE_DIRNAME = "references"
 _SNAPSHOT_FILES_DIRNAME = "files"
 _KNOWLEDGE_SCHEMA_VERSION = "2"
@@ -162,15 +167,35 @@ _CHARACTER_NAME_BLACKLIST = {
   "组织",
   "道具",
   "世界",
+  "世界名",
   "蓝图",
   "骨架",
   "摘要",
   "设定",
   "结构",
   "时间线",
+  "规则",
+  "连续性规则",
+  "初始状态",
+  "感情线",
+  "目标规模",
+  "高潮分布",
+  "神话主线",
+  "全局叙事主线",
+  "感情线节奏",
   "冲突",
   "项目",
   "当前小说",
+  "方式",
+  "封王",
+  "国主",
+  "相连",
+  "金丹",
+  "元婴",
+  "赵王",
+  "经学",
+  "国运",
+  "宗门",
 }
 _JSON_CHARACTER_CONTAINER_KEYS = {
   "content",
@@ -189,6 +214,8 @@ _NON_CHARACTER_NAME_FRAGMENTS = (
   "危机",
   "问题",
   "终章",
+  "章尾",
+  "章展开",
   "章节",
   "时代",
   "动机",
@@ -217,8 +244,73 @@ _NON_CHARACTER_NAME_FRAGMENTS = (
   "呕吐",
   "忠诚",
   "历史",
+  "方式",
+  "每章",
+  "主线",
+  "感情线",
+  "信任线",
+  "目标",
+  "规模",
+  "高潮",
+  "分布",
+  "节奏",
+  "生成",
+  "叙事",
+  "按上",
+  "下三段",
+  "王印",
+  "华林苑",
+  "经义",
+  "胡天",
+  "山海",
+  "意象",
+  "记名",
+  "王朝",
+  "天王",
+  "北方",
+  "东宫",
+  "国主",
+  "后赵",
+  "葛陂",
+  "权力",
+  "封王",
+  "州鼎",
+  "副印",
+  "境成",
+  "失控",
+  "相连",
   "机制",
   "结构",
+  "规则",
+  "国家",
+  "国家修",
+  "修仙",
+  "修真",
+  "东晋",
+  "十六",
+  "龙城",
+  "香火",
+  "金丹",
+  "元婴",
+  "通天",
+  "古神",
+  "怨炁",
+  "国运",
+  "邺城",
+  "经学",
+  "宗门",
+  "天庭",
+  "境界",
+  "阵法",
+  "法术",
+  "文书",
+  "史书",
+  "宫廷",
+  "边界",
+  "材料",
+  "路径",
+  "制度",
+  "主题",
   "课程",
   "教师",
   "高校",
@@ -233,6 +325,37 @@ _NON_CHARACTER_NAME_FRAGMENTS = (
   "设定",
 )
 _NON_CHARACTER_NAME_CHARS = frozenset("的了与及为被将把从因却虽而在是有和或并都就向以到给让使会要能须需应")
+_DISCOVERED_CHARACTER_TRAILING_CONTEXT_CHARS = frozenset("称之任建成改反乱以连为被将把从因却虽而在死废受派写严等幼随第获不说问答喊叫笑看听想拿握见劝盯")
+_DISCOVERED_CHARACTER_CONTEXT_PATTERN = re.compile(
+  r"(?:"
+  r"说|问|答|喊|叫|笑|冷笑|看|听|想|知道|觉得|认为|选择|决定|试图|负责|"
+  r"参加|陷入|怀疑|追查|掌握|拿|握|回到|回来|离开|赶到|走进|进入|"
+  r"来信|写信|见|盯|劝|提到|不答|不该|不会|不能|称帝|称王|称天王|称"
+  r")"
+)
+_DISCOVERED_CHARACTER_LEFT_CONTEXT_PATTERN = re.compile(
+  r"(?:"
+  r"见|问|劝|对|向|替|给|找|逼|"
+  r"主角|人物|角色|妻|父|母|兄|弟|姐|妹"
+  r")$"
+)
+_CHARACTER_REVIEW_CACHE_VERSION = "1"
+_ENTITY_REVIEW_CACHE_VERSION = "1"
+_ENTITY_REVIEW_KINDS = ("events", "locations", "organizations", "props", "skills")
+_ENTITY_REVIEW_LABELS = {
+  "events": "事件",
+  "locations": "地点",
+  "organizations": "组织/势力",
+  "props": "道具",
+  "skills": "技能",
+}
+_CHAPTER_EVENT_ACTION_PATTERN = re.compile(
+  r"(?:"
+  r"进入|走进|回到|回来|离开|赶到|找到|拿到|握住|打开|闯进|避开|发现|听见|"
+  r"问|答|说|冷笑|追查|追近|决定|选择|开始|建立|失踪|暴露|返回|捡到|堵住|"
+  r"封闭|追求|试图|塞进|带着|点亮|横刀|来信|提到|翻出|低声议论"
+  r")"
+)
 _COMMON_SINGLE_CHAR_SURNAMES = (
   "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜"
   "戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳鲍史唐费"
@@ -291,6 +414,29 @@ _DISCOVERED_CHARACTER_BLACKLIST = {
   "图书馆",
   "火车站",
   "研究所",
+  "石头",
+  "王印",
+  "华林苑",
+}
+_DISCOVERED_CHARACTER_EXACT_BLACKLIST = {
+  "季龙",
+  "石头",
+  "刘氏线",
+  "王印",
+  "华林苑",
+  "解石季",
+  "向石季",
+  "相吞噬",
+  "王朝怨",
+  "都不能",
+  "赵王",
+  "天王",
+  "金丹",
+  "元婴",
+  "国运",
+  "宗门",
+  "经学",
+  "灵脉",
 }
 _DISCOVERED_CHARACTER_SUFFIX_BLACKLIST = (
   "先生",
@@ -367,9 +513,45 @@ _DISCOVERED_NAME_LEFT_CONTEXT_TOKENS = (
   "对手",
   "搭档",
 )
+_NON_CHARACTER_ENTITY_SUFFIX_BLACKLIST = (
+  "商会",
+  "警署",
+  "监察局",
+  "巡夜队",
+  "学宫",
+  "教会",
+  "公司",
+  "研究所",
+  "军团",
+  "联盟",
+  "帮会",
+  "门派",
+  "公会",
+  "教团",
+  "议会",
+  "财团",
+  "神殿",
+  "宗门",
+  "骑士团",
+  "帮派",
+  "王朝",
+  "朝廷",
+  "地脉",
+  "州鼎",
+  "副印",
+  "秩序",
+  "制度",
+  "仪式",
+  "方式",
+  "势力",
+  "阵营",
+  "庭",
+  "国",
+  "朝",
+)
 _PROJECT_DIR_PREFIX_PATTERN = re.compile(r"^(\d{8}_\d{6})_(.+)$")
 _LOCATION_PATTERN = re.compile(
-  r"([\u4e00-\u9fff]{1,8}(?:港口|码头|仓库|车站|书房|病房|教室|办公室|走廊|庭院|屋顶|船舱|甲板|酒馆|会馆|广场|巷|街|桥|山谷|河岸|湖畔|小镇|古城|村庄))"
+  r"([\u4e00-\u9fff]{1,8}(?:港口|码头|仓库|车站|书房|病房|教室|办公室|走廊|庭院|屋顶|船舱|甲板|酒馆|会馆|广场|宫门|城门|巷|街|桥|山谷|河岸|湖畔|小镇|古城|村庄|城))"
 )
 _LOCATION_KEYWORDS = (
   "码头",
@@ -388,6 +570,8 @@ _LOCATION_KEYWORDS = (
   "酒馆",
   "会馆",
   "广场",
+  "宫门",
+  "城门",
   "街口",
   "雨巷",
   "河岸",
@@ -395,10 +579,43 @@ _LOCATION_KEYWORDS = (
   "小镇",
   "古城",
   "村庄",
+  "城",
   "船",
 )
+_LOCATION_NAME_BLACKLIST = {
+  "屠城",
+  "攻城",
+  "夺城",
+  "造桥",
+  "仓库",
+  "城",
+  "宫门",
+  "城门",
+  "宫城",
+  "都城",
+}
+_LOCATION_NAME_BLACKLIST_FRAGMENTS = (
+  "章尾",
+  "章展开",
+  "可以",
+  "一城",
+  "或城",
+  "钵中",
+  "钵水",
+  "宴饮",
+  "遮住",
+  "压近",
+  "参与",
+  "怨炁",
+  "籍阵",
+  "最终",
+  "身体",
+  "每座",
+  "同一座",
+  "记载",
+)
 _ORGANIZATION_PATTERN = re.compile(
-  r"([\u4e00-\u9fff]{2,12}(?:商会|警署|监察局|巡夜队|学宫|教会|公司|研究所|军团|联盟|帮会|门派|公会|教团|议会|财团|神殿|宗门|骑士团|帮派))"
+  r"([\u4e00-\u9fff]{2,12}(?:商会|警署|监察局|巡夜队|学宫|教会|公司|研究所|军团|联盟|帮会|门派|公会|教团|议会|财团|神殿|宗门|骑士团|帮派|王朝|朝廷|王庭|燕庭))"
 )
 _ORGANIZATION_KEYWORDS = (
   "商会",
@@ -421,6 +638,38 @@ _ORGANIZATION_KEYWORDS = (
   "宗门",
   "骑士团",
   "帮派",
+  "王朝",
+  "朝廷",
+  "王庭",
+  "燕庭",
+)
+_ORGANIZATION_GENERIC_NAMES = {
+  "宗门",
+  "王朝",
+  "朝廷",
+  "旧王朝",
+  "普通宗门",
+}
+_ORGANIZATION_NAME_BLACKLIST_FRAGMENTS = (
+  "不写成",
+  "避免",
+  "适合",
+  "代表",
+  "第一次",
+  "看见",
+  "国家像",
+  "国家如",
+  "章尾",
+  "而是",
+  "与旧王朝",
+  "每逢",
+  "通过",
+  "史官",
+  "主角",
+  "国家为",
+  "战利品",
+  "隐语",
+  "典籍",
 )
 _PROP_KEYWORDS = (
   "灯",
@@ -444,6 +693,16 @@ _PROP_KEYWORDS = (
   "药剂",
   "手电",
 )
+_SINGLE_CHARACTER_PROP_KEYWORDS = frozenset({"灯", "信", "刀", "剑", "枪", "伞"})
+_PROP_CONTEXT_PATTERNS = {
+  "灯": re.compile(r"(?:一盏|这盏|那盏|油|铜|铁|旧|煤油|马|长明|手提|壁)灯(?!塔|光|火|影|芯|罩)"),
+  "信": re.compile(r"(?:一封|这封|那封|密|旧|书|手写|匿名|遗|家|绝笔|求救|告密)信(?!任|号|息|念|仰|用|件)"),
+  "刀": re.compile(r"(?:一把|这把|那把|短|长|弯|钢|铁|旧|断|佩|战|横|苗)刀(?!法|术|锋|口|柄|光|痕)"),
+  "剑": re.compile(r"(?:一柄|一把|这把|那把|长|短|木|铁|铜|青铜|佩|断|古|宝)剑(?!术|法|气|意|阵|客|士)"),
+  "枪": re.compile(r"(?:一杆|一把|这把|那把|长|短|火|手|步|猎|旧)枪(?!法|术|声|口|弹|械|兵|炮)"),
+  "伞": re.compile(r"(?:一把|这把|那把|油纸|黑|红|旧|纸)伞(?!兵)"),
+}
+_PROP_SIMILE_PATTERN_TEMPLATE = r"(?:像|仿佛|如同|似)[^。！？!?；;\n]{{0,16}}{keyword}"
 _SKILL_HINT_KEYWORDS = (
   "开锁",
   "潜行",
@@ -473,6 +732,22 @@ _SKILL_VERB_PATTERNS = (
   re.compile(r"(?:有|具备)([\u4e00-\u9fffA-Za-z0-9]{2,12}能力)"),
 )
 _SKILL_SPLIT_PATTERN = re.compile(r"[、,，/|｜]+")
+_SKILL_CONTEXT_TOKENS = (
+  "擅长",
+  "善于",
+  "精通",
+  "熟悉",
+  "掌握",
+  "精于",
+  "最会",
+  "很会",
+  "会",
+  "具备",
+  "有",
+  "靠",
+  "用",
+  "以",
+)
 _SKILL_BLACKLIST = {
   "人物设定",
   "人物状态",
@@ -490,7 +765,39 @@ _SKILL_BLACKLIST = {
   "滚动摘要",
   "当前小说",
 }
+_SKILL_BLACKLIST_FRAGMENTS = (
+  "代表",
+  "这些",
+  "此道",
+  "国家",
+  "写成",
+  "适合",
+  "转化",
+  "神通",
+  "三类",
+  "某种",
+  "大型",
+  "北方君主",
+)
 _ENTITY_CONTEXT_TOKENS = (
+  "第一次看见",
+  "详细记载",
+  "最终让",
+  "章展开",
+  "章尾",
+  "写成",
+  "变成",
+  "成为",
+  "迁都",
+  "营建",
+  "镇守",
+  "记载",
+  "展示",
+  "解释成",
+  "章",
+  "参与",
+  "遮住",
+  "压近",
   "回到",
   "来到",
   "前往",
@@ -500,6 +807,8 @@ _ENTITY_CONTEXT_TOKENS = (
   "避开",
   "冲进",
   "走进",
+  "进入",
+  "入",
   "站在",
   "留在",
   "躲进",
@@ -507,6 +816,20 @@ _ENTITY_CONTEXT_TOKENS = (
   "奔向",
   "看向",
   "驶向",
+  "抵抗被",
+  "用",
+  "以",
+  "为",
+  "把",
+  "让",
+  "使",
+  "被",
+  "救",
+  "而是",
+  "像",
+  "如",
+  "与",
+  "和",
   "在",
   "到",
   "进",
@@ -515,6 +838,9 @@ _ENTITY_CONTEXT_TOKENS = (
   "往",
   "从",
   "的",
+)
+_LOCATION_ORGANIZATION_FOLLOWING_SUFFIXES = tuple(
+  sorted(_ORGANIZATION_KEYWORDS, key=len, reverse=True)
 )
 def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
@@ -669,6 +995,10 @@ def _agent_threads_dir(project_dir: Path) -> Path:
   return _app_state_dir(project_dir) / _AGENT_THREADS_DIRNAME
 
 
+def _agent_thread_context_dir(project_dir: Path) -> Path:
+  return _app_state_dir(project_dir) / _AGENT_THREAD_CONTEXT_DIRNAME
+
+
 def _agent_threads_index_path(project_dir: Path) -> Path:
   return _agent_threads_dir(project_dir) / "index.json"
 
@@ -679,6 +1009,10 @@ def _model_story_overview_path(project_dir: Path) -> Path:
 
 def _agent_thread_path(project_dir: Path, thread_id: str) -> Path:
   return _agent_threads_dir(project_dir) / f"{thread_id}.json"
+
+
+def _agent_thread_context_path(project_dir: Path, thread_id: str) -> Path:
+  return _agent_thread_context_dir(project_dir) / f"{thread_id}.json"
 
 
 def _normalize_thread_id_or_400(thread_id: str) -> str:
@@ -694,10 +1028,302 @@ def _normalize_thread_id_or_400(thread_id: str) -> str:
 def _ensure_agent_threads_layout(project_dir: Path) -> None:
   threads_dir = _agent_threads_dir(project_dir)
   threads_dir.mkdir(parents=True, exist_ok=True)
+  _agent_thread_context_dir(project_dir).mkdir(parents=True, exist_ok=True)
 
   index_path = _agent_threads_index_path(project_dir)
   if not index_path.exists():
     atomic_write_json(index_path, {"active_thread_id": "", "threads": []})
+
+
+def _agent_thread_content_hash(content: str) -> str:
+  return hashlib.sha1(str(content or "").encode("utf-8")).hexdigest()
+
+
+def _agent_thread_message_id(message: object, index: int) -> str:
+  explicit_id = str(getattr(message, "id", "") or "").strip()
+  if explicit_id:
+    return explicit_id[:80]
+  content_hash = str(getattr(message, "content_hash", "") or "").strip()
+  if content_hash:
+    return content_hash[:80]
+  content = str(getattr(message, "content", "") or "")
+  return f"message-{index + 1}-{_agent_thread_content_hash(content)[:12]}"
+
+
+def _agent_thread_summary(content: str, limit: int = 420) -> str:
+  normalized = " ".join(str(content or "").split())
+  if len(normalized) <= limit:
+    return normalized
+  head_limit = max(80, limit // 2)
+  tail_limit = max(80, limit - head_limit - 12)
+  return f"{normalized[:head_limit].rstrip()} …… {normalized[-tail_limit:].lstrip()}"
+
+
+def _agent_thread_chunks(content: str) -> list[str]:
+  normalized = str(content or "").strip()
+  if not normalized:
+    return []
+  if len(normalized) <= _AGENT_THREAD_CHUNK_SIZE:
+    return [normalized]
+
+  chunks: list[str] = []
+  start = 0
+  while start < len(normalized):
+    end = min(len(normalized), start + _AGENT_THREAD_CHUNK_SIZE)
+    chunks.append(normalized[start:end].strip())
+    if end >= len(normalized):
+      break
+    start = max(0, end - _AGENT_THREAD_CHUNK_OVERLAP)
+  return [item for item in chunks if item]
+
+
+def _agent_thread_keyword_terms(text: str) -> set[str]:
+  normalized = str(text or "").lower()
+  terms: set[str] = set()
+  for match in re.finditer(r"[a-z0-9_]{2,}", normalized):
+    terms.add(match.group(0))
+
+  for segment in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+    if len(segment) <= 8:
+      terms.add(segment)
+    for size in (2, 3, 4):
+      if len(segment) < size:
+        continue
+      for index in range(0, len(segment) - size + 1):
+        terms.add(segment[index:index + size])
+        if len(terms) >= 260:
+          return terms
+  return terms
+
+
+def _agent_thread_index_signature(record: AgentThreadRecord) -> str:
+  payload = {
+    "version": _AGENT_THREAD_CONTEXT_SCHEMA_VERSION,
+    "messages": [
+      {
+        "id": _agent_thread_message_id(message, index),
+        "role": message.role,
+        "content_hash": message.content_hash or _agent_thread_content_hash(message.content),
+        "length": len(message.content or ""),
+      }
+      for index, message in enumerate(record.messages)
+    ],
+  }
+  return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _agent_thread_context_index(record: AgentThreadRecord) -> dict[str, object]:
+  chunks: list[dict[str, object]] = []
+  messages: list[dict[str, object]] = []
+  for message_index, message in enumerate(record.messages):
+    content = str(message.content or "")
+    content_hash = message.content_hash or _agent_thread_content_hash(content)
+    message_id = _agent_thread_message_id(message, message_index)
+    summary = message.summary.strip() or _agent_thread_summary(content)
+    messages.append(
+      {
+        "id": message_id,
+        "role": message.role,
+        "order": message_index,
+        "content_hash": content_hash,
+        "original_length": len(content),
+        "summary": summary,
+      }
+    )
+    for chunk_index, chunk in enumerate(_agent_thread_chunks(content)):
+      chunks.append(
+        {
+          "message_id": message_id,
+          "role": message.role,
+          "message_order": message_index,
+          "chunk_index": chunk_index,
+          "text": chunk,
+          "summary": _agent_thread_summary(chunk, limit=180),
+          "keywords": sorted(_agent_thread_keyword_terms(chunk))[:260],
+        }
+      )
+
+  return {
+    "schema_version": _AGENT_THREAD_CONTEXT_SCHEMA_VERSION,
+    "thread_id": record.id,
+    "signature": _agent_thread_index_signature(record),
+    "message_count": len(record.messages),
+    "messages": messages,
+    "chunks": chunks,
+  }
+
+
+def _save_agent_thread_context_index(project_dir: Path, record: AgentThreadRecord) -> None:
+  _agent_thread_context_dir(project_dir).mkdir(parents=True, exist_ok=True)
+  atomic_write_json(_agent_thread_context_path(project_dir, record.id), _agent_thread_context_index(record))
+
+
+def _normalized_agent_thread_record(record: AgentThreadRecord, thread_id: str) -> AgentThreadRecord:
+  normalized_messages = []
+  for index, message in enumerate(record.messages):
+    content = str(message.content or "")
+    content_hash = message.content_hash.strip() or _agent_thread_content_hash(content)
+    normalized_messages.append(
+      message.model_copy(
+        update={
+          "id": _agent_thread_message_id(message, index),
+          "content_hash": content_hash,
+          "original_length": len(content),
+          "summary": message.summary.strip() or _agent_thread_summary(content),
+        }
+      )
+    )
+  return record.model_copy(update={"id": thread_id, "messages": normalized_messages})
+
+
+def _load_agent_thread_record(project_dir: Path, thread_id: str) -> AgentThreadRecord | None:
+  normalized_thread_id = _normalize_thread_id_or_400(thread_id)
+  thread_payload = read_json(_agent_thread_path(project_dir, normalized_thread_id), None)
+  if not isinstance(thread_payload, dict):
+    return None
+  thread_payload = {**thread_payload, "id": normalized_thread_id}
+  try:
+    return AgentThreadRecord.model_validate(thread_payload)
+  except Exception:
+    return None
+
+
+def _agent_thread_chunk_score(chunk: dict[str, object], query_terms: set[str], current_message_ids: set[str], message_count: int) -> float:
+  chunk_terms = set(str(item) for item in chunk.get("keywords", []) if str(item))
+  score = 0.0
+  for term in query_terms:
+    if term in chunk_terms:
+      score += max(1.0, min(6.0, len(term) / 2))
+
+  message_id = str(chunk.get("message_id", "") or "")
+  if message_id in current_message_ids:
+    score += 5.0
+
+  message_order = int(chunk.get("message_order") or 0)
+  if message_count > 0:
+    score += min(2.0, max(0.0, message_order / message_count * 2.0))
+  return score
+
+
+def _agent_thread_context_payload(project_dir: Path, record: AgentThreadRecord) -> dict[str, object]:
+  expected_signature = _agent_thread_index_signature(record)
+  index_path = _agent_thread_context_path(project_dir, record.id)
+  payload = read_json(index_path, None)
+  if (
+    not isinstance(payload, dict)
+    or payload.get("schema_version") != _AGENT_THREAD_CONTEXT_SCHEMA_VERSION
+    or payload.get("signature") != expected_signature
+  ):
+    _save_agent_thread_context_index(project_dir, record)
+    payload = read_json(index_path, None)
+  return payload if isinstance(payload, dict) else _agent_thread_context_index(record)
+
+
+def _agent_thread_message_label(role: str) -> str:
+  if role == "user":
+    return "用户"
+  if role == "system":
+    return "系统"
+  return "Agent"
+
+
+def build_project_agent_thread_context(
+  settings: Settings,
+  project_id: str,
+  thread_id: str,
+  *,
+  query: str = "",
+  current_message_ids: list[str] | None = None,
+  max_chars: int = _AGENT_THREAD_CONTEXT_MAX_CHARS,
+) -> str:
+  if not thread_id.strip():
+    return ""
+
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  _ensure_agent_threads_layout(project_dir)
+  record = _load_agent_thread_record(project_dir, thread_id)
+  if record is None or not record.messages:
+    return ""
+
+  payload = _agent_thread_context_payload(project_dir, record)
+  messages = [item for item in payload.get("messages", []) if isinstance(item, dict)]
+  chunks = [item for item in payload.get("chunks", []) if isinstance(item, dict)]
+  if not chunks:
+    return ""
+
+  query_terms = _agent_thread_keyword_terms(query)
+  current_ids = {str(item).strip() for item in (current_message_ids or []) if str(item).strip()}
+  message_count = max(1, int(payload.get("message_count") or len(messages) or 1))
+
+  long_messages = [
+    item
+    for item in messages
+    if int(item.get("original_length") or 0) > 6000
+  ]
+  long_messages = sorted(long_messages, key=lambda item: int(item.get("order") or 0), reverse=True)[:4]
+
+  scored_chunks = []
+  for chunk in chunks:
+    score = _agent_thread_chunk_score(chunk, query_terms, current_ids, message_count)
+    if query_terms and score <= 0:
+      continue
+    scored_chunks.append((score, chunk))
+
+  if query_terms:
+    scored_chunks.sort(key=lambda item: (item[0], int(item[1].get("message_order") or 0)), reverse=True)
+  else:
+    scored_chunks.sort(key=lambda item: int(item[1].get("message_order") or 0), reverse=True)
+
+  selected_chunks: list[dict[str, object]] = []
+  seen_chunk_keys: set[tuple[str, int]] = set()
+
+  def append_chunk(chunk: dict[str, object]) -> None:
+    key = (str(chunk.get("message_id") or ""), int(chunk.get("chunk_index") or 0))
+    if key in seen_chunk_keys:
+      return
+    seen_chunk_keys.add(key)
+    selected_chunks.append(chunk)
+
+  if current_ids:
+    current_chunks = [chunk for chunk in chunks if str(chunk.get("message_id") or "") in current_ids]
+    current_chunks.sort(key=lambda item: int(item.get("chunk_index") or 0))
+    for chunk in current_chunks[:2]:
+      append_chunk(chunk)
+    for chunk in current_chunks[-1:]:
+      append_chunk(chunk)
+
+  for _score, chunk in scored_chunks:
+    append_chunk(chunk)
+    if len(selected_chunks) >= 6:
+      break
+
+  lines = [
+    "本地完整对话历史检索：",
+    "以下内容来自项目线程全文和分块索引，用于补足前端请求里的省略历史。",
+  ]
+  if long_messages:
+    lines.append("长消息摘要：")
+    for item in long_messages:
+      role = _agent_thread_message_label(str(item.get("role", "")))
+      message_id = str(item.get("id", ""))[:18]
+      length = int(item.get("original_length") or 0)
+      summary_text = _compact_text(str(item.get("summary", "") or ""), 360)
+      lines.append(f"- {role}消息 {message_id}（{length} 字）：{summary_text}")
+
+  if selected_chunks:
+    lines.append("相关原文片段：")
+    for chunk in selected_chunks:
+      role = _agent_thread_message_label(str(chunk.get("role", "")))
+      message_id = str(chunk.get("message_id", ""))[:18]
+      chunk_index = int(chunk.get("chunk_index") or 0) + 1
+      text = _compact_text(str(chunk.get("text", "") or ""), 900)
+      lines.append(f"[{role}消息 {message_id} 片段 {chunk_index}]\n{text}")
+
+  context = "\n".join(lines).strip()
+  if len(context) <= max_chars:
+    return context
+  return f"{context[:max_chars].rstrip()}…"
 
 
 def _history_index_path(project_dir: Path) -> Path:
@@ -2646,6 +3272,12 @@ def _is_character_candidate(name: str) -> bool:
     return False
   if cleaned in _CHARACTER_NAME_BLACKLIST:
     return False
+  if any(char in _NON_CHARACTER_NAME_CHARS for char in cleaned):
+    return False
+  if any(fragment in cleaned for fragment in _NON_CHARACTER_NAME_FRAGMENTS):
+    return False
+  if len(cleaned) >= 3 and any(cleaned.endswith(suffix) for suffix in _NON_CHARACTER_ENTITY_SUFFIX_BLACKLIST):
+    return False
   if cleaned.startswith("第") and "章" in cleaned:
     return False
   if any(keyword in cleaned for keyword in ("关系", "状态", "场景", "事件", "地点", "组织", "道具")):
@@ -2747,29 +3379,36 @@ def _extract_json_character_sections(text: str) -> dict[str, list[str]]:
   return {name: lines for name, lines in sections.items() if lines}
 
 
-def _character_heading_candidate(line: str) -> str | None:
+def _character_heading_candidates(line: str) -> list[str]:
   normalized = re.sub(r"^[#*\-\d\.\s、）\)]+", "", line).strip()
   if not normalized:
-    return None
+    return []
 
   if ":" in normalized or "：" in normalized:
     left, right = re.split(r"[:：]", normalized, maxsplit=1)
     candidate = left.strip()
     if _is_character_candidate(candidate) and right.strip():
-      return candidate
+      return [candidate]
+    split_candidates = [
+      item.strip()
+      for item in re.split(r"[、/／与及和]+", candidate)
+      if _is_character_candidate(item.strip())
+    ]
+    if split_candidates and right.strip():
+      return _ordered_unique(split_candidates)
 
   if line.lstrip().startswith("#") and _is_character_candidate(normalized):
-    return normalized
+    return [normalized]
 
   if normalized in _ROLE_CHARACTER_TOKENS:
-    return normalized
+    return [normalized]
 
-  return None
+  return []
 
 
 def _extract_character_sections(text: str) -> dict[str, list[str]]:
   sections: dict[str, list[str]] = defaultdict(list)
-  current_character = ""
+  current_characters: list[str] = []
 
   for name, lines in _extract_json_character_sections(text).items():
     sections[name].extend(lines)
@@ -2779,11 +3418,11 @@ def _extract_character_sections(text: str) -> dict[str, list[str]]:
     if not line:
       continue
 
-    candidate = _character_heading_candidate(line)
-    if candidate is not None:
-      current_character = candidate
+    candidates = _character_heading_candidates(line)
+    if candidates:
+      current_characters = candidates
 
-    if current_character:
+    for current_character in current_characters:
       sections[current_character].append(line)
 
   return {name: lines for name, lines in sections.items() if len(lines) > 0}
@@ -2820,11 +3459,23 @@ def _extract_character_mentions(
 
 def _normalize_discovered_character_name(name: str) -> str:
   cleaned = name.strip().strip("，,。！？!?；;：:、·“”‘’\"'（）()[]【】《》")
+  if (
+    len(cleaned) == 3
+    and cleaned[-1] in _DISCOVERED_CHARACTER_TRAILING_CONTEXT_CHARS
+    and cleaned[:2] not in _CHARACTER_NAME_BLACKLIST
+    and not any(fragment in cleaned for fragment in _NON_CHARACTER_NAME_FRAGMENTS)
+    and not any(fragment in cleaned[:2] for fragment in _NON_CHARACTER_NAME_FRAGMENTS)
+  ):
+    cleaned = cleaned[:2]
   if len(cleaned) < 2 or len(cleaned) > 4:
     return ""
   if not re.fullmatch(r"[\u4e00-\u9fff]+", cleaned):
     return ""
-  if cleaned in _CHARACTER_NAME_BLACKLIST or cleaned in _DISCOVERED_CHARACTER_BLACKLIST:
+  if (
+    cleaned in _CHARACTER_NAME_BLACKLIST
+    or cleaned in _DISCOVERED_CHARACTER_BLACKLIST
+    or cleaned in _DISCOVERED_CHARACTER_EXACT_BLACKLIST
+  ):
     return ""
   if any(char in _NON_CHARACTER_NAME_CHARS for char in cleaned):
     return ""
@@ -2944,6 +3595,473 @@ def _candidate_character_evidence(text: str) -> list[tuple[str, int]]:
   return evidence
 
 
+def _candidate_character_context_has_person_evidence(source: str, start: int, candidate: str) -> bool:
+  end = start + len(candidate)
+  left_context = source[max(0, start - 8):start]
+  right_context = source[end:end + 12]
+  return bool(
+    _DISCOVERED_CHARACTER_CONTEXT_PATTERN.search(right_context)
+    or _DISCOVERED_CHARACTER_LEFT_CONTEXT_PATTERN.search(left_context)
+  )
+
+
+def _character_review_cache_path(project_dir: Path) -> Path:
+  return project_dir / _APP_STATE_DIRNAME / "story_overview_character_review.json"
+
+
+def _story_entity_review_cache_path(project_dir: Path) -> Path:
+  return project_dir / _APP_STATE_DIRNAME / "story_overview_entity_review.json"
+
+
+def _character_review_model_signature(settings: Settings) -> str:
+  config = load_config(settings).model
+  return hashlib.sha1(
+    json.dumps(
+      {
+        "base_url": config.base_url.strip(),
+        "model_name": config.model_name.strip(),
+        "temperature": 0,
+      },
+      ensure_ascii=False,
+      sort_keys=True,
+    ).encode("utf-8")
+  ).hexdigest()
+
+
+def _character_review_source_signature(
+  texts: list[str],
+  candidates: list[str],
+  model_signature: str,
+) -> str:
+  payload = {
+    "version": _CHARACTER_REVIEW_CACHE_VERSION,
+    "model_signature": model_signature,
+    "candidates": candidates,
+    "texts": [hashlib.sha1((text or "").encode("utf-8")).hexdigest() for text in texts],
+  }
+  return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _story_entity_review_source_signature(
+  texts: list[str],
+  candidates_by_kind: dict[str, list[str]],
+  model_signature: str,
+) -> str:
+  payload = {
+    "version": _ENTITY_REVIEW_CACHE_VERSION,
+    "model_signature": model_signature,
+    "candidates_by_kind": candidates_by_kind,
+    "texts": [hashlib.sha1((text or "").encode("utf-8")).hexdigest() for text in texts],
+  }
+  return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _has_character_review_model_config(settings: Settings) -> bool:
+  config = load_config(settings).model
+  return any(
+    item.strip()
+    for item in (
+      config.api_key,
+      os.getenv("NOVEL_MODEL_API_KEY", ""),
+      os.getenv("DASHSCOPE_API_KEY", ""),
+      os.getenv("ARK_API_KEY", ""),
+      os.getenv("NOVEL_API_KEY", ""),
+      os.getenv("OPENAI_API_KEY", ""),
+    )
+  )
+
+
+def _character_candidate_evidence_items(
+  texts: list[str],
+  candidates: list[str],
+  *,
+  limit_per_candidate: int = 3,
+) -> list[dict[str, object]]:
+  items: list[dict[str, object]] = []
+  for candidate in candidates:
+    snippets: list[str] = []
+    for text in texts:
+      source = text or ""
+      if candidate not in source:
+        continue
+      for sentence in _split_sentences(source):
+        if candidate not in sentence:
+          continue
+        snippets.append(_compact_text(sentence, limit=140))
+        if len(snippets) >= limit_per_candidate:
+          break
+      if len(snippets) >= limit_per_candidate:
+        break
+    items.append(
+      {
+        "name": candidate,
+        "evidence": _ordered_unique(snippets)[:limit_per_candidate],
+      }
+    )
+  return items
+
+
+def _story_entity_candidate_evidence_items(
+  texts: list[str],
+  entity_store: dict[str, dict[str, dict]],
+  *,
+  limit_per_candidate: int = 3,
+) -> list[dict[str, object]]:
+  items: list[dict[str, object]] = []
+  for kind in _ENTITY_REVIEW_KINDS:
+    for name, payload in entity_store.get(kind, {}).items():
+      snippets: list[str] = []
+      for text in texts:
+        source = text or ""
+        if name not in source:
+          continue
+        for sentence in _split_sentences(source):
+          if name not in sentence:
+            continue
+          snippets.append(_compact_text(sentence, limit=160))
+          if len(snippets) >= limit_per_candidate:
+            break
+        if len(snippets) >= limit_per_candidate:
+          break
+
+      items.append(
+        {
+          "kind": kind,
+          "label": _ENTITY_REVIEW_LABELS[kind],
+          "name": name,
+          "summary": str(payload.get("summary", "")),
+          "related_characters": sorted(str(item) for item in payload.get("related_characters", set())),
+          "chapter_indexes": sorted(int(item) for item in payload.get("chapter_indexes", set())),
+          "evidence": _ordered_unique(snippets)[:limit_per_candidate],
+        }
+      )
+  return items
+
+
+def _json_object_from_model_text(text: str) -> dict[str, object] | None:
+  stripped = (text or "").strip()
+  if stripped.startswith("```"):
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+      stripped = "\n".join(lines[1:-1]).strip()
+
+  try:
+    payload = json.loads(stripped)
+  except json.JSONDecodeError:
+    payload = None
+  if isinstance(payload, dict):
+    return payload
+
+  start = stripped.find("{")
+  end = stripped.rfind("}")
+  if start == -1 or end == -1 or end <= start:
+    return None
+
+  try:
+    payload = json.loads(stripped[start : end + 1])
+  except json.JSONDecodeError:
+    return None
+  return payload if isinstance(payload, dict) else None
+
+
+def _string_list_from_model_payload(value: object, allowed: set[str]) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  return _ordered_unique([str(item).strip() for item in value if str(item).strip() in allowed])
+
+
+def _rejected_entities_from_model_payload(
+  value: object,
+  candidates_by_kind: dict[str, list[str]],
+) -> dict[str, set[str]]:
+  rejected: dict[str, set[str]] = {kind: set() for kind in _ENTITY_REVIEW_KINDS}
+  if not isinstance(value, list):
+    return rejected
+
+  for item in value:
+    if not isinstance(item, dict):
+      continue
+    kind = str(item.get("kind", "")).strip()
+    name = str(item.get("name", "")).strip()
+    if kind in rejected and name in set(candidates_by_kind.get(kind, [])):
+      rejected[kind].add(name)
+  return rejected
+
+
+def _valid_story_entities_from_model_payload(
+  payload: dict[str, object],
+  candidates_by_kind: dict[str, list[str]],
+) -> dict[str, set[str]]:
+  valid_payload = payload.get("valid_entities")
+  rejected_by_kind = _rejected_entities_from_model_payload(payload.get("rejected"), candidates_by_kind)
+  if not isinstance(valid_payload, dict) and not any(rejected_by_kind.values()):
+    raise RuntimeError("模型世界要素复核没有返回可用候选")
+
+  valid_entities: dict[str, set[str]] = {}
+  has_reviewed_item = False
+  for kind in _ENTITY_REVIEW_KINDS:
+    candidates = candidates_by_kind.get(kind, [])
+    allowed = set(candidates)
+    if isinstance(valid_payload, dict) and kind in valid_payload:
+      names = _string_list_from_model_payload(valid_payload.get(kind), allowed)
+      valid_entities[kind] = set(names)
+      has_reviewed_item = True
+      continue
+
+    rejected = rejected_by_kind.get(kind, set())
+    if rejected:
+      valid_entities[kind] = allowed - rejected
+      has_reviewed_item = True
+    else:
+      valid_entities[kind] = allowed
+
+  if not has_reviewed_item:
+    raise RuntimeError("模型世界要素复核没有返回可用候选")
+  return valid_entities
+
+
+def _model_review_character_candidates(
+  settings: Settings,
+  project_dir: Path,
+  texts: list[str],
+  candidates: list[str],
+  *,
+  allow_model_call: bool = False,
+) -> list[str]:
+  ordered_candidates = _ordered_unique(candidates)
+  if not ordered_candidates:
+    return ordered_candidates
+
+  model_signature = _character_review_model_signature(settings)
+  source_signature = _character_review_source_signature(texts, ordered_candidates, model_signature)
+  cache_path = _character_review_cache_path(project_dir)
+  cached = read_json(cache_path, None)
+  if (
+    isinstance(cached, dict)
+    and cached.get("version") == _CHARACTER_REVIEW_CACHE_VERSION
+    and cached.get("source_signature") == source_signature
+    and isinstance(cached.get("characters"), list)
+  ):
+    return _string_list_from_model_payload(cached.get("characters"), set(ordered_candidates))
+
+  if not allow_model_call or not _has_character_review_model_config(settings):
+    return ordered_candidates
+
+  evidence_items = _character_candidate_evidence_items(texts, ordered_candidates)
+  messages = [
+    {
+      "role": "system",
+      "content": (
+        "你是中文小说资料整理助手，只判断候选词是不是人物。"
+        "必须只输出 JSON，不要解释。"
+        "JSON 字段固定为 characters、non_characters、aliases。"
+        "只能从候选词里选择，不要新增候选外的人名。"
+        "人物包括真实历史人物、小说角色和明确人物化的化名；"
+        "制度、地点、组织、技能、称号、事件、抽象概念和普通短语都归入 non_characters。"
+      ),
+    },
+    {
+      "role": "user",
+      "content": json.dumps(
+        {
+          "candidates": ordered_candidates,
+          "evidence": evidence_items,
+          "output_example": {
+            "characters": ["石虎"],
+            "non_characters": ["方式", "封王"],
+            "aliases": {"石虎": ["石季龙"]},
+          },
+        },
+        ensure_ascii=False,
+      ),
+    },
+  ]
+
+  try:
+    from novel_backend.services.generation_service import _invoke_model
+
+    content = _invoke_model(
+      settings,
+      messages,
+      task_name="story_overview_character_review",
+      temperature=0,
+      max_tokens=1200,
+      enable_thinking=False,
+    )
+    payload = _json_object_from_model_text(content)
+    if payload is None:
+      raise RuntimeError("模型人物复核返回的不是合法 JSON")
+
+    allowed = set(ordered_candidates)
+    reviewed_characters = _string_list_from_model_payload(payload.get("characters"), allowed)
+    reviewed_non_characters = _string_list_from_model_payload(payload.get("non_characters"), allowed)
+    if not reviewed_characters and not reviewed_non_characters:
+      raise RuntimeError("模型人物复核没有返回可用候选")
+
+    atomic_write_json(
+      cache_path,
+      {
+        "version": _CHARACTER_REVIEW_CACHE_VERSION,
+        "source_signature": source_signature,
+        "model_signature": model_signature,
+        "characters": reviewed_characters,
+        "non_characters": reviewed_non_characters,
+        "aliases": payload.get("aliases") if isinstance(payload.get("aliases"), dict) else {},
+      },
+    )
+    return reviewed_characters
+  except Exception as error:
+    append_app_log(settings, f"story_overview_character_review failed: {error}")
+    return ordered_candidates
+
+
+def _model_review_story_entities(
+  settings: Settings,
+  project_dir: Path,
+  texts: list[str],
+  entity_store: dict[str, dict[str, dict]],
+  *,
+  allow_model_call: bool = False,
+) -> dict[str, set[str]]:
+  candidates_by_kind = {
+    kind: _ordered_unique(list(entity_store.get(kind, {}).keys()))
+    for kind in _ENTITY_REVIEW_KINDS
+  }
+  default_entities = {kind: set(candidates) for kind, candidates in candidates_by_kind.items()}
+  if not any(candidates_by_kind.values()):
+    return default_entities
+
+  model_signature = _character_review_model_signature(settings)
+  source_signature = _story_entity_review_source_signature(texts, candidates_by_kind, model_signature)
+  cache_path = _story_entity_review_cache_path(project_dir)
+  cached = read_json(cache_path, None)
+  if (
+    isinstance(cached, dict)
+    and cached.get("version") == _ENTITY_REVIEW_CACHE_VERSION
+    and cached.get("source_signature") == source_signature
+    and isinstance(cached.get("valid_entities"), dict)
+  ):
+    try:
+      return _valid_story_entities_from_model_payload(cached, candidates_by_kind)
+    except RuntimeError:
+      pass
+
+  if not allow_model_call or not _has_character_review_model_config(settings):
+    return default_entities
+
+  evidence_items = _story_entity_candidate_evidence_items(texts, entity_store)
+  messages = [
+    {
+      "role": "system",
+      "content": (
+        "你是中文小说架构总览审核助手，只判断候选词是不是对应类别的世界要素。"
+        "必须只输出 JSON，不要解释。"
+        "JSON 字段固定为 valid_entities、rejected。"
+        "只能从候选词里选择，不要新增候选外的词。"
+        "事件是已经发生或即将推动情节的动作、决定、冲突、发现或关系变化；章节标题、场景名、纯环境描写和资料格式噪声不是事件。"
+        "地点是可发生剧情的具体空间、建筑、城市、区域；章节提示、句子片段、比喻和泛称不是地点。"
+        "组织/势力是有名字的机构、派系、政权、家族、公司、门派；泛称、比较句和句子片段不是组织。"
+        "道具是剧情中可被持有、寻找、使用或争夺的具体物件；抽象概念和比喻不是道具。"
+        "技能是人物明确具备或使用的能力；世界规则、法术体系名、抽象设定和泛称不是技能。"
+      ),
+    },
+    {
+      "role": "user",
+      "content": json.dumps(
+        {
+          "candidates_by_kind": candidates_by_kind,
+          "evidence": evidence_items,
+          "output_example": {
+            "valid_entities": {
+              "events": ["石季龙回到邺城"],
+              "locations": ["邺城"],
+              "organizations": ["龙城燕庭"],
+              "props": ["海内图"],
+              "skills": ["钵中见城"],
+            },
+            "rejected": [
+              {"kind": "organizations", "name": "国家像宗门", "reason": "比较句"},
+              {"kind": "locations", "name": "章尾邺城", "reason": "章节提示"},
+              {"kind": "events", "name": "冻土如铁", "reason": "环境描写"},
+            ],
+          },
+        },
+        ensure_ascii=False,
+      ),
+    },
+  ]
+
+  try:
+    from novel_backend.services.generation_service import _invoke_model
+
+    content = _invoke_model(
+      settings,
+      messages,
+      task_name="story_overview_entity_review",
+      temperature=0,
+      max_tokens=1800,
+      enable_thinking=False,
+    )
+    payload = _json_object_from_model_text(content)
+    if payload is None:
+      raise RuntimeError("模型世界要素复核返回的不是合法 JSON")
+
+    valid_entities = _valid_story_entities_from_model_payload(payload, candidates_by_kind)
+    rejected = payload.get("rejected") if isinstance(payload.get("rejected"), list) else []
+    atomic_write_json(
+      cache_path,
+      {
+        "version": _ENTITY_REVIEW_CACHE_VERSION,
+        "source_signature": source_signature,
+        "model_signature": model_signature,
+        "valid_entities": {
+          kind: [name for name in candidates_by_kind[kind] if name in valid_entities[kind]]
+          for kind in _ENTITY_REVIEW_KINDS
+        },
+        "rejected": rejected,
+      },
+    )
+    return valid_entities
+  except Exception as error:
+    append_app_log(settings, f"story_overview_entity_review failed: {error}")
+    return default_entities
+
+
+def _filter_story_entity_values(items: list[str], allowed: set[str]) -> list[str]:
+  return _ordered_unique([item for item in items if item in allowed])
+
+
+def _apply_story_entity_review(
+  entity_store: dict[str, dict[str, dict]],
+  character_store: dict[str, dict],
+  valid_entities: dict[str, set[str]],
+) -> None:
+  for kind in _ENTITY_REVIEW_KINDS:
+    allowed = valid_entities.get(kind, set(entity_store.get(kind, {}).keys()))
+    entity_store[kind] = {
+      name: payload
+      for name, payload in entity_store.get(kind, {}).items()
+      if name in allowed
+    }
+
+  for store in character_store.values():
+    for kind in _ENTITY_REVIEW_KINDS:
+      allowed = valid_entities.get(kind, set())
+      store[kind] = _filter_story_entity_values(store.get(kind, []), allowed)
+
+    reviewed_timeline: list[CharacterTimelineEntry] = []
+    for entry in store.get("timeline", []):
+      reviewed_timeline.append(
+        entry.model_copy(
+          update={
+            kind: _filter_story_entity_values(getattr(entry, kind), valid_entities.get(kind, set()))
+            for kind in _ENTITY_REVIEW_KINDS
+          }
+        )
+      )
+    store["timeline"] = reviewed_timeline
+
+
 def _discover_character_names(texts: list[str], limit: int = 24) -> list[str]:
   counts: dict[str, int] = {}
   evidence_scores: dict[str, int] = {}
@@ -3021,6 +4139,29 @@ def _is_meta_sentence(sentence: str) -> bool:
   return any(keyword in compact for keyword in ("初稿", "正文", "版本", "草稿"))
 
 
+def _is_descriptive_chapter_sentence(sentence: str) -> bool:
+  compact = sentence.strip()
+  if not compact:
+    return True
+  if "像" in compact and not re.search(r"(?:说|问|答|听见|看见|发现|进入|回到|找到|拿到|握住|打开|闯进)", compact):
+    return True
+  return False
+
+
+def _chapter_event_summary(sentences: list[str], character_names: list[str]) -> str:
+  for sentence in sentences:
+    if any(name and name in sentence for name in character_names):
+      return _compact_text(sentence, limit=90)
+
+  for sentence in sentences:
+    if _is_descriptive_chapter_sentence(sentence):
+      continue
+    if _CHAPTER_EVENT_ACTION_PATTERN.search(sentence):
+      return _compact_text(sentence, limit=90)
+
+  return ""
+
+
 def _normalize_entity_name(name: str, keywords: tuple[str, ...]) -> str:
   current = name.strip().strip("，,。！？!?；;：:、·“”‘’\"'（）()[]【】《》")
   if not current:
@@ -3049,6 +4190,8 @@ def _expand_entity_keywords(
 ) -> list[str]:
   expanded_matches = list(matches)
   for keyword in keywords:
+    if len(keyword) == 1:
+      continue
     if keyword not in source_text:
       continue
     if any(item.endswith(keyword) and len(item) > len(keyword) for item in expanded_matches):
@@ -3058,13 +4201,29 @@ def _expand_entity_keywords(
   return expanded_matches
 
 
+def _location_match_is_inside_organization(source_text: str, match: re.Match[str]) -> bool:
+  following_text = source_text[match.end(1):]
+  return any(following_text.startswith(suffix) for suffix in _LOCATION_ORGANIZATION_FOLLOWING_SUFFIXES)
+
+
+def _is_location_candidate(name: str) -> bool:
+  if not name or name in _LOCATION_NAME_BLACKLIST:
+    return False
+  if name.startswith(("一", "某", "这", "那", "每")):
+    return False
+  return not any(fragment in name for fragment in _LOCATION_NAME_BLACKLIST_FRAGMENTS)
+
+
 def _extract_locations(text: str) -> list[str]:
-  matches = [
-    _normalize_entity_name(item, _LOCATION_KEYWORDS)
-    for item in _LOCATION_PATTERN.findall(text)
-  ]
+  matches = []
+  for item in _LOCATION_PATTERN.finditer(text):
+    if _location_match_is_inside_organization(text, item):
+      continue
+    normalized = _normalize_entity_name(item.group(1), _LOCATION_KEYWORDS)
+    if _is_location_candidate(normalized):
+      matches.append(normalized)
   matches = _expand_entity_keywords(text, matches, _LOCATION_KEYWORDS)
-  return _ordered_unique(matches)
+  return _ordered_unique([item for item in matches if _is_location_candidate(item)])
 
 
 def _extract_organizations(text: str) -> list[str]:
@@ -3073,19 +4232,50 @@ def _extract_organizations(text: str) -> list[str]:
     for item in _ORGANIZATION_PATTERN.findall(text)
   ]
   matches = _expand_entity_keywords(text, matches, _ORGANIZATION_KEYWORDS)
-  return _ordered_unique(matches)
+  return _ordered_unique([item for item in matches if _is_organization_candidate(item)])
+
+
+def _is_organization_candidate(name: str) -> bool:
+  if not name or name in _ORGANIZATION_GENERIC_NAMES:
+    return False
+  return not any(fragment in name for fragment in _ORGANIZATION_NAME_BLACKLIST_FRAGMENTS)
+
+
+def _prop_appears_as_simile(source: str, keyword: str) -> bool:
+  pattern = re.compile(_PROP_SIMILE_PATTERN_TEMPLATE.format(keyword=re.escape(keyword)))
+  return bool(pattern.search(source))
 
 
 def _extract_props(text: str) -> list[str]:
-  return _ordered_unique([keyword for keyword in _PROP_KEYWORDS if keyword in text])
+  source = text or ""
+  matches = []
+  for keyword in _PROP_KEYWORDS:
+    if keyword in _SINGLE_CHARACTER_PROP_KEYWORDS:
+      pattern = _PROP_CONTEXT_PATTERNS.get(keyword)
+      if pattern is not None and pattern.search(source):
+        matches.append(keyword)
+      continue
+    if keyword in source:
+      if _prop_appears_as_simile(source, keyword):
+        continue
+      matches.append(keyword)
+  return _ordered_unique(matches)
 
 
 def _normalize_skill_name(name: str) -> str:
   current = name.strip().strip("，,。！？!?；;：:、·“”‘’\"'（）()[]【】《》")
+  for token in _SKILL_CONTEXT_TOKENS:
+    if token in current:
+      candidate = current.rsplit(token, maxsplit=1)[-1].strip()
+      if candidate:
+        current = candidate
+        break
   current = re.sub(r"^(?:技能|能力|特长|绝活|本领|擅长|善于|精通|熟悉|掌握|精于|最会|很会)", "", current)
   current = re.sub(r"(?:能力|本事|技巧|的人|方面)$", "", current)
   current = current.strip("，,。！？!?；;：:、·“”‘’\"'（）()[]【】《》")
   if not current or current in _SKILL_BLACKLIST:
+    return ""
+  if any(fragment in current for fragment in _SKILL_BLACKLIST_FRAGMENTS):
     return ""
   if len(current) < 2 or len(current) > 12:
     return ""
@@ -4132,7 +5322,13 @@ def _apply_structured_character_fields(
   return structured_entities
 
 
-def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[ChapterSummary]) -> StoryOverview:
+def _build_story_overview(
+  settings: Settings,
+  project_dir: Path,
+  chapters: list[ChapterSummary],
+  *,
+  review_character_candidates: bool = False,
+) -> StoryOverview:
   documents = _build_story_documents(project_dir)
   material_payloads = _load_knowledge_material_payloads(project_dir)
   model_overview = _model_story_overview_or_none(settings, project_dir, documents, material_payloads, chapters)
@@ -4142,16 +5338,31 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
   document_map = {item.key: item for item in documents}
   character_design_sections = _extract_character_sections(document_map["character_design"].content)
   character_state_sections = _extract_character_sections(document_map["character_state"].content)
-  discovered_characters = _discover_character_names(
-    [
-      *(item.content for item in documents if item.content.strip()),
-      *(item["content"] for item in material_payloads if item.get("content")),
-      *(item.content for item in chapters if item.exists and item.content.strip()),
-    ]
+  seed_character_names = _ordered_unique(
+    list(character_design_sections.keys()) + list(character_state_sections.keys())
+  )
+  has_seed_characters = _has_named_character(seed_character_names)
+  project_source_texts = [
+    *(item.content for item in documents if item.content.strip()),
+    *(item.content for item in chapters if item.exists and item.content.strip()),
+  ]
+  overview_source_texts = [
+    *(item.content for item in documents if item.content.strip()),
+    *(item["content"] for item in material_payloads if item.get("content")),
+    *(item.content for item in chapters if item.exists and item.content.strip()),
+  ]
+  character_discovery_texts = project_source_texts if has_seed_characters else overview_source_texts
+  graph_material_payloads = [] if has_seed_characters else material_payloads
+  discovered_characters = _model_review_character_candidates(
+    settings,
+    project_dir,
+    character_discovery_texts,
+    _discover_character_names(character_discovery_texts),
+    allow_model_call=review_character_candidates,
   )
 
   known_characters = _ordered_unique(
-    list(character_design_sections.keys()) + list(character_state_sections.keys()) + discovered_characters
+    seed_character_names + discovered_characters
   )
 
   for document in documents:
@@ -4159,7 +5370,7 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
       known_characters + _extract_character_mentions(document.content, known_characters)
     )
 
-  for material in material_payloads:
+  for material in graph_material_payloads:
     known_characters = _ordered_unique(
       known_characters + _extract_character_mentions(material.get("content", ""), known_characters)
     )
@@ -4289,7 +5500,7 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
     for item in skills:
       _register_entity(entity_store["skills"], item, summary=summary, related_characters=mentioned_characters)
 
-  for material in material_payloads:
+  for material in graph_material_payloads:
     title = material.get("title", "").strip()
     raw_content = material.get("content", "").strip()
     if not title or not raw_content:
@@ -4304,12 +5515,7 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
     material_summary = _material_tail_anchor(raw_content)
     if not material_summary:
       material_summary = _compact_text(analysis_text, limit=120)
-    material_events = _ordered_unique(
-      [
-        title,
-        material_summary if material_summary != title else "",
-      ]
-    )
+    material_events = _ordered_unique([title])
     material_relations = _extract_relationship_summaries(analysis_text, mentioned_characters)
 
     _register_entity(
@@ -4407,7 +5613,8 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
       for sentence in _split_sentences(chapter_text)
       if not _is_meta_sentence(sentence)
     ]
-    chapter_summary = _compact_text(
+    chapter_event_summary = _chapter_event_summary(chapter_sentences, chapter_characters)
+    chapter_summary = chapter_event_summary or _compact_text(
       chapter_sentences[0] if chapter_sentences else chapter.title,
       limit=90,
     )
@@ -4415,12 +5622,7 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
     chapter_organizations = _extract_organizations(f"{chapter.title}\n{chapter_text}")
     chapter_props = _extract_props(f"{chapter.title}\n{chapter_text}")
     chapter_skills = _extract_skills(f"{chapter.title}\n{chapter_text}")
-    chapter_events = _ordered_unique(
-      [
-        chapter.title,
-        chapter_summary if chapter_summary != chapter.title else "",
-      ]
-    )
+    chapter_events = _ordered_unique([chapter_event_summary])
     chapter_relations = _extract_relationship_summaries(chapter_text, chapter_characters)
 
     _register_entity(
@@ -4510,6 +5712,16 @@ def _build_story_overview(settings: Settings, project_dir: Path, chapters: list[
         )
       )
 
+  entity_review_texts = project_source_texts if has_seed_characters else overview_source_texts
+  valid_entities = _model_review_story_entities(
+    settings,
+    project_dir,
+    entity_review_texts,
+    entity_store,
+    allow_model_call=review_character_candidates,
+  )
+  _apply_story_entity_review(entity_store, character_store, valid_entities)
+
   ordered_characters = _ordered_unique(list(character_store.keys()))
   character_items = [
     StoryCharacter(
@@ -4569,7 +5781,12 @@ def list_projects(settings: Settings) -> list[ProjectSummary]:
   return sorted(projects, key=lambda item: item.updated_at, reverse=True)
 
 
-def get_project_detail(settings: Settings, project_id: str) -> ProjectDetail:
+def get_project_detail(
+  settings: Settings,
+  project_id: str,
+  *,
+  review_characters: bool = False,
+) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
   chapters = [
@@ -4577,7 +5794,12 @@ def get_project_detail(settings: Settings, project_id: str) -> ProjectDetail:
     for index in range(1, summary.target_chapters + 1)
   ]
   local_history = _local_history_state(project_dir)
-  overview = _build_story_overview(settings, project_dir, chapters)
+  overview = _build_story_overview(
+    settings,
+    project_dir,
+    chapters,
+    review_character_candidates=review_characters,
+  )
   auto_entries, memory_signature = build_auto_project_memory(
     documents=overview.documents,
     characters=overview.characters,
@@ -5210,17 +6432,22 @@ def save_project_agent_threads(
   kept_ids: set[str] = set()
   for item in request.threads:
     normalized_thread_id = _normalize_thread_id_or_400(item.id)
-    normalized_record = item.model_copy(update={"id": normalized_thread_id})
+    normalized_record = _normalized_agent_thread_record(item, normalized_thread_id)
     normalized_records.append(normalized_record)
     kept_ids.add(normalized_thread_id)
     atomic_write_json(
       _agent_thread_path(project_dir, normalized_thread_id),
       normalized_record.model_dump(mode="json"),
     )
+    _save_agent_thread_context_index(project_dir, normalized_record)
 
   for path in _agent_threads_dir(project_dir).glob("*.json"):
     if path.name == "index.json":
       continue
+    if path.stem not in kept_ids:
+      path.unlink(missing_ok=True)
+
+  for path in _agent_thread_context_dir(project_dir).glob("*.json"):
     if path.stem not in kept_ids:
       path.unlink(missing_ok=True)
 
@@ -5306,6 +6533,48 @@ def update_chapter_content(
 ) -> ProjectDetail:
   detail, _review_error = update_chapter_content_with_review_status(settings, project_id, chapter_id, request)
   return detail
+
+
+def summarize_chapter_review_status(detail: ProjectDetail, chapter_id: str, review_error: str = "") -> dict[str, object]:
+  if review_error.strip():
+    return {
+      "ok": False,
+      "message": review_error.strip(),
+      "error": review_error.strip(),
+    }
+
+  review = next(
+    (item for item in detail.story_overview.chapter_reviews if item.chapter_id == chapter_id),
+    None,
+  )
+  if review is None:
+    return {
+      "ok": False,
+      "message": "章节核验未生成报告。",
+      "error": "章节核验未生成报告。",
+    }
+
+  label = {
+    "good": "良好",
+    "watch": "需关注",
+    "risk": "有风险",
+    "na": "未评估",
+  }.get(review.status, review.status or "未评估")
+  stale_note = "，报告已过期" if review.is_stale else ""
+  summary = review.summary.strip()
+  message = f"章节核验：{review.overall_score}/100（{label}{stale_note}）。"
+  if summary:
+    message = f"{message}{summary}"
+  return {
+    "ok": True,
+    "message": message,
+    "score": review.overall_score,
+    "status": review.status,
+    "status_label": label,
+    "summary": summary,
+    "is_stale": review.is_stale,
+    "updated_at": review.updated_at or "",
+  }
 
 
 def _persist_chapter_review(

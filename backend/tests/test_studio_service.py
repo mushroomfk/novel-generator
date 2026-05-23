@@ -17,6 +17,8 @@ from novel_backend.models import (
   CharacterReplicaRequest,
   ChapterGenerateRequest,
   ChapterGenerateResult,
+  ChapterReviewDimension,
+  ChapterReviewIssue,
   ChapterReviewReport,
   ChapterRewriteRequest,
   ChapterUpdateRequest,
@@ -564,21 +566,24 @@ class StudioServiceTestCase(unittest.TestCase):
     ):
       events = asyncio.run(
         collect_stream(
-              batch_generate_stream(
-                self.settings,
-                BatchGenerateRequest(
-                  project_id=self.project.id,
-                  start_chapter=1,
-                  end_chapter=2,
-                  instruction="连着生成前两章。",
-                  style_name="冷雾叙事",
-                ),
-              )
-            )
+          batch_generate_stream(
+            self.settings,
+            BatchGenerateRequest(
+              project_id=self.project.id,
+              start_chapter=1,
+              end_chapter=2,
+              instruction="连着生成前两章。",
+              style_name="冷雾叙事",
+            ),
+          )
+        )
       )
 
     result_event = next(item for item in events if item[0] == "result")
     self.assertEqual(len(result_event[1]["generated"]), 2)
+    self.assertIn("核验", result_event[1]["generated"][0]["status"])
+    self.assertGreater(result_event[1]["generated"][0]["review_score"], 0)
+    self.assertEqual(result_event[1]["generated"][1]["review_status"], "good")
 
     detail = get_project_detail(self.settings, self.project.id)
     chapter_2 = next(item for item in detail.chapters if item.id == "chapter-002")
@@ -586,6 +591,178 @@ class StudioServiceTestCase(unittest.TestCase):
     self.assertTrue(chapter_2.exists)
     self.assertIn("白石会馆", chapter_2.content)
     self.assertEqual(review_2.style_name, "冷雾叙事")
+
+  def test_batch_generate_stream_resumes_completed_task_without_regenerating(self) -> None:
+    generated_results = [
+      ChapterGenerateResult(
+        task_id="batch-1",
+        headline="第 1 章初稿",
+        summary="写出钥匙出场。",
+        content="# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n",
+        next_action="下一章让追兵靠近。",
+      ),
+      ChapterGenerateResult(
+        task_id="batch-2",
+        headline="第 2 章初稿",
+        summary="写出会馆试探。",
+        content="# 第二章 白石会馆\n林追带着钥匙去白石会馆试探旧船队联系人。\n",
+        next_action="下一章让对立方出手。",
+      ),
+    ]
+
+    def fake_review(_settings, _detail, chapter_id, **_kwargs):
+      chapter_index = 1 if chapter_id == "chapter-001" else 2
+      return ChapterReviewReport(
+        chapter_id=chapter_id,
+        chapter_index=chapter_index,
+        chapter_title=f"第 {chapter_index} 章",
+        engine="test",
+        status="good",
+        overall_score=91,
+        summary="章节核验通过。",
+        dimensions=[
+          ChapterReviewDimension(
+            id="consistency",
+            label="一致性",
+            score=91,
+            status="good",
+            summary="人物、事件和道具状态一致。",
+          )
+        ],
+      )
+
+    first_request = BatchGenerateRequest(
+      project_id=self.project.id,
+      start_chapter=1,
+      end_chapter=2,
+      instruction="连着生成前两章。",
+    )
+    with patch("novel_backend.services.studio_service._generate_chapter", side_effect=generated_results), patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=fake_review,
+    ):
+      first_events = asyncio.run(collect_stream(batch_generate_stream(self.settings, first_request)))
+
+    task_id = str(first_events[0][1]["task_id"])
+    self.assertTrue(first_events[0][1]["resumable"])
+    self.assertEqual(first_events[-1], ("done", {"task_id": task_id, "status": "completed"}))
+    state_path = self.settings.data_dir / "batch_tasks" / f"{task_id}.json"
+    self.assertTrue(state_path.exists())
+
+    with patch("novel_backend.services.studio_service._generate_chapter") as mocked_generate:
+      resumed_events = asyncio.run(
+        collect_stream(
+          batch_generate_stream(
+            self.settings,
+            BatchGenerateRequest(
+              project_id=self.project.id,
+              start_chapter=1,
+              end_chapter=2,
+              instruction="连着生成前两章。",
+              task_id=task_id,
+              comment="人工确认前两章可用，继续查看状态。",
+            ),
+          )
+        )
+      )
+
+    mocked_generate.assert_not_called()
+    progress_messages = [str(item[1].get("message") or "") for item in resumed_events if item[0] == "progress"]
+    self.assertTrue(any("第 1 章已完成，跳过" in item for item in progress_messages))
+    self.assertTrue(any("第 2 章已完成，跳过" in item for item in progress_messages))
+    resumed_result = next(item for item in resumed_events if item[0] == "result")
+    self.assertEqual(len(resumed_result[1]["generated"]), 2)
+    self.assertEqual(resumed_events[-1], ("done", {"task_id": task_id, "status": "completed"}))
+
+  def test_batch_generate_stream_auto_repairs_low_review_score(self) -> None:
+    risk_review = ChapterReviewReport(
+      chapter_id="chapter-001",
+      chapter_index=1,
+      chapter_title="第一章 雨夜靠港",
+      engine="test",
+      status="risk",
+      overall_score=54,
+      summary="章末悬念偏弱。",
+      dimensions=[
+        ChapterReviewDimension(
+          id="suspense",
+          label="悬念与钩子",
+          score=48,
+          status="risk",
+          summary="结尾没有留下新的不安。",
+          issues=[
+            ChapterReviewIssue(level="warning", title="章末悬念偏弱", detail="最后一句没有形成新问题。"),
+          ],
+        )
+      ],
+    )
+    good_review = ChapterReviewReport(
+      chapter_id="chapter-001",
+      chapter_index=1,
+      chapter_title="第一章 雨夜靠港",
+      engine="test",
+      status="good",
+      overall_score=90,
+      summary="章末悬念已经成立。",
+      dimensions=[
+        ChapterReviewDimension(
+          id="suspense",
+          label="悬念与钩子",
+          score=90,
+          status="good",
+          summary="结尾留下新问题。",
+        )
+      ],
+    )
+
+    with patch(
+      "novel_backend.services.studio_service._generate_chapter",
+      return_value=ChapterGenerateResult(
+        task_id="batch-1",
+        headline="第 1 章初稿",
+        summary="写出钥匙出场。",
+        content="# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n",
+        next_action="下一章让追兵靠近。",
+      ),
+    ), patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=[risk_review, good_review],
+    ), patch(
+      "novel_backend.services.chapter_auto_repair_service._invoke_model",
+      return_value=json.dumps(
+        {
+          "summary": "补上章末异动。",
+          "changes": ["让铜钥匙在结尾出现反常"],
+          "revised_content": "# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。门外脚步声停住时，钥匙自己转了半圈。\n",
+        },
+        ensure_ascii=False,
+      ),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          batch_generate_stream(
+            self.settings,
+            BatchGenerateRequest(
+              project_id=self.project.id,
+              start_chapter=1,
+              end_chapter=1,
+              instruction="写第一章。",
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    generated = result_event[1]["generated"][0]
+    self.assertTrue(generated["review_auto_repair_attempted"])
+    self.assertTrue(generated["review_auto_repair_applied"])
+    self.assertEqual(generated["review_score"], 90)
+    self.assertIn("已自动修订", generated["status"])
+    self.assertIn("钥匙自己转了半圈", generated["preview"])
+
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    self.assertIn("钥匙自己转了半圈", chapter.content)
 
   def test_continue_project_stream_updates_targets_and_documents(self) -> None:
     with patch(
@@ -628,7 +805,7 @@ class StudioServiceTestCase(unittest.TestCase):
     blueprint = next(item for item in detail.story_overview.documents if item.key == "blueprint")
     self.assertIn("潮位窗口", blueprint.content)
 
-  def test_chapter_generate_stream_runs_partial_pipeline_and_repair(self) -> None:
+  def test_chapter_generate_stream_uses_parallel_candidate_pipeline(self) -> None:
     save_config(
       self.settings,
       ModelConfig(
@@ -637,350 +814,30 @@ class StudioServiceTestCase(unittest.TestCase):
         model_name="qwen3.6-plus",
       ),
     )
-    responses = [
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "这一章先守住钥匙和追兵两条线。",
-                  "must_keep": ["林追刚拿到铜钥匙", "旧码头仓库仍然危险"],
-                  "current_state": ["追兵还没真正现身，只是逼近"],
-                  "voice_rules": ["句子偏短，动作先行"],
-                  "blocked_changes": ["不要提前揭开钥匙用途"],
-                  "next_action": "先让仓库外的动静逼近。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": "门外先亮了一道白光，林追却把铜钥匙放回桌上，没有立刻动。\n"
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "正文把铜钥匙从林追手里拿开，和项目记忆冲突。",
-                  "passed": False,
-                  "conflicts": [
-                    {
-                      "title": "道具状态冲突",
-                      "detail": "项目记忆要求林追刚拿到铜钥匙，正文却写成把钥匙放回桌上。",
-                      "severity": "critical",
-                      "evidence": "林追刚拿到铜钥匙",
-                    }
-                  ],
-                  "rewrite_focus": ["保留林追握住铜钥匙的状态，不要写成放回桌上。"],
-                  "next_action": "只修道具状态。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "headline": "修订完成。",
-                  "summary": "已恢复铜钥匙状态。",
-                  "content": "# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n仓库门缝里又刮进一线白光，林追拇指按在铜钥匙的齿上，像是先拿住了自己。外面没有脚步声，可那静劲比脚步更近。下一瞬，墙外像有人极轻地换了一口气，那股看不见的人气已经贴到了门边。\n",
-                  "next_action": "下一段让林追做选择。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "修订后没有硬冲突。",
-                  "passed": True,
-                  "conflicts": [],
-                  "rewrite_focus": [],
-                  "next_action": "下一段让林追做选择。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "结尾压力还不够。",
-                  "score": 70,
-                  "passed": False,
-                  "issues": [
-                    {
-                      "title": "结尾压力偏弱",
-                      "detail": "最后一句停得太平，追兵的逼近感还不够。",
-                      "severity": "critical",
-                    }
-                  ],
-                  "rewrite_focus": ["把结尾改得更紧，让外面的逼近感再压近半步。"],
-                  "next_action": "只修结尾。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": "仓库门缝里又刮进一线白光，林追拇指按在铜钥匙的齿上，像是先拿住了自己。外面没有脚步声，可那静劲比脚步更近，逼得他连呼吸都不敢放长。\n"
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "承接仍然成立。",
-                  "score": 91,
-                  "passed": False,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "事实层面不用返工。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "人物口气还在。",
-                  "score": 88,
-                  "passed": True,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "口气层面可以保留。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "压迫感最接近可用稿，但结尾还差半步。",
-                  "score": 79,
-                  "passed": False,
-                  "issues": [
-                    {
-                      "title": "尾压不够",
-                      "detail": "危险已经贴近，但段尾还没把下一步逼出来。",
-                      "severity": "critical",
-                    }
-                  ],
-                  "rewrite_focus": ["把段尾再压近一点，让外面的人像已经摸到门边。"],
-                  "next_action": "只修结尾半步。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": "探照灯第二次掠过门缝时，林追没再抬头，只把铜钥匙更深地扣进掌心。仓库外静得像有人正贴着墙根换气，那一点看不见的人气，比脚步更先摸到了门边。\n"
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "承接没偏。",
-                  "score": 83,
-                  "passed": False,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "事实层面不用返工。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "人物口气基本稳住了。",
-                  "score": 82,
-                  "passed": True,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "口气层面先不动。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "这一版也需要修结尾。",
-                  "score": 68,
-                  "passed": False,
-                  "issues": [
-                    {
-                      "title": "段尾偏平",
-                      "detail": "末句停得太早，门外的人还没真正贴到门边。",
-                      "severity": "critical",
-                    }
-                  ],
-                  "rewrite_focus": ["把门外那个人再压近半步。"],
-                  "next_action": "只修结尾。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "headline": "修订完成。",
-                  "summary": "把结尾再压紧了一步。",
-                  "content": "# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n仓库门缝里又刮进一线白光，林追拇指按在铜钥匙的齿上，像是先拿住了自己。外面没有脚步声，可那静劲比脚步更近。下一瞬，墙外像有人极轻地换了一口气，那股看不见的人气已经贴到了门边。\n",
-                  "next_action": "下一段让林追做选择。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "返工后承接仍然成立。",
-                  "score": 93,
-                  "passed": True,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "继续往下写即可。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "返工后人物口气没有散。",
-                  "score": 90,
-                  "passed": True,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "对白可以继续保持现在的力度。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "返工后压迫感已经够了，这版可以继续往下写。",
-                  "score": 94,
-                  "passed": True,
-                  "issues": [],
-                  "rewrite_focus": [],
-                  "next_action": "下一段让林追决定是躲还是冲。",
-                },
-                ensure_ascii=False,
-              )
-            }
-          }
-        ]
-      },
-    ]
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n"),
+    )
 
-    captured_payloads: list[dict[str, object]] = []
+    def fake_pipeline(_settings, **kwargs):
+      self.assertEqual(kwargs["candidate_count"], 3)
+      self.assertEqual(kwargs["task_name_prefix"], "chapter_generate")
+      self.assertTrue(kwargs["complete_chapter"])
+      return {
+        "headline": "章节初稿已修订",
+        "summary": "已并行生成 3 个候选，并由三类审校择优。",
+        "content": (
+          "# 第一章 雨夜靠港\n"
+          "林追在旧码头仓库找到一把铜钥匙。\n"
+          "仓库门缝里又刮进一线白光，林追拇指按在铜钥匙的齿上，像是先拿住了自己。"
+          "那股看不见的人气已经贴到了门边。\n"
+        ),
+        "next_action": "下一段让林追做选择。",
+      }
 
-    def fake_request(_endpoint, _api_key, payload):
-      captured_payloads.append(payload)
-      return responses[len(captured_payloads) - 1]
-
-    with patch(
-      "novel_backend.services.generation_service._request_chat_completion",
-      side_effect=fake_request,
-    ):
+    with patch("novel_backend.services.studio_service._run_continuation_pipeline", side_effect=fake_pipeline):
       events = asyncio.run(
         collect_stream(
           chapter_generate_stream(
@@ -996,15 +853,7 @@ class StudioServiceTestCase(unittest.TestCase):
 
     result_event = next(item for item in events if item[0] == "result")
     self.assertIn("那股看不见的人气已经贴到了门边", result_event[1]["content"])
-    self.assertEqual(len(captured_payloads), 5)
-    partial_messages = captured_payloads[1]["messages"]
-    self.assertTrue(partial_messages[-1]["partial"])
-    self.assertIn("# 第一章 雨夜靠港", partial_messages[-1]["content"])
-    self.assertTrue(captured_payloads[0]["enable_thinking"])
-    self.assertFalse(captured_payloads[1]["enable_thinking"])
-    self.assertTrue(captured_payloads[2]["enable_thinking"])
-    self.assertTrue(captured_payloads[3]["enable_thinking"])
-    self.assertTrue(captured_payloads[4]["enable_thinking"])
+    self.assertIn("并行生成 3 个候选", result_event[1]["summary"])
 
   def test_style_analyze_stream_and_related_storage(self) -> None:
     with patch(

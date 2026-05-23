@@ -294,10 +294,17 @@ export interface ReviewModelConfig {
   temperature: number;
 }
 
+export interface ChapterAutoRepairConfig {
+  enabled: boolean;
+  score_threshold: number;
+  max_rounds: number;
+}
+
 export interface AppConfig {
   model: ModelConfig;
   embedding: EmbeddingConfig;
   review_model: ReviewModelConfig;
+  chapter_auto_repair: ChapterAutoRepairConfig;
   updated_at: string;
 }
 

@@ -100,8 +100,12 @@ function hiddenChangeCount(item) {
   return total > 3 ? total - 3 : 0;
 }
 
+function subtasks(item) {
+  return Array.isArray(item?.subTasks) ? item.subTasks : [];
+}
+
 function hasDetails(item) {
-  return Boolean(detailSummary(item) || hiddenChangeCount(item) > 0);
+  return Boolean(detailSummary(item) || hiddenChangeCount(item) > 0 || subtasks(item).some((subtask) => subtask.summary));
 }
 </script>
 
@@ -180,6 +184,26 @@ function hasDetails(item) {
           </span>
         </div>
 
+        <div
+          v-if="subtasks(item).length"
+          class="timeline-subtask-list"
+        >
+          <div
+            v-for="subtask in subtasks(item)"
+            :key="subtask.id"
+            class="timeline-subtask"
+          >
+            <span :class="['timeline-subtask-dot', statusClass(subtask.status)]"></span>
+            <div class="timeline-subtask-copy">
+              <strong>{{ subtask.role }}</strong>
+              <span v-if="subtask.capability">{{ subtask.capability }}</span>
+            </div>
+            <span :class="['timeline-subtask-status', statusClass(subtask.status)]">
+              {{ statusLabel(subtask.status) }}
+            </span>
+          </div>
+        </div>
+
         <details
           v-if="hasDetails(item)"
           :open="item.status === 'running'"
@@ -203,6 +227,18 @@ function hasDetails(item) {
               :key="change"
             >
               {{ change }}
+            </li>
+          </ul>
+
+          <ul
+            v-if="subtasks(item).some((subtask) => subtask.summary)"
+            class="timeline-detail-list"
+          >
+            <li
+              v-for="subtask in subtasks(item).filter((subtask) => subtask.summary)"
+              :key="`${subtask.id}-summary`"
+            >
+              {{ subtask.role }}：{{ subtask.summary }}
             </li>
           </ul>
         </details>
@@ -353,6 +389,52 @@ function hasDetails(item) {
 
 .timeline-change-chip-more {
   color: #7a8088;
+}
+
+.timeline-subtask-list {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #eef1f4;
+  border-radius: 10px;
+  padding: 8px;
+  background: #fbfcfe;
+}
+
+.timeline-subtask {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.timeline-subtask-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+}
+
+.timeline-subtask-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.timeline-subtask-copy strong {
+  color: #24292f;
+  font-size: 12px;
+}
+
+.timeline-subtask-copy span {
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.timeline-subtask-status {
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .timeline-detail {

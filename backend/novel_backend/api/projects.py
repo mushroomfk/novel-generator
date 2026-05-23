@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from novel_backend.api.license_guard import require_valid_license
 from novel_backend.models import (
   AgentThreadStoreUpdateRequest,
   ArchitectureWorkspaceApplyRequest,
@@ -106,9 +107,15 @@ async def post_project(request: Request, project_request: CreateProjectRequest):
 
 
 @router.get("/{project_id}")
-def get_project(request: Request, project_id: str):
+def get_project(
+  request: Request,
+  project_id: str,
+  review_characters: bool = Query(default=False),
+):
+  if review_characters:
+    require_valid_license(request)
   settings = request.app.state.settings
-  payload = get_project_detail(settings, project_id).model_dump(mode="json")
+  payload = get_project_detail(settings, project_id, review_characters=review_characters).model_dump(mode="json")
   return {"ok": True, "data": payload}
 
 
@@ -212,6 +219,7 @@ def post_project_dream_run(
   project_id: str,
   dream_request: ProjectDreamRunRequest,
 ):
+  require_valid_license(request)
   settings = request.app.state.settings
   payload = run_project_dream(settings, project_id, dream_request).model_dump(mode="json")
   return {"ok": True, "data": payload}
@@ -392,6 +400,7 @@ def get_project_historical_research(
   q: str = Query(min_length=1, max_length=160),
   limit: int = Query(default=8, ge=1, le=12),
 ):
+  require_valid_license(request)
   settings = request.app.state.settings
   payload = research_historical_reference(settings, project_id, q, limit).model_dump(mode="json")
   return {"ok": True, "data": payload}

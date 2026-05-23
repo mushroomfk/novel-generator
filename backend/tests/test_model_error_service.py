@@ -45,6 +45,7 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(classified.kind, "network_connection")
     self.assertEqual(classified.title, "模型网络连接中断")
     self.assertTrue(classified.retryable)
+    self.assertEqual(classify_model_error("Remote end closed connection without response").kind, "network_connection")
 
   def test_request_json_retries_transient_ssl_eof(self) -> None:
     ssl_eof = urllib_error.URLError(

@@ -38,6 +38,7 @@ function normalizeTrace(trace, fallback = {}) {
       summary: normalizeString(fallback.summary),
       changes: normalizeChanges(fallback.changes),
       artifacts: normalizeArtifacts(fallback.artifacts),
+      subTasks: Array.isArray(fallback.subTasks) ? fallback.subTasks : [],
     };
   }
 
@@ -52,6 +53,7 @@ function normalizeTrace(trace, fallback = {}) {
     changes: normalizeChanges(trace.changes ?? fallback.changes),
     artifacts: normalizeArtifacts(fallback.artifacts),
     materialCount: typeof trace.material_count === 'number' ? trace.material_count : null,
+    subTasks: Array.isArray(fallback.subTasks) ? fallback.subTasks : [],
   };
 }
 
@@ -65,6 +67,17 @@ function normalizeResultPayload(data) {
 
 function actionKey(step, actionKind, label) {
   return `${Number(step || 0)}:${normalizeString(actionKind)}:${normalizeString(label)}`;
+}
+
+function normalizeSubtask(data, status) {
+  return {
+    id: normalizeString(data?.subtask_id) || `${normalizeString(data?.role)}:${normalizeString(data?.capability)}`,
+    role: normalizeString(data?.role) || '子任务',
+    capability: normalizeString(data?.capability),
+    parallelGroup: normalizeString(data?.parallel_group),
+    status: normalizeString(data?.status) || status,
+    summary: normalizeString(data?.summary ?? data?.message),
+  };
 }
 
 export function useAgentSession(options = {}) {
@@ -105,11 +118,51 @@ export function useAgentSession(options = {}) {
         ...normalizedItem,
         changes: normalizedItem.changes.length ? normalizedItem.changes : nextItems[matchedIndex].changes,
         artifacts: normalizedItem.artifacts.length ? normalizedItem.artifacts : nextItems[matchedIndex].artifacts,
+        subTasks: normalizedItem.subTasks.length ? normalizedItem.subTasks : nextItems[matchedIndex].subTasks,
       };
     } else {
       nextItems.push(normalizedItem);
     }
 
+    timelineItems.value = nextItems.sort((left, right) => left.step - right.step);
+  }
+
+  function upsertSubtask(data, status) {
+    const key = actionKey(data?.step, data?.action_kind ?? data?.actionKind, data?.label);
+    const subtask = normalizeSubtask(data, status);
+    const nextItems = [...timelineItems.value];
+    let matchedIndex = nextItems.findIndex((current) => (
+      actionKey(current.step, current.actionKind, current.label) === key
+    ));
+
+    if (matchedIndex < 0) {
+      nextItems.push(normalizeTrace(null, {
+        step: data?.step,
+        total: data?.total,
+        action_kind: data?.action_kind,
+        label: data?.label,
+        status: 'running',
+        subTasks: [],
+      }));
+      matchedIndex = nextItems.length - 1;
+    }
+
+    const currentItem = nextItems[matchedIndex];
+    const currentSubtasks = Array.isArray(currentItem.subTasks) ? [...currentItem.subTasks] : [];
+    const subtaskIndex = currentSubtasks.findIndex((item) => item.id === subtask.id);
+    if (subtaskIndex >= 0) {
+      currentSubtasks[subtaskIndex] = {
+        ...currentSubtasks[subtaskIndex],
+        ...subtask,
+        summary: subtask.summary || currentSubtasks[subtaskIndex].summary,
+      };
+    } else {
+      currentSubtasks.push(subtask);
+    }
+    nextItems[matchedIndex] = {
+      ...currentItem,
+      subTasks: currentSubtasks,
+    };
     timelineItems.value = nextItems.sort((left, right) => left.step - right.step);
   }
 
@@ -173,6 +226,21 @@ export function useAgentSession(options = {}) {
       return;
     }
 
+    if (eventName === 'subtask_started') {
+      upsertSubtask(data, 'running');
+      return;
+    }
+
+    if (eventName === 'subtask_result') {
+      upsertSubtask(data, 'completed');
+      return;
+    }
+
+    if (eventName === 'subtask_failed') {
+      upsertSubtask(data, 'failed');
+      return;
+    }
+
     if (eventName === 'state_updated' && data.state) {
       runtimeState.value = data.state;
       return;
@@ -184,9 +252,13 @@ export function useAgentSession(options = {}) {
     }
 
     if (eventName === 'session_result') {
-      latestResult.value = normalizeResultPayload(data);
-      if (latestResult.value?.state) {
-        runtimeState.value = latestResult.value.state;
+      const result = normalizeResultPayload(data);
+      latestResult.value = result;
+      if (result?.state) {
+        runtimeState.value = result.state;
+      }
+      if (result?.project_detail && typeof options.onProjectUpdated === 'function') {
+        options.onProjectUpdated(result.project_detail);
       }
       return;
     }
@@ -224,9 +296,13 @@ export function useAgentSession(options = {}) {
     }
 
     if (eventName === 'result') {
-      latestResult.value = normalizeResultPayload(data);
-      if (latestResult.value?.state) {
-        runtimeState.value = latestResult.value.state;
+      const result = normalizeResultPayload(data);
+      latestResult.value = result;
+      if (result?.state) {
+        runtimeState.value = result.state;
+      }
+      if (result?.project_detail && typeof options.onProjectUpdated === 'function') {
+        options.onProjectUpdated(result.project_detail);
       }
       return;
     }
@@ -245,7 +321,7 @@ export function useAgentSession(options = {}) {
   function handleEvent(event) {
     const eventName = normalizeString(event?.event) || 'message';
     const data = event?.data;
-    if (eventName.startsWith('session_') || eventName.startsWith('action_') || eventName === 'plan_confirm_required' || eventName === 'state_updated' || eventName === 'project_updated') {
+    if (eventName.startsWith('session_') || eventName.startsWith('action_') || eventName.startsWith('subtask_') || eventName === 'plan_confirm_required' || eventName === 'state_updated' || eventName === 'project_updated') {
       handleStructuredEvent(eventName, data);
       return;
     }

@@ -6,7 +6,7 @@ import time
 from novel_backend.config import Settings
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
-from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.model_transport_service import request_json
 
 
 class RerankConfigError(RuntimeError):
@@ -43,16 +43,13 @@ def _rerank_endpoint(base_url: str) -> str:
 
 
 def _request_rerank(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-  return request_json_with_retries(
+  return request_json(
     endpoint,
-    headers={
-      "Content-Type": "application/json",
-      "Authorization": f"Bearer {api_key}",
-    },
-    payload=payload,
-    error_prefix="重排序请求失败",
+    api_key,
+    payload,
+    failure_label="重排序请求失败",
     invalid_json_message="重排序返回的不是合法 JSON",
-    invalid_payload_message="重排序返回格式不正确",
+    invalid_format_message="重排序返回格式不正确",
   )
 
 

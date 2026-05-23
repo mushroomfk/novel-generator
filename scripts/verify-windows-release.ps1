@@ -124,7 +124,7 @@ try {
     Write-Step "Check Windows sidecar health"
     Invoke-BackendSmoke $SidecarPath "sidecar"
 
-    Write-Step "Build Tauri Windows NSIS installer"
+    Write-Step "Build Tauri Windows installer"
     & npm run tauri -- build --bundles nsis
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   }
@@ -136,7 +136,7 @@ try {
   $Nsis = Get-ChildItem -Path $NsisDir -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
   if ($null -eq $Nsis) {
-    throw "No NSIS Windows installer found under $NsisDir"
+    throw "No Windows NSIS installer found under $NsisDir"
   }
 
   Write-Step "Windows release check finished"

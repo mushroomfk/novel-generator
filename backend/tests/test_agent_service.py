@@ -1046,7 +1046,7 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(chapter_action["scene_location"], "旧码头仓库")
     self.assertEqual(chapter_action["time_constraint"], "涨潮前一小时")
 
-  def test_approved_chapter_generate_uses_single_partial_pipeline(self) -> None:
+  def test_approved_chapter_generate_uses_partial_pipeline(self) -> None:
     save_config(
       self.settings,
       ModelConfig(
@@ -1075,62 +1075,66 @@ class AgentServiceTestCase(unittest.TestCase):
         )
       ],
     )
-    responses = [
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "继续承接仓库门外的危险。",
-                  "last_state": ["林追在仓库内，手里有铜钥匙"],
-                  "active_characters": ["林追"],
-                  "open_threads": ["门外白光逼近"],
-                  "next_beat": "让门外危险更近一步。",
-                  "hard_constraints": ["林追不能放下铜钥匙"],
-                  "avoid_conflicts": ["不要提前揭开钥匙用途"],
-                  "next_action": "继续写门外动静。",
-                },
-                ensure_ascii=False,
-              )
-            }
+    brief_response = {
+      "choices": [
+        {
+          "message": {
+            "content": json.dumps(
+              {
+                "summary": "继续承接仓库门外的危险。",
+                "last_state": ["林追在仓库内，手里有铜钥匙"],
+                "active_characters": ["林追"],
+                "open_threads": ["门外白光逼近"],
+                "next_beat": "让门外危险更近一步。",
+                "hard_constraints": ["林追不能放下铜钥匙"],
+                "avoid_conflicts": ["不要提前揭开钥匙用途"],
+                "next_action": "继续写门外动静。",
+              },
+              ensure_ascii=False,
+            )
           }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": "门缝里亮光一闪，林追把铜钥匙扣进掌心，听见墙外有人停住了呼吸。\n"
-            }
+        }
+      ]
+    }
+    partial_response = {
+      "choices": [
+        {
+          "message": {
+            "content": "门缝里亮光一闪，林追把铜钥匙扣进掌心，听见墙外有人停住了呼吸。\n"
           }
-        ]
-      },
-      {
-        "choices": [
-          {
-            "message": {
-              "content": json.dumps(
-                {
-                  "summary": "没有发现硬冲突。",
-                  "passed": True,
-                  "conflicts": [],
-                  "rewrite_focus": [],
-                  "next_action": "下一段让林追决定去留。",
-                },
-                ensure_ascii=False,
-              )
-            }
+        }
+      ]
+    }
+    judge_response = {
+      "choices": [
+        {
+          "message": {
+            "content": json.dumps(
+              {
+                "summary": "没有发现硬冲突。",
+                "passed": True,
+                "conflicts": [],
+                "rewrite_focus": [],
+                "next_action": "下一段让林追决定去留。",
+              },
+              ensure_ascii=False,
+            )
           }
-        ]
-      },
-    ]
+        }
+      ]
+    }
+    brief_returned = False
     captured_payloads: list[dict[str, object]] = []
 
     def fake_request(_endpoint, _api_key, payload):
+      nonlocal brief_returned
       captured_payloads.append(payload)
-      index = min(len(captured_payloads) - 1, len(responses) - 1)
-      return responses[index]
+      if payload["messages"][-1].get("partial"):
+        return partial_response
+      if not brief_returned:
+        brief_returned = True
+        return brief_response
+      return judge_response
 
     with patch(
       "novel_backend.services.generation_service._request_chat_completion",
@@ -1158,12 +1162,12 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["mode"], "execution")
     self.assertGreaterEqual(len(captured_payloads), 3)
     self.assertTrue(captured_payloads[0]["enable_thinking"])
-    self.assertFalse(captured_payloads[1]["enable_thinking"])
-    self.assertTrue(captured_payloads[2]["enable_thinking"])
     partial_payloads = [
       item for item in captured_payloads if item["messages"][-1].get("partial")
     ]
-    self.assertEqual(len(partial_payloads), 1)
+    self.assertGreaterEqual(len(partial_payloads), 1)
+    self.assertTrue(all(item["enable_thinking"] is False for item in partial_payloads))
+    self.assertTrue(any(item.get("enable_thinking") for item in captured_payloads[1:]))
     detail = get_project_detail(self.settings, self.project.id)
     chapter = next(item for item in detail.chapters if item.id == "chapter-001")
     self.assertIn("门缝里亮光一闪", chapter.content)

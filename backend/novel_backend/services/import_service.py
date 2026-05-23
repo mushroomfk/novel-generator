@@ -10,8 +10,6 @@ import time
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 from xml.etree import ElementTree
 
 from fastapi import HTTPException
@@ -26,6 +24,7 @@ from novel_backend.models import (
 )
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_transport_service import request_json as transport_request_json
 
 
 _SUPPORTED_IMPORT_EXTENSIONS = {
@@ -185,38 +184,19 @@ def _request_json(
   body: bytes | None = None,
   content_type: str | None = "application/json",
 ) -> dict[str, object]:
-  if payload is not None and body is not None:
-    raise RuntimeError("请求参数冲突")
-  request_body = body if body is not None else (
-    json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if payload is not None else None
+  return transport_request_json(
+    endpoint,
+    api_key=api_key,
+    payload=payload,
+    method=method,
+    body=body,
+    content_type=content_type,
+    failure_label="文档接口请求失败",
+    invalid_json_message="文档接口返回的不是合法 JSON",
+    invalid_format_message="文档接口返回格式不正确",
+    allow_empty_response=True,
+    timeout=120,
   )
-  request = urllib_request.Request(endpoint, data=request_body, method=method)
-  request.add_header("Authorization", f"Bearer {api_key}")
-  if request_body is not None and content_type:
-    request.add_header("Content-Type", content_type)
-
-  try:
-    with urllib_request.urlopen(request, timeout=120) as response:
-      raw_text = response.read().decode("utf-8")
-  except urllib_error.HTTPError as error:
-    error_text = error.read().decode("utf-8", errors="ignore")
-    message = error_text or str(error)
-    raise RuntimeError(f"文档接口请求失败: {error.code} {message}") from error
-  except urllib_error.URLError as error:
-    raise RuntimeError(f"文档接口请求失败: {error.reason}") from error
-
-  if not raw_text.strip():
-    return {}
-
-  try:
-    parsed = json.loads(raw_text)
-  except json.JSONDecodeError as error:
-    raise RuntimeError("文档接口返回的不是合法 JSON") from error
-
-  if not isinstance(parsed, dict):
-    raise RuntimeError("文档接口返回格式不正确")
-  return parsed
 
 
 def _safe_upload_filename(filename: str) -> str:

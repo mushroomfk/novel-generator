@@ -1,6 +1,6 @@
 [package]
 name = "novel-generator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Gaoxia desktop shell"
 authors = ["Gaoxia Contributors"]
 edition = "2021"

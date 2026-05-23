@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import net from 'node:net';
@@ -280,6 +280,54 @@ async function seedModelConfig(backendUrl, modelBaseUrl) {
       },
     }),
   });
+}
+
+async function seedTestLicense(backendUrl, licenseContent) {
+  await apiRequest(backendUrl, '/api/license/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      content: licenseContent,
+    }),
+  });
+}
+
+function runJsonTool(args) {
+  const result = spawnSync(path.join(ROOT_DIR, '.venv', 'bin', 'python'), args, {
+    cwd: ROOT_DIR,
+    encoding: 'utf-8',
+  });
+  if (result.status !== 0) {
+    throw new Error(`${args.join(' ')} 失败：${result.stderr || result.stdout}`);
+  }
+  return JSON.parse(result.stdout);
+}
+
+function runTextTool(args) {
+  const result = spawnSync(path.join(ROOT_DIR, '.venv', 'bin', 'python'), args, {
+    cwd: ROOT_DIR,
+    encoding: 'utf-8',
+  });
+  if (result.status !== 0) {
+    throw new Error(`${args.join(' ')} 失败：${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trim();
+}
+
+function createSmokeLicense() {
+  const keypair = runJsonTool(['scripts/generate-license-keypair.py', '--json']);
+  const content = runTextTool([
+    'scripts/create-license.py',
+    '--private-key',
+    keypair.private_key,
+    '--licensee',
+    'UI smoke',
+    '--expires-at',
+    '2099-01-01T00:00:00+00:00',
+  ]);
+  return {
+    publicKey: keypair.public_key,
+    content,
+  };
 }
 
 function jsonResponse(response, payload, status = 200) {
@@ -1022,6 +1070,12 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('story-overview-relationship-grid').waitFor();
     await page.getByTestId('story-overview-character-skills').waitFor();
     await page.getByTestId('story-overview-timeline').waitFor();
+    await page.getByRole('button', { name: '查看事件' }).click();
+    await page.locator('[data-overview-target="events"]').waitFor();
+    await page.getByRole('button', { name: '查看技能' }).click();
+    await page.locator('[data-overview-target="skills"]').waitFor();
+    await page.getByRole('button', { name: '查看时间线' }).click();
+    await page.getByTestId('story-overview-timeline').waitFor();
     await page.keyboard.press('Escape');
     await page.getByTestId('story-overview-modal').waitFor({ state: 'hidden' });
     log('检查提示词方案');
@@ -1121,6 +1175,7 @@ async function main() {
   let mockModelServer = null;
   let shouldRestoreDefaultBuild = false;
   let pendingError = null;
+  const smokeLicense = createSmokeLicense();
 
   try {
     await runCommand('npm', ['run', 'build'], {
@@ -1139,6 +1194,7 @@ async function main() {
         label: 'backend',
         env: {
           NOVEL_CORS_ORIGINS: corsOrigins,
+          NOVEL_LICENSE_PUBLIC_KEY: smokeLicense.publicKey,
           BOCHA_API_KEY: '',
           BOCHA_SEARCH_ENDPOINT: '',
         },
@@ -1146,6 +1202,7 @@ async function main() {
     );
     backgroundProcesses.push(backend);
     await waitForHttpOk(`${backendUrl}/api/app/health`, { timeoutMs: 15000 });
+    await seedTestLicense(backendUrl, smokeLicense.content);
 
     log(`启动本地假模型：127.0.0.1:${modelPort}`);
     mockModelServer = await startMockModelServer(modelPort);

@@ -4,7 +4,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from novel_backend.config import Settings
-from novel_backend.models import AppConfig, AppConfigUpdateRequest, EmbeddingConfig, ModelConfig, ReviewModelConfig
+from novel_backend.models import (
+  AppConfig,
+  AppConfigUpdateRequest,
+  ChapterAutoRepairConfig,
+  EmbeddingConfig,
+  ModelConfig,
+  ReviewModelConfig,
+)
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 
@@ -610,6 +617,22 @@ def initialize_app_storage(settings: Settings) -> None:
       "requires_project": False,
       "requires_chapter": False,
     },
+    {
+      "id": "self-evolution",
+      "badge": "进",
+      "name": "自我进化",
+      "description": "查看经验候选、技能维护和失败样本，决定哪些经验继续沉淀。",
+      "category": "工具",
+      "scenes": ["经验", "技能", "评测"],
+      "accent": "olive",
+      "section_id": "styles-and-tools",
+      "section_title": "风格与工具",
+      "section_description": "把文风、提示词、项目文件和运行记录都收进当前技能区。",
+      "section_order": 3,
+      "order": 90,
+      "requires_project": True,
+      "requires_chapter": False,
+    },
   ]
 
   for payload in default_skills:
@@ -640,6 +663,8 @@ def load_config(settings: Settings) -> AppConfig:
       AppConfigUpdateRequest(
         model=ModelConfig.model_validate(payload),
         embedding=EmbeddingConfig(),
+        review_model=ReviewModelConfig(),
+        chapter_auto_repair=ChapterAutoRepairConfig(),
       ),
     )
 
@@ -654,19 +679,29 @@ def _existing_review_model_config(settings: Settings) -> ReviewModelConfig:
   return ReviewModelConfig()
 
 
+def _existing_chapter_auto_repair_config(settings: Settings) -> ChapterAutoRepairConfig:
+  payload = read_json(app_config_path(settings), None)
+  if isinstance(payload, dict) and isinstance(payload.get("chapter_auto_repair"), dict):
+    return ChapterAutoRepairConfig.model_validate(payload["chapter_auto_repair"])
+  return ChapterAutoRepairConfig()
+
+
 def save_config(settings: Settings, config_update: AppConfigUpdateRequest | ModelConfig) -> AppConfig:
   if isinstance(config_update, ModelConfig):
     model_config = config_update
     embedding_config = resolve_embedding_config(model_config)
     review_model_config = _existing_review_model_config(settings)
+    chapter_auto_repair_config = _existing_chapter_auto_repair_config(settings)
   else:
     model_config = config_update.model
     embedding_config = config_update.embedding
     review_model_config = ReviewModelConfig.model_validate(config_update.review_model)
+    chapter_auto_repair_config = ChapterAutoRepairConfig.model_validate(config_update.chapter_auto_repair)
   payload = AppConfig(
     model=model_config,
     embedding=embedding_config,
     review_model=review_model_config,
+    chapter_auto_repair=chapter_auto_repair_config,
     updated_at=_now_iso(),
   )
   atomic_write_json(app_config_path(settings), payload.model_dump(mode="json"))

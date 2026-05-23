@@ -41,10 +41,17 @@ class ReviewModelConfig(BaseModel):
   temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
 
+class ChapterAutoRepairConfig(BaseModel):
+  enabled: bool = True
+  score_threshold: int = Field(default=65, ge=0, le=100)
+  max_rounds: int = Field(default=1, ge=0, le=3)
+
+
 class AppConfig(BaseModel):
   model: ModelConfig = Field(default_factory=ModelConfig)
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
   review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
+  chapter_auto_repair: ChapterAutoRepairConfig = Field(default_factory=ChapterAutoRepairConfig)
   updated_at: str
 
 
@@ -52,6 +59,7 @@ class AppConfigUpdateRequest(BaseModel):
   model: ModelConfig = Field(default_factory=ModelConfig)
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
   review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
+  chapter_auto_repair: ChapterAutoRepairConfig = Field(default_factory=ChapterAutoRepairConfig)
 
 
 class HealthPayload(BaseModel):
@@ -525,7 +533,7 @@ class ChapterWorkflowRequest(BaseModel):
   chapter_id: str = Field(min_length=1)
   mode: str = Field(default="diagnose", min_length=1, max_length=32)
   instruction: str = Field(default="", max_length=2000)
-  target_words: int = Field(default=1500, ge=300, le=8000)
+  target_words: int = Field(default=1500, ge=300, le=30000)
 
 
 class ChapterWorkflowResult(BaseModel):
@@ -575,8 +583,13 @@ class BrainstormResult(BaseModel):
 
 
 class AgentMessage(BaseModel):
+  id: str = Field(default="", max_length=80)
   role: str = Field(pattern="^(user|assistant|system)$")
   content: str = Field(min_length=1, max_length=6000)
+  content_hash: str = Field(default="", max_length=80)
+  compacted: bool = False
+  original_length: int = Field(default=0, ge=0)
+  summary: str = Field(default="", max_length=2000)
 
 
 class AgentStateSummary(BaseModel):
@@ -631,12 +644,16 @@ class AgentPlanAction(BaseModel):
     pattern="^(brainstorm|review_knowledge|generate_architecture|continue_project|chapter_generate|chapter_workflow|consistency_check|rewrite_chapter|skill_optimize)$"
   )
   label: str = Field(min_length=1, max_length=120)
+  subtask_id: str = Field(default="", max_length=80)
+  parallel_group: str = Field(default="", max_length=80)
+  role: str = Field(default="", max_length=80)
+  capability: str = Field(default="", max_length=160)
   task_pack_kind: str = Field(default="", pattern="^(|continuation|architecture|imitation|persona)$")
   instruction: str = Field(default="", max_length=4000)
   chapter_id: str = Field(default="", max_length=120)
   mode: str = Field(default="", max_length=40)
   new_chapters: int = Field(default=0, ge=0, le=200)
-  target_words: int = Field(default=0, ge=0, le=12000)
+  target_words: int = Field(default=0, ge=0, le=30000)
   style_name: str = Field(default="", max_length=80)
   xp_preset: str = Field(default="", max_length=80)
   characters_involved: str = Field(default="", max_length=500)
@@ -690,8 +707,12 @@ class AgentChatResult(BaseModel):
 
 
 class AgentThreadMessage(BaseModel):
+  id: str = Field(default="", max_length=80)
   role: str = Field(pattern="^(user|assistant|system)$")
-  content: str = Field(min_length=1, max_length=6000)
+  content: str = Field(min_length=1, max_length=1000000)
+  content_hash: str = Field(default="", max_length=80)
+  original_length: int = Field(default=0, ge=0)
+  summary: str = Field(default="", max_length=2000)
   mode: str = Field(default="", max_length=40)
   task_pack_kind: str = Field(default="", pattern="^(|continuation|architecture|imitation|persona)$")
   plan: AgentPlan | None = None
@@ -709,7 +730,7 @@ class AgentThreadRecord(BaseModel):
   title: str = Field(default="", max_length=120)
   preview: str = Field(default="", max_length=240)
   updated_at: str = Field(min_length=1, max_length=80)
-  messages: list[AgentThreadMessage] = Field(default_factory=list, max_length=100)
+  messages: list[AgentThreadMessage] = Field(default_factory=list, max_length=500)
   suggestions: list[str] = Field(default_factory=list, max_length=10)
   pending_plan: AgentPlan | None = None
 
@@ -793,6 +814,7 @@ class ChapterGenerateRequest(BaseModel):
   project_id: str = Field(min_length=1)
   chapter_id: str = Field(min_length=1)
   instruction: str = Field(default="", max_length=2000)
+  target_words: int = Field(default=0, ge=0, le=30000)
   style_name: str = Field(default="", max_length=80)
   xp_preset: str = Field(default="", max_length=80)
   characters_involved: str = Field(default="", max_length=500)
@@ -853,6 +875,9 @@ class BatchGenerateRequest(BaseModel):
   instruction: str = Field(default="", max_length=2000)
   style_name: str = Field(default="", max_length=80)
   xp_preset: str = Field(default="", max_length=80)
+  task_id: str = Field(default="", max_length=80)
+  retry_failed: bool = False
+  comment: str = Field(default="", max_length=1000)
 
 
 class BatchGenerateChapterResult(BaseModel):
@@ -860,6 +885,16 @@ class BatchGenerateChapterResult(BaseModel):
   title: str
   status: str
   preview: str = ""
+  review_status: str = ""
+  review_score: int | None = Field(default=None, ge=0, le=100)
+  review_summary: str = ""
+  review_error: str = ""
+  review_auto_repair_attempted: bool = False
+  review_auto_repair_applied: bool = False
+  review_auto_repair_rounds_attempted: int = Field(default=0, ge=0, le=3)
+  review_auto_repair_rounds_applied: int = Field(default=0, ge=0, le=3)
+  review_auto_repair_summary: str = ""
+  review_auto_repair_error: str = ""
 
 
 class BatchGenerateResult(BaseModel):
@@ -1039,6 +1074,51 @@ class SkillMaterializeResult(BaseModel):
   saved_path: str
   skill_markdown: str
   verification: SkillVerificationReport
+
+
+class SkillCurationItem(BaseModel):
+  skill_id: str
+  name: str
+  source: str = "custom"
+  status: str = Field(default="active", pattern="^(active|stale|archive_candidate)$")
+  pinned: bool = False
+  usage_count: int = Field(default=0, ge=0)
+  materialized_count: int = Field(default=0, ge=0)
+  updated_at: str = ""
+  last_used_at: str = ""
+  reason: str = ""
+  suggestion: str = ""
+
+
+class SkillCurationReport(BaseModel):
+  generated_at: str
+  total: int = Field(default=0, ge=0)
+  active_count: int = Field(default=0, ge=0)
+  stale_count: int = Field(default=0, ge=0)
+  archive_candidate_count: int = Field(default=0, ge=0)
+  items: list[SkillCurationItem] = Field(default_factory=list)
+
+
+class SelfEvolutionCandidate(BaseModel):
+  id: str
+  kind: str = Field(pattern="^(skill|prompt|memory|review)$")
+  title: str
+  summary: str = ""
+  evidence: list[str] = Field(default_factory=list)
+  recommendation: str = ""
+  confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+  source_task_ids: list[str] = Field(default_factory=list)
+  status: str = Field(default="pending", pattern="^(pending|accepted|dismissed)$")
+
+
+class SelfEvolutionReport(BaseModel):
+  project_id: str
+  generated_at: str
+  candidates: list[SelfEvolutionCandidate] = Field(default_factory=list)
+  skill_curation: SkillCurationReport
+  prompt_failure_count: int = Field(default=0, ge=0)
+  trajectory_count: int = Field(default=0, ge=0)
+  learning_review_count: int = Field(default=0, ge=0)
 
 
 class StyleSummary(BaseModel):

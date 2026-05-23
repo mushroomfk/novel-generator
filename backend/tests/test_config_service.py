@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from novel_backend.config import Settings
-from novel_backend.models import AppConfigUpdateRequest, EmbeddingConfig, ModelConfig, ReviewModelConfig
+from novel_backend.models import AppConfigUpdateRequest, ChapterAutoRepairConfig, EmbeddingConfig, ModelConfig, ReviewModelConfig
 from novel_backend.services.config_service import initialize_app_storage, load_config, save_config
 
 
@@ -25,6 +25,64 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertEqual(config.embedding.model_name, "text-embedding-v4")
     self.assertEqual(config.embedding.dimensions, 2048)
     self.assertFalse(config.review_model.enabled)
+    self.assertTrue(config.chapter_auto_repair.enabled)
+    self.assertEqual(config.chapter_auto_repair.score_threshold, 65)
+    self.assertEqual(config.chapter_auto_repair.max_rounds, 1)
+
+  def test_save_config_persists_chapter_auto_repair_settings(self) -> None:
+    config = save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(model_name="demo-model"),
+        chapter_auto_repair=ChapterAutoRepairConfig(
+          enabled=False,
+          score_threshold=72,
+          max_rounds=2,
+        ),
+      ),
+    )
+
+    self.assertFalse(config.chapter_auto_repair.enabled)
+    self.assertEqual(config.chapter_auto_repair.score_threshold, 72)
+    self.assertEqual(config.chapter_auto_repair.max_rounds, 2)
+
+    loaded = load_config(self.settings)
+    self.assertFalse(loaded.chapter_auto_repair.enabled)
+    self.assertEqual(loaded.chapter_auto_repair.score_threshold, 72)
+    self.assertEqual(loaded.chapter_auto_repair.max_rounds, 2)
+
+  def test_save_model_config_preserves_chapter_auto_repair_settings(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(model_name="demo-model"),
+        chapter_auto_repair=ChapterAutoRepairConfig(score_threshold=70, max_rounds=2),
+      ),
+    )
+
+    config = save_config(self.settings, ModelConfig(model_name="qwen3.6-plus"))
+
+    self.assertEqual(config.chapter_auto_repair.score_threshold, 70)
+    self.assertEqual(config.chapter_auto_repair.max_rounds, 2)
+
+  def test_save_model_config_auto_uses_aliyun_embedding_for_aliyun_model(self) -> None:
+    config = save_config(
+      self.settings,
+      ModelConfig(
+        provider="aliyun-bailian",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="dashscope-key",
+        model_name="qwen-max",
+      ),
+    )
+
+    self.assertEqual(config.embedding.provider, "aliyun-bailian")
+    self.assertEqual(config.embedding.base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    self.assertEqual(config.embedding.model_name, "text-embedding-v4")
+    self.assertEqual(config.embedding.dimensions, 2048)
+    self.assertEqual(config.embedding.api_key, "dashscope-key")
+    self.assertEqual(config.embedding.retrieval_k, 6)
+    self.assertEqual(config.embedding.batch_size, 8)
 
   def test_save_config_preserves_separate_embedding_for_known_model_family(self) -> None:
     config = save_config(
