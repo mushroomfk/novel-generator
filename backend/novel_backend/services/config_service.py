@@ -644,12 +644,7 @@ def load_config(settings: Settings) -> AppConfig:
     )
 
   parsed = AppConfig.model_validate(payload)
-  normalized = parsed.model_copy(
-    update={"embedding": resolve_embedding_config(parsed.model, parsed.embedding)}
-  )
-  if normalized.model_dump(mode="json") != parsed.model_dump(mode="json"):
-    atomic_write_json(app_config_path(settings), normalized.model_dump(mode="json"))
-  return normalized
+  return parsed
 
 
 def _existing_review_model_config(settings: Settings) -> ReviewModelConfig:
@@ -666,7 +661,7 @@ def save_config(settings: Settings, config_update: AppConfigUpdateRequest | Mode
     review_model_config = _existing_review_model_config(settings)
   else:
     model_config = config_update.model
-    embedding_config = resolve_embedding_config(model_config, config_update.embedding)
+    embedding_config = config_update.embedding
     review_model_config = ReviewModelConfig.model_validate(config_update.review_model)
   payload = AppConfig(
     model=model_config,

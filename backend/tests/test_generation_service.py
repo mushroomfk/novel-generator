@@ -67,6 +67,24 @@ class GenerationServiceTestCase(unittest.TestCase):
     self._temp_dir = tempfile.TemporaryDirectory()
     self.settings = Settings(data_dir=Path(self._temp_dir.name))
     initialize_app_storage(self.settings)
+    self._embedding_signature_patcher = patch(
+      "novel_backend.services.project_service.embedding_config_signature",
+      return_value="generation-tests:not-ready",
+    )
+    self._embedding_signature_patcher.start()
+    self.addCleanup(self._embedding_signature_patcher.stop)
+    self._embedding_request_patcher = patch(
+      "novel_backend.services.project_service.embed_texts",
+      side_effect=RuntimeError("skip embedding in generation tests"),
+    )
+    self._embedding_request_patcher.start()
+    self.addCleanup(self._embedding_request_patcher.stop)
+    self._rerank_patcher = patch(
+      "novel_backend.services.project_service.rerank_documents",
+      return_value=[],
+    )
+    self._rerank_patcher.start()
+    self.addCleanup(self._rerank_patcher.stop)
     self.payload = ArchitectureRequest(
       title="测试小说",
       premise="主角在海港城市追查一段被隐藏的家族航线，同时被旧秩序和黑市交易追赶。",

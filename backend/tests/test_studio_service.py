@@ -17,6 +17,7 @@ from novel_backend.models import (
   CharacterReplicaRequest,
   ChapterGenerateRequest,
   ChapterGenerateResult,
+  ChapterReviewReport,
   ChapterRewriteRequest,
   ChapterUpdateRequest,
   ContinueProjectRequest,
@@ -92,6 +93,22 @@ async def collect_stream(stream) -> list[tuple[str, object]]:
 
 
 class StudioServiceTestCase(unittest.TestCase):
+  def _fake_chapter_review(self, _settings, detail, chapter_id: str, *, style_name: str = "") -> ChapterReviewReport:
+    chapter = next(item for item in detail.chapters if item.id == chapter_id)
+    return ChapterReviewReport(
+      chapter_id=chapter.id,
+      chapter_index=chapter.index,
+      chapter_title=chapter.title,
+      version="complete",
+      engine="studio-test",
+      status="good",
+      overall_score=88,
+      summary="测试环境跳过模型审查。",
+      style_name=style_name,
+      updated_at="2026-05-23T00:00:00+00:00",
+      source_signature=f"studio-test:{chapter.id}:{style_name}",
+    )
+
   def setUp(self) -> None:
     self._temp_dir = tempfile.TemporaryDirectory()
     self.settings = Settings(data_dir=Path(self._temp_dir.name))
@@ -113,6 +130,30 @@ class StudioServiceTestCase(unittest.TestCase):
         target_words=60000,
       ),
     )
+    self._chapter_review_patcher = patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=self._fake_chapter_review,
+    )
+    self._chapter_review_patcher.start()
+    self.addCleanup(self._chapter_review_patcher.stop)
+    self._embedding_signature_patcher = patch(
+      "novel_backend.services.project_service.embedding_config_signature",
+      return_value="studio-tests:not-ready",
+    )
+    self._embedding_signature_patcher.start()
+    self.addCleanup(self._embedding_signature_patcher.stop)
+    self._embedding_request_patcher = patch(
+      "novel_backend.services.project_service.embed_texts",
+      side_effect=RuntimeError("skip embedding in studio tests"),
+    )
+    self._embedding_request_patcher.start()
+    self.addCleanup(self._embedding_request_patcher.stop)
+    self._rerank_patcher = patch(
+      "novel_backend.services.project_service.rerank_documents",
+      return_value=[],
+    )
+    self._rerank_patcher.start()
+    self.addCleanup(self._rerank_patcher.stop)
     self.project_dir = Path(self.project.path)
     (self.project_dir / "core_seed.txt").write_text("海港旧航线和铜钥匙牵出主角身世。", encoding="utf-8")
     (self.project_dir / "plot_structure.txt").write_text("前段引案，中段追索，后段改写秩序。", encoding="utf-8")

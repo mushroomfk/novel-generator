@@ -72,9 +72,53 @@ class AgentServiceTestCase(unittest.TestCase):
         target_words=30000,
       ),
     )
+    self._chapter_review_patcher = patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=RuntimeError("skip chapter review in agent tests"),
+    )
+    self._chapter_review_patcher.start()
+    self.addCleanup(self._chapter_review_patcher.stop)
+    self._embedding_signature_patcher = patch(
+      "novel_backend.services.project_service.embedding_config_signature",
+      return_value="agent-tests:not-ready",
+    )
+    self._embedding_signature_patcher.start()
+    self.addCleanup(self._embedding_signature_patcher.stop)
+    self._embedding_request_patcher = patch(
+      "novel_backend.services.project_service.embed_texts",
+      side_effect=RuntimeError("skip embedding in agent tests"),
+    )
+    self._embedding_request_patcher.start()
+    self.addCleanup(self._embedding_request_patcher.stop)
+    self._rerank_patcher = patch(
+      "novel_backend.services.project_service.rerank_documents",
+      return_value=[],
+    )
+    self._rerank_patcher.start()
+    self.addCleanup(self._rerank_patcher.stop)
+    self._context_search_patcher = patch(
+      "novel_backend.services.context_builder.search_project_knowledge",
+      return_value=[],
+    )
+    self._context_search_patcher.start()
+    self.addCleanup(self._context_search_patcher.stop)
+    self._guard_search_patcher = patch(
+      "novel_backend.services.continuity_guard_service.search_project_knowledge_evidence",
+      return_value=[],
+    )
+    self._guard_search_patcher.start()
+    self.addCleanup(self._guard_search_patcher.stop)
 
   def tearDown(self) -> None:
     self._temp_dir.cleanup()
+
+  def _write_chapter_without_review(self, chapter_id: str, content: str) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      chapter_id,
+      ChapterUpdateRequest(content=content),
+    )
 
   def _write_custom_skill(self, skill_id: str, name: str, *, scenes: list[str] | None = None, body_note: str = "") -> Path:
     skill_path = self.settings.data_dir / "skills" / "user-skills" / skill_id / "SKILL.md"
@@ -124,11 +168,9 @@ class AgentServiceTestCase(unittest.TestCase):
     return skill_path
 
   def test_write_request_returns_confirm_plan_when_architecture_missing(self) -> None:
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+      "# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
     )
 
     events = asyncio.run(
@@ -368,11 +410,9 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertIn("用户要求先看资料时，计划必须先放 review_knowledge", joined_context)
 
   def test_model_plan_respects_user_explicit_chapter_over_selected_chapter(self) -> None:
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n"),
+      "# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n",
     )
 
     with patch(
@@ -420,11 +460,9 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertIn("第 2 章", result_event[1]["reply"])
 
   def test_model_plan_uses_action_specific_chapter_when_reference_chapter_appears_first(self) -> None:
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n"),
+      "# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n",
     )
 
     with patch(
@@ -476,11 +514,9 @@ class AgentServiceTestCase(unittest.TestCase):
       scenes=["去 AI", "对白"],
       body_note="去 AI 时保留人物对白差异。",
     )
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追说：我们不能回头。\n"),
+      "# 第一章\n林追说：我们不能回头。\n",
     )
 
     events = asyncio.run(
@@ -573,11 +609,9 @@ class AgentServiceTestCase(unittest.TestCase):
         ]
       ),
     )
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追把铜钥匙塞进口袋，准备回旧码头。\n"),
+      "# 第一章\n林追把铜钥匙塞进口袋，准备回旧码头。\n",
     )
     runtime = _build_runtime_state(self.settings, self.project.id)
 
@@ -762,11 +796,9 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertIn("已启用用户技能：对白整理", result_event[1]["changes"])
 
   def test_execution_suggests_saving_reusable_skill_from_natural_language(self) -> None:
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追说：我们不能回头。\n"),
+      "# 第一章\n林追说：我们不能回头。\n",
     )
     plan = AgentPlan(
       id="plan-suggest-skill",
@@ -880,11 +912,9 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertIn("资料库分析结论", mock_generate.call_args.args[2])
 
   def test_write_plan_carries_style_xp_and_chapter_constraints(self) -> None:
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n旧码头重新亮灯，主角被迫回港。\n"),
+      "# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
     )
 
     events = asyncio.run(
@@ -925,11 +955,9 @@ class AgentServiceTestCase(unittest.TestCase):
         model_name="qwen3.6-plus",
       ),
     )
-    update_chapter_content(
-      self.settings,
-      self.project.id,
+    self._write_chapter_without_review(
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n"),
+      "# 第一章\n林追在旧码头仓库找到一把铜钥匙。\n",
     )
     plan = AgentPlan(
       id="plan-single-pipeline",

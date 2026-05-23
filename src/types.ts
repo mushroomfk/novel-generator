@@ -274,8 +274,30 @@ export interface ModelConfig {
   temperature: number;
 }
 
+export interface EmbeddingConfig {
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model_name: string;
+  dimensions: number | null;
+  retrieval_k: number;
+  batch_size: number;
+}
+
+export interface ReviewModelConfig {
+  enabled: boolean;
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model_name: string;
+  max_tokens: number;
+  temperature: number;
+}
+
 export interface AppConfig {
   model: ModelConfig;
+  embedding: EmbeddingConfig;
+  review_model: ReviewModelConfig;
   updated_at: string;
 }
 

@@ -23,9 +23,15 @@
 - 修改摘要：`release/` 发布测试输出目录加入 `.gitignore`，避免本地测试包、`.DS_Store` 和外部测试说明被误提交。
 - 修复摘要：旧的 `ModelConfig` 保存路径现在会保留已配置的 `review_model`，避免只保存主模型时清空第二审查模型配置；架构生成解析支持模型返回嵌套 JSON 段落，人物名自动识别减少把“项目文档、关键词、养老金、封口费”等词片段误判成人物。
 - 影响范围：`.gitignore`、`config_service.save_config()`、`generation_service` 架构解析、`project_service` 人物名识别，以及对应回归测试。
-- 补充摘要：架构总览的人物发现现在会检查姓名左右语境，可把“林晚在……”识别为“林晚”，并拒绝嵌在“实习生、项目文档、关键词、养老金”等普通词里的片段。
-- 补充验证：`PYTHONPATH=backend python3 -m pytest backend/tests/test_project_service.py backend/tests/test_generation_service.py` 通过，42 个用例通过。
-- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_model_error_service backend.tests.test_self_evolution_service -v` 通过，14 个用例通过；`npm run backend:test` 通过，121 个后端用例通过；`npm run build` 通过；`npm run verify:ui` 通过；`git diff --check` 通过。
+- 补充摘要：架构总览现在会优先读取模型结构化输出里的嵌套字段，把人物状态、关系、事件、地点、道具、技能和组织直接挂到总览节点；普通正文里发现的人名只按证据评分进入候选，避免把“项目文档、关键词、养老金”等词片段写成人物。
+- 测试修正：Agent、生成服务和 Studio 单测屏蔽不属于目标的章节审查、Embedding 和 rerank 外部请求，避免回归测试误连真实模型。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_model_error_service backend.tests.test_self_evolution_service -v` 通过，14 个用例通过；`npm run backend:test` 通过，123 个后端用例通过；`npm run build` 通过；`npm run verify` 通过；`npm run verify:ui` 通过；`git diff --check` 通过。
+
+### Embedding 单独配置恢复
+
+- 修改摘要：设置页恢复“单独设置 Embedding”开关和独立输入项。默认仍按当前写作模型推导 Embedding；勾选后可单独填写 Embedding 服务商、模型、接口地址、API Key、向量维度、检索数量和批量大小。后端保存完整配置时保留传入的 `embedding`，不再按写作模型强制覆盖；旧的单独 `ModelConfig` 保存路径仍会自动推导 Embedding。
+- 影响范围：模型设置页、`AppConfigUpdateRequest` 保存语义、Embedding 配置持久化、界面 smoke 设置页检查、README、核心引擎说明、界面回归说明和测试反馈清单；不改变知识库索引文件格式、模型请求接口或环境变量名称。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service -v` 通过，7 个用例通过；`npm run backend:test` 通过，123 个后端用例通过；`npm run build` 通过；`npm run verify` 通过；`npm run verify:ui` 通过，包含设置页“单独设置 Embedding”检查；`git diff --check` 通过。
 
 ## 2026-05-22
 

@@ -974,6 +974,9 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('open-settings-button').click();
     await page.getByTestId('settings-modal').waitFor();
     await page.getByTestId('settings-modal').locator('.accordion-summary').click();
+    await page.getByTestId('settings-modal').getByText('单独设置 Embedding').waitFor();
+    await page.getByTestId('settings-modal').getByLabel('单独设置 Embedding').check();
+    await page.getByTestId('settings-modal').getByText('Embedding 模型').waitFor();
     await page.getByTestId('settings-modal').getByText('自学习审查模型').waitFor();
     await page.keyboard.press('Escape');
     await page.getByTestId('settings-modal').waitFor({ state: 'hidden' });

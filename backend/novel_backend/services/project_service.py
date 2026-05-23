@@ -260,10 +260,6 @@ _COMPOUND_SURNAMES = (
   "司寇",
   "南宫",
 )
-_COMPOUND_SURNAME_PATTERN = re.compile(
-  rf"((?:{'|'.join(_COMPOUND_SURNAMES)})[\u4e00-\u9fff]{{1,2}})"
-)
-_SINGLE_SURNAME_PATTERN = re.compile(rf"([{_COMMON_SINGLE_CHAR_SURNAMES}][\u4e00-\u9fff]{{1,2}})")
 _DISCOVERED_CHARACTER_BLACKLIST = {
   "中国人",
   "外国人",
@@ -3128,6 +3124,221 @@ def _extract_relationship_summaries(text: str, character_names: list[str]) -> di
   return {name: _ordered_unique(items) for name, items in relation_map.items()}
 
 
+_STRUCTURED_OVERVIEW_FIELD_ALIASES = {
+  "current_state": {
+    "current_state",
+    "initial_state",
+    "state",
+    "当前状态",
+    "初始状态",
+    "状态",
+    "现状",
+    "处境",
+  },
+  "relationships": {
+    "relationships",
+    "relationship",
+    "relations",
+    "关联人物",
+    "人物关系",
+    "关系",
+  },
+  "events": {
+    "events",
+    "event",
+    "plot_events",
+    "关键事件",
+    "事件",
+  },
+  "locations": {
+    "locations",
+    "location",
+    "places",
+    "place",
+    "地点",
+    "场所",
+    "场地",
+  },
+  "props": {
+    "props",
+    "items",
+    "key_items",
+    "objects",
+    "道具",
+    "物件",
+    "关键物件",
+    "线索物",
+  },
+  "skills": {
+    "skills",
+    "skill",
+    "ability",
+    "abilities",
+    "能力",
+    "技能",
+    "本领",
+  },
+  "scenes": {
+    "scenes",
+    "scene",
+    "beats",
+    "场景",
+    "场次",
+  },
+  "organizations": {
+    "organizations",
+    "organization",
+    "factions",
+    "faction",
+    "forces",
+    "force",
+    "组织",
+    "势力",
+    "机构",
+    "阵营",
+  },
+}
+_STRUCTURED_OVERVIEW_KEY_TO_FIELD = {
+  key: field
+  for field, keys in _STRUCTURED_OVERVIEW_FIELD_ALIASES.items()
+  for key in keys
+}
+_STRUCTURED_OVERVIEW_FIELD_PATTERN = re.compile(
+  r"(" + "|".join(re.escape(key) for key in sorted(_STRUCTURED_OVERVIEW_KEY_TO_FIELD, key=len, reverse=True)) + r")\s*[：:]"
+)
+_STRUCTURED_SPLIT_PATTERN = re.compile(r"[；;\n]+")
+_STRUCTURED_ENTITY_NAME_KEYS = {
+  "events": ("name", "title", "event", "事件", "关键事件", "标题"),
+  "locations": ("name", "title", "location", "place", "地点", "场所", "标题"),
+  "props": ("name", "title", "prop", "item", "道具", "物件", "标题"),
+  "skills": ("name", "title", "skill", "ability", "技能", "能力", "标题"),
+  "scenes": ("name", "title", "scene", "beat", "场景", "场次", "标题"),
+  "organizations": ("name", "title", "organization", "faction", "force", "组织", "势力", "机构", "标题"),
+}
+_STRUCTURED_RELATED_CHARACTER_KEYS = ("related_characters", "characters", "人物", "关联人物", "角色")
+_STRUCTURED_SUMMARY_KEYS = ("summary", "description", "detail", "goal", "hook", "content", "说明", "摘要", "目标", "钩子", "状态")
+
+
+def _structured_field_map(lines: list[str]) -> dict[str, list[str]]:
+  text = "\n".join(str(item or "") for item in lines if str(item or "").strip())
+  if not text:
+    return {}
+  matches = list(_STRUCTURED_OVERVIEW_FIELD_PATTERN.finditer(text))
+  fields: dict[str, list[str]] = defaultdict(list)
+  for index, match in enumerate(matches):
+    key = match.group(1)
+    field = _STRUCTURED_OVERVIEW_KEY_TO_FIELD.get(key)
+    if not field:
+      continue
+    next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+    value = text[match.end() : next_start].strip(" \t\r\n，,；;。")
+    if value:
+      fields[field].append(value)
+  return fields
+
+
+def _structured_items(values: list[str]) -> list[str]:
+  items: list[str] = []
+  for value in values:
+    for piece in _STRUCTURED_SPLIT_PATTERN.split(str(value or "")):
+      cleaned = piece.strip(" -，,、。")
+      if cleaned:
+        items.append(cleaned)
+  return _ordered_unique(items)
+
+
+def _structured_entity_name(value: str) -> str:
+  cleaned = value.strip(" -，,、。")
+  if "：" in cleaned or ":" in cleaned:
+    left = re.split(r"[:：]", cleaned, maxsplit=1)[0].strip()
+    if 1 <= len(left) <= 24:
+      return left
+  return _compact_text(cleaned, limit=40)
+
+
+def _first_structured_string(payload: dict, keys: tuple[str, ...]) -> str:
+  for key in keys:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+      return value.strip()
+  return ""
+
+
+def _structured_related_characters(payload: dict) -> list[str]:
+  values: list[str] = []
+  for key in _STRUCTURED_RELATED_CHARACTER_KEYS:
+    value = payload.get(key)
+    if isinstance(value, str):
+      values.append(value)
+    elif isinstance(value, list):
+      values.extend(str(item) for item in value if str(item).strip())
+  return _structured_items(values)
+
+
+def _structured_entity_records(kind: str, value: object) -> list[tuple[str, str, list[str]]]:
+  records: list[tuple[str, str, list[str]]] = []
+  if value is None:
+    return records
+  if isinstance(value, str):
+    for item in _structured_items([value]):
+      records.append((_structured_entity_name(item), item, []))
+    return [(name, summary, related) for name, summary, related in records if name]
+  if isinstance(value, list):
+    for item in value:
+      records.extend(_structured_entity_records(kind, item))
+    return records
+  if not isinstance(value, dict):
+    text = _json_value_to_text(value)
+    return _structured_entity_records(kind, text)
+
+  name = _first_structured_string(value, _STRUCTURED_ENTITY_NAME_KEYS[kind])
+  related = _structured_related_characters(value)
+  summary = _first_structured_string(value, _STRUCTURED_SUMMARY_KEYS)
+  if not summary:
+    summary = _json_value_to_text(value)
+  if name:
+    return [(_structured_entity_name(name), _compact_text(summary, limit=140), related)]
+
+  for key, item in value.items():
+    if key in _STRUCTURED_RELATED_CHARACTER_KEYS or key in _STRUCTURED_SUMMARY_KEYS:
+      continue
+    if isinstance(key, str) and key.strip() and key not in _STRUCTURED_OVERVIEW_KEY_TO_FIELD:
+      if isinstance(item, (str, int, float, bool)):
+        records.append((_structured_entity_name(key), _compact_text(str(item), limit=140), related))
+        continue
+    records.extend(_structured_entity_records(kind, item))
+  return [(record_name, record_summary, record_related) for record_name, record_summary, record_related in records if record_name]
+
+
+def _structured_overview_entities_from_payload(payload: object) -> dict[str, list[tuple[str, str, list[str]]]]:
+  entities: dict[str, list[tuple[str, str, list[str]]]] = defaultdict(list)
+  if isinstance(payload, list):
+    for item in payload:
+      for kind, records in _structured_overview_entities_from_payload(item).items():
+        entities[kind].extend(records)
+    return entities
+  if not isinstance(payload, dict):
+    return entities
+
+  for key, value in payload.items():
+    field = _STRUCTURED_OVERVIEW_KEY_TO_FIELD.get(str(key))
+    if field in {"events", "locations", "props", "skills", "scenes", "organizations"}:
+      entities[field].extend(_structured_entity_records(field, value))
+      continue
+    if isinstance(value, (dict, list)):
+      for kind, records in _structured_overview_entities_from_payload(value).items():
+        entities[kind].extend(records)
+  return entities
+
+
+def _extract_json_structured_overview_entities(text: str) -> dict[str, list[tuple[str, str, list[str]]]]:
+  try:
+    payload = json.loads(text)
+  except (TypeError, json.JSONDecodeError):
+    return {}
+  return _structured_overview_entities_from_payload(payload)
+
+
 def _register_entity(
   entity_map: dict[str, dict[str, set[str] | str | set[int]]],
   name: str,
@@ -3154,6 +3365,64 @@ def _register_entity(
     payload["related_characters"].update(item for item in related_characters if item)
   if chapter_index is not None:
     payload["chapter_indexes"].add(chapter_index)
+
+
+def _new_character_store_item() -> dict[str, object]:
+  return {
+    "profile": "",
+    "current_state": "",
+    "relationships": [],
+    "events": [],
+    "locations": [],
+    "props": [],
+    "skills": [],
+    "scenes": [],
+    "organizations": [],
+    "timeline": [],
+  }
+
+
+def _apply_structured_character_fields(
+  character_store: dict[str, dict],
+  entity_store: dict[str, dict],
+  name: str,
+  lines: list[str],
+  *,
+  summary: str,
+) -> dict[str, list[str]]:
+  fields = _structured_field_map(lines)
+  if not fields:
+    return {}
+
+  store = character_store.setdefault(name, _new_character_store_item())
+  if fields.get("current_state") and not store["current_state"]:
+    store["current_state"] = _compact_text("；".join(_structured_items(fields["current_state"])), limit=160)
+
+  if fields.get("relationships"):
+    store["relationships"] = _ordered_unique(
+      store["relationships"] + _structured_items(fields["relationships"])
+    )
+
+  structured_entities: dict[str, list[str]] = {}
+  for kind in ("events", "locations", "props", "skills", "scenes", "organizations"):
+    values = _structured_items(fields.get(kind, []))
+    if not values:
+      continue
+    entity_names = [_structured_entity_name(item) for item in values]
+    entity_names = [item for item in entity_names if item]
+    if not entity_names:
+      continue
+    structured_entities[kind] = entity_names
+    store[kind] = _ordered_unique(store[kind] + entity_names)
+    for entity_name, raw_value in zip(entity_names, values):
+      _register_entity(
+        entity_store[kind],
+        entity_name,
+        summary=_compact_text(raw_value if raw_value != entity_name else summary, limit=120),
+        related_characters=[name],
+      )
+
+  return structured_entities
 
 
 def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> StoryOverview:
@@ -3195,18 +3464,7 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
     known_characters = ["主角"]
 
   character_store: dict[str, dict] = {
-    name: {
-      "profile": "",
-      "current_state": "",
-      "relationships": [],
-      "events": [],
-      "locations": [],
-      "props": [],
-      "skills": [],
-      "scenes": [],
-      "organizations": [],
-      "timeline": [],
-    }
+    name: _new_character_store_item()
     for name in known_characters
   }
   entity_store = {
@@ -3223,29 +3481,31 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
     skills = _extract_skills("\n".join(lines))
     character_store.setdefault(
       name,
-      {
-        "profile": "",
-        "current_state": "",
-        "relationships": [],
-        "events": [],
-        "locations": [],
-        "props": [],
-        "skills": [],
-        "scenes": [],
-        "organizations": [],
-        "timeline": [],
-      },
+      _new_character_store_item(),
     )
     character_store[name]["profile"] = summary
     character_store[name]["skills"] = _ordered_unique(character_store[name]["skills"] + skills)
     for item in skills:
       _register_entity(entity_store["skills"], item, summary=summary, related_characters=[name])
+    structured_entities = _apply_structured_character_fields(
+      character_store,
+      entity_store,
+      name,
+      lines,
+      summary=summary,
+    )
     character_store[name]["timeline"].append(
       CharacterTimelineEntry(
         id=f"{name}-design",
         source_label="人物设定",
         summary=summary,
-        skills=skills,
+        relations=character_store[name]["relationships"],
+        events=structured_entities.get("events", []),
+        locations=structured_entities.get("locations", []),
+        props=structured_entities.get("props", []),
+        skills=_ordered_unique(skills + structured_entities.get("skills", [])),
+        scenes=structured_entities.get("scenes", []),
+        organizations=structured_entities.get("organizations", []),
       )
     )
 
@@ -3254,29 +3514,31 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
     skills = _extract_skills("\n".join(lines))
     character_store.setdefault(
       name,
-      {
-        "profile": "",
-        "current_state": "",
-        "relationships": [],
-        "events": [],
-        "locations": [],
-        "props": [],
-        "skills": [],
-        "scenes": [],
-        "organizations": [],
-        "timeline": [],
-      },
+      _new_character_store_item(),
     )
     character_store[name]["current_state"] = summary
     character_store[name]["skills"] = _ordered_unique(character_store[name]["skills"] + skills)
     for item in skills:
       _register_entity(entity_store["skills"], item, summary=summary, related_characters=[name])
+    structured_entities = _apply_structured_character_fields(
+      character_store,
+      entity_store,
+      name,
+      lines,
+      summary=summary,
+    )
     character_store[name]["timeline"].append(
       CharacterTimelineEntry(
         id=f"{name}-state",
         source_label="人物状态",
         summary=summary,
-        skills=skills,
+        relations=character_store[name]["relationships"],
+        events=structured_entities.get("events", []),
+        locations=structured_entities.get("locations", []),
+        props=structured_entities.get("props", []),
+        skills=_ordered_unique(skills + structured_entities.get("skills", [])),
+        scenes=structured_entities.get("scenes", []),
+        organizations=structured_entities.get("organizations", []),
       )
     )
 
@@ -3285,6 +3547,22 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
       continue
 
     mentioned_characters = _extract_character_mentions(document.content, known_characters)
+    structured_overview_entities = _extract_json_structured_overview_entities(document.content)
+    for kind, records in structured_overview_entities.items():
+      for entity_name, entity_summary, related_characters in records:
+        entity_related_characters = _ordered_unique(
+          related_characters + _extract_character_mentions(f"{entity_name}\n{entity_summary}", known_characters)
+        )
+        _register_entity(
+          entity_store[kind],
+          entity_name,
+          summary=entity_summary or _compact_text(document.content, limit=120),
+          related_characters=entity_related_characters,
+        )
+        for character_name in entity_related_characters:
+          store = character_store.setdefault(character_name, _new_character_store_item())
+          store[kind] = _ordered_unique(store[kind] + [entity_name])
+
     locations = _extract_locations(document.content)
     organizations = _extract_organizations(document.content)
     props = _extract_props(document.content)
@@ -3369,18 +3647,7 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
 
     for character_name in mentioned_characters:
       if character_name not in character_store:
-        character_store[character_name] = {
-          "profile": "",
-          "current_state": "",
-          "relationships": [],
-          "events": [],
-          "locations": [],
-          "props": [],
-          "skills": [],
-          "scenes": [],
-          "organizations": [],
-          "timeline": [],
-        }
+        character_store[character_name] = _new_character_store_item()
 
       store = character_store[character_name]
       character_anchor = _character_anchor_from_text(analysis_text, character_name, limit=160)
@@ -3499,18 +3766,7 @@ def _build_story_overview(project_dir: Path, chapters: list[ChapterSummary]) -> 
 
     for character_name in chapter_characters:
       if character_name not in character_store:
-        character_store[character_name] = {
-          "profile": "",
-          "current_state": "",
-          "relationships": [],
-          "events": [],
-          "locations": [],
-          "props": [],
-          "skills": [],
-          "scenes": [],
-          "organizations": [],
-          "timeline": [],
-        }
+        character_store[character_name] = _new_character_store_item()
 
       store = character_store[character_name]
       store["events"] = _ordered_unique(store["events"] + chapter_events)

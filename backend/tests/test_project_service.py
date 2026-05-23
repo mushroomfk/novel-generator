@@ -243,6 +243,57 @@ class ProjectServiceTestCase(unittest.TestCase):
     for wrong_name in ["林晚在", "苏青保", "苏青继", "苏青仍", "习生", "项目文", "关键词", "养老金", "封口费"]:
       self.assertNotIn(wrong_name, character_names)
 
+  def test_story_overview_reads_nested_model_character_json(self) -> None:
+    summary = self.create_demo_project("模型结构化人物")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      json.dumps(
+        {
+          "headline": "人物设定已经整理。",
+          "content": {
+            "characters": [
+              {
+                "name": "林晚",
+                "role": "创意总监",
+                "initial_state": "事业巅峰期被当众羞辱。",
+                "relationships": {"苏青": "导师，需要主动接触。"},
+                "events": ["公开羞辱：林晚被当众羞辱。"],
+                "locations": ["发布会现场"],
+                "props": ["证据账本"],
+                "skills": ["危机公关"],
+                "organizations": ["明成集团"],
+              },
+              {
+                "name": "陈小雨",
+                "role": "前实习生",
+                "initial_state": "掌握关键证据。",
+              },
+            ]
+          },
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    character_names = [item.name for item in detail.story_overview.characters]
+    self.assertEqual(character_names[:2], ["林晚", "陈小雨"])
+    lin_wan = next(item for item in detail.story_overview.characters if item.name == "林晚")
+    self.assertIn("创意总监", lin_wan.profile)
+    self.assertIn("事业巅峰期被当众羞辱", lin_wan.current_state)
+    self.assertTrue(any("苏青" in item for item in lin_wan.relationships))
+    self.assertIn("公开羞辱", lin_wan.events)
+    self.assertIn("发布会现场", lin_wan.locations)
+    self.assertIn("证据账本", lin_wan.props)
+    self.assertIn("危机公关", lin_wan.skills)
+    self.assertIn("明成集团", lin_wan.organizations)
+    self.assertIn("公开羞辱", [item.name for item in detail.story_overview.events])
+    self.assertIn("发布会现场", [item.name for item in detail.story_overview.locations])
+    self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
+    self.assertIn("明成集团", [item.name for item in detail.story_overview.organizations])
+
   def test_project_detail_includes_distillation_report_and_task_packs(self) -> None:
     summary = self.create_demo_project("蒸馏结构")
     project_dir = Path(summary.path)

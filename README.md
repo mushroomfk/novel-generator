@@ -160,7 +160,7 @@ cp .env.example .env
 - `ARK_API_KEY`
 - `OPENAI_API_KEY`
 
-Embedding 检索可单独配置：
+Embedding 检索默认跟随当前写作模型的服务商配置，也可以在设置里勾选“单独设置 Embedding”后使用独立模型、接口地址和 API Key。可用环境变量：
 
 - `NOVEL_EMBEDDING_API_KEY`
 - `DASHSCOPE_API_KEY`
