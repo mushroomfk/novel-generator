@@ -103,8 +103,8 @@ flowchart LR
 当前是公开预览版。
 
 - 已可本地运行前端、Python backend 和 Tauri 桌面壳
-- 已验证 macOS arm64 调试包和测试分发流程
-- Windows 安装包可通过 GitHub Actions 手动流程生成，仍需要 Windows 实机安装和卸载验收
+- 已验证 macOS arm64 调试包、测试分发流程和 Windows x64 CI 安装包构建
+- Windows 0.1.2 安装包已发布到 GitHub Release，仍需要 Windows 实机安装和卸载验收
 - 后端单测覆盖项目服务、生成服务、资料导入、许可证、技能流程和记忆系统
 - 浏览器层 UI smoke 覆盖建作品、写章节、Agent 计划执行、整书架构和技能检索主链路
 - 正式分发仍需要补充 Developer ID 签名、公证、安装包渠道和版本升级策略

@@ -18,6 +18,12 @@
 
 ## 2026-05-24
 
+### 0.1.2 Windows 测试包发布
+
+- 修改摘要：在 `main` 当前提交 `7051ada` 触发 GitHub Actions `Windows Desktop Release`，生成 Windows x64 NSIS 安装包和 Windows sidecar，并上传到 GitHub Release `v0.1.2`；本地整理 `release/test-release/windows/稿匣_0.1.2_测试包`，安装说明和反馈清单改为 Windows 内容。
+- 影响范围：GitHub Release 资产、Windows 测试包整理目录、README 项目状态和 Windows 打包说明；不改变应用代码、版本号、接口或数据结构。
+- 验证结果：GitHub Actions run `26353093355` 通过，包含 Windows backend 单测、前端生产构建、Windows sidecar 打包与健康检查、Tauri NSIS 安装包构建和 artifact 上传；本地 `SHA256SUMS.txt` 校验通过。Windows setup SHA256：`3dbb1e170036c1ff50ec7a02c592793d5ffa2f395fda760caf182e0472780cea`；Windows sidecar SHA256：`b7e871b5c62ab4a2aff00c10fc8d2c76a3e55a9219971eed90d5efd3b9a3f0aa`。Windows 实机安装、卸载和首次启动仍未人工验收。
+
 ### Agent 章节目标字数修正
 
 - 修改摘要：Agent 对话里普通“写第一章 / 生成第 N 章”请求，在作品架构齐全且用户没有指定短稿或具体字数时，会按作品目标字数和目标章节数计算本章目标容量；例如 200000 字 / 30 章会把单章目标设为约 6667 字，不再沿用 1800 字默认短目标。
