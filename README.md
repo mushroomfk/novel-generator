@@ -9,7 +9,7 @@
 
 `稿匣` 把作品文件夹、章节正文、设定资料、知识检索、模型生成、改稿技能和桌面打包流程放在同一个应用里。它适合需要长期维护世界观、人物线、章节上下文和参考资料的个人作者，也适合作为本地 AI 写作工具的二次开发底座。
 
-[Release](https://github.com/mushroomfk/novel-generator/releases/tag/v0.1.1) · [文档索引](./docs/README.md) · [更新记录](./CHANGELOG.md) · [许可](./LICENSE)
+[Release](https://github.com/mushroomfk/novel-generator/releases/tag/v0.1.2) · [文档索引](./docs/README.md) · [更新记录](./CHANGELOG.md) · [许可](./LICENSE)
 
 ## 桌面截图
 
@@ -52,7 +52,7 @@
 - 可审阅生成：模型输出进入计划、执行、预览、写回和本地历史，不只是一段聊天回复
 - 受监督逐章生产：章节写回默认经过正文生成、去 AI 改稿、一致性复查和章节核验，作者确认后再进入项目正文
 - 资料可检索：导入文本、文档、网页、PDF 后建立 SQLite / FTS5 索引，并支持 embedding 与 rerank
-- Agent 有轨迹：讨论、资料分析、章节写作、并行审校和整书架构共用执行时间线；技能库可查看自学习候选、确认草案、写作回归、模型审查、失败案例、技能版本、技能包和能力看板
+- Agent 有轨迹：讨论、资料分析、章节写作、队列化审校和整书架构共用执行时间线；技能库可查看自学习候选、确认草案、写作回归、模型审查、失败案例、技能版本、技能包和能力看板
 - 可二次开发：前端、Python backend、Tauri 壳层和回归脚本都在仓库内
 
 ## 适合场景
@@ -170,6 +170,19 @@ Embedding 检索默认跟随当前写作模型的服务商配置，也可以在�
 - `ARK_API_KEY`
 - `NOVEL_API_KEY`
 - `OPENAI_API_KEY`
+
+设置页的“模型运行调度”控制本机模型请求节奏。默认主模型并发为 1、检索并发为 1，后台模型任务只在前台空闲后执行；章节候选模式默认 `standard`，也可以切到 `fast` 或 `deep`。
+
+第二审查模型用于模型审查。模型版故事总览会优先使用第二审查模型；第二审查模型不可用时，改用当前写作模型。关系总览只读取模型版故事总览缓存；没有可用缓存时不再用本地规则猜人物、事件或地点。设置页可保存第二审查模型，也可以用环境变量覆盖：
+
+- `NOVEL_REVIEW_MODEL_API_KEY`
+- `NOVEL_REVIEW_MODEL_BASE_URL`
+- `NOVEL_REVIEW_MODEL_NAME`
+
+辅助任务后台巡检用于刷新知识库索引和模型版故事总览。默认开启，默认间隔 180 秒；当前台模型或检索任务忙时，后台巡检会延后到后续巡检。模型版故事总览没有生成 `.gaoxia/story_overview_model.json` 时，任务会记录为失败并等待重试。
+
+- `NOVEL_AUXILIARY_WORKER_ENABLED`
+- `NOVEL_AUXILIARY_WORKER_INTERVAL_SECONDS`
 
 联网考据优先使用阿里百炼联网搜索，已配置阿里百炼写作模型时会复用当前模型 Key；也可以用 `DASHSCOPE_API_KEY` 提供。博查 Web Search API 是备用搜索源：
 

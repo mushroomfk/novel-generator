@@ -43,6 +43,7 @@ from novel_backend.services.context_builder import (
   project_documents_map,
 )
 from novel_backend.services.chapter_auto_repair_service import auto_repair_chapter_after_review
+from novel_backend.services.config_service import load_config
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.generation_service import (
   _compact_text,
@@ -1002,6 +1003,7 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     style_query=payload.instruction,
     xp_name=payload.xp_preset,
   )
+  candidate_mode = load_config(settings).model_runtime.chapter_candidate_mode
   pipeline = _run_continuation_pipeline(
     settings,
     project_id=payload.project_id,
@@ -1014,7 +1016,7 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     scene_location=payload.scene_location,
     time_constraint=payload.time_constraint,
     task_name_prefix="chapter_generate",
-    candidate_count=3,
+    candidate_count=3 if candidate_mode == "deep" else 1,
     prefer_project_budget=True,
     complete_chapter=payload.target_words <= 0,
   )

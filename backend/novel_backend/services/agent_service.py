@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +41,7 @@ from novel_backend.models import (
   StoryDocumentPatch,
 )
 from novel_backend.services.context_builder import (
+  build_project_context_bundle,
   build_prompt_support,
   chapter_average_word_target,
   chapter_text_length,
@@ -65,10 +68,15 @@ from novel_backend.services.generation_service import (
 )
 from novel_backend.services.project_distillation_service import build_distillation_review_text, resolve_task_pack_kind
 from novel_backend.services.project_learning_service import build_learning_review_artifact
+from novel_backend.services.project_auxiliary_service import enqueue_project_auxiliary_tasks
 from novel_backend.services.project_service import (
   build_project_agent_thread_context,
+  clear_architecture_progress,
   get_project_detail,
+  load_architecture_progress,
   load_project_knowledge_material_contents,
+  save_architecture_progress,
+  save_story_document_incremental,
   summarize_chapter_review_status,
   update_chapter_content_with_review_status,
   update_story_documents,
@@ -292,13 +300,10 @@ def _chapter_generation_target_for_action(
   instruction: str,
 ) -> int:
   explicit_target = explicit_length_target(instruction)
+  explicit_length_requested = instruction_requests_explicit_length(instruction)
   if explicit_target > 0:
     requested_target = explicit_target
-  elif instruction_requests_full_chapter(instruction):
-    full_target = full_chapter_generation_target(runtime.detail, chapter)
-    if full_target > 0:
-      requested_target = full_target
-  elif runtime.architecture_ready and chapter_average_word_target(runtime.detail) >= 9_000 and not instruction_requests_explicit_length(instruction):
+  elif instruction_requests_full_chapter(instruction) or (runtime.architecture_ready and not explicit_length_requested):
     full_target = full_chapter_generation_target(runtime.detail, chapter)
     if full_target > 0:
       requested_target = full_target
@@ -306,7 +311,7 @@ def _chapter_generation_target_for_action(
     runtime.detail,
     chapter,
     requested_target=requested_target,
-    prefer_project_budget=False if runtime.architecture_ready and requested_target > 0 else not instruction_requests_explicit_length(instruction),
+    prefer_project_budget=False if runtime.architecture_ready and requested_target > 0 else not explicit_length_requested,
   )
 
 
@@ -1190,6 +1195,7 @@ def _build_action_from_plan_payload(
   payload: dict[str, object],
   instruction: str,
   request: AgentChatRequest,
+  future_chapter_id: str = "",
 ) -> tuple[AgentPlanAction | None, str | None]:
   kind = str(payload.get("kind") or "").strip()
   mode = str(payload.get("mode") or "").strip()
@@ -1229,6 +1235,12 @@ def _build_action_from_plan_payload(
       skill_ids=action_skill_ids,
     ), None
 
+  future_chapter = (
+    next((item for item in runtime.detail.chapters if item.id == future_chapter_id), None)
+    if future_chapter_id
+    else None
+  )
+
   if user_explicit_chapter and kind in {
     "chapter_generate",
     "chapter_workflow",
@@ -1254,7 +1266,7 @@ def _build_action_from_plan_payload(
       skill_ids=action_skill_ids,
     ), None
 
-  chapter = _resolve_target_chapter_from_plan(runtime, kind, payload)
+  chapter = future_chapter or _resolve_target_chapter_from_plan(runtime, kind, payload)
   if chapter is None:
     return None, "当前规划指向了一个不存在或不可处理的章节。"
   payload_label = "" if user_explicit_chapter else str(payload.get("label") or "").strip()
@@ -1327,7 +1339,7 @@ def _build_action_from_plan_payload(
     ), None
 
   rewrite_mode = mode if mode in {"finalize", "polish", "humanize"} else "polish"
-  if not chapter.exists or not chapter.content.strip():
+  if future_chapter is None and (not chapter.exists or not chapter.content.strip()):
     return None, "要修订的章节还没有正文，先生成正文，或者先手动写一版。"
   return AgentPlanAction(
     kind="rewrite_chapter",
@@ -1390,6 +1402,57 @@ def _longform_rewrite_action(action: AgentPlanAction) -> bool:
 
 def _longform_content_write_action(action: AgentPlanAction) -> bool:
   return _longform_generation_action(action) or _longform_rewrite_action(action)
+
+
+def _latest_planned_content_chapter_id(actions: list[AgentPlanAction]) -> str:
+  for action in reversed(actions):
+    if action.chapter_id and _longform_content_write_action(action):
+      return action.chapter_id
+  return ""
+
+
+def _future_chapter_id_for_followup_action(
+  runtime: RuntimeState,
+  instruction: str,
+  raw_action: dict[str, object],
+  actions: list[AgentPlanAction],
+) -> str:
+  kind = str(raw_action.get("kind") or "").strip()
+  mode = str(raw_action.get("mode") or "").strip()
+  if not _action_requires_existing_chapter(kind, mode):
+    return ""
+
+  pending_chapter_id = _latest_planned_content_chapter_id(actions)
+  if not pending_chapter_id:
+    return ""
+
+  pending_chapter = next((item for item in runtime.detail.chapters if item.id == pending_chapter_id), None)
+  if pending_chapter is None:
+    return ""
+
+  chapter_target = str(raw_action.get("chapter_target") or "auto").strip().lower()
+  if chapter_target == "last_written":
+    return pending_chapter_id
+  if chapter_target == "next" and runtime.next_chapter is not None and runtime.next_chapter.id == pending_chapter_id:
+    return pending_chapter_id
+  if chapter_target == "selected" and runtime.selected_chapter is not None and runtime.selected_chapter.id == pending_chapter_id:
+    return pending_chapter_id
+
+  raw_chapter_index = _int_from_value(raw_action.get("chapter_index"), 0)
+  raw_chapter_title = str(raw_action.get("chapter_title") or "").strip()
+  raw_chapter = _find_chapter(runtime, raw_chapter_index, raw_chapter_title)
+  if raw_chapter is not None:
+    return pending_chapter_id if raw_chapter.id == pending_chapter_id else ""
+
+  user_chapter_index = _chapter_number_from_text_for_action(instruction, kind, mode)
+  user_chapter_title = _chapter_title_from_text(instruction)
+  user_chapter = _find_chapter(runtime, user_chapter_index, user_chapter_title)
+  if user_chapter is not None:
+    return pending_chapter_id if user_chapter.id == pending_chapter_id else ""
+
+  if chapter_target in {"", "auto"}:
+    return pending_chapter_id
+  return ""
 
 
 def _longform_supervision_enabled(action: AgentPlanAction) -> bool:
@@ -1545,7 +1608,14 @@ def _plan_from_payload(
   for raw_action in raw_actions[:8]:
     if not isinstance(raw_action, dict):
       continue
-    action, error_message = _build_action_from_plan_payload(runtime, raw_action, instruction, request)
+    future_chapter_id = _future_chapter_id_for_followup_action(runtime, instruction, raw_action, actions)
+    action, error_message = _build_action_from_plan_payload(
+      runtime,
+      raw_action,
+      instruction,
+      request,
+      future_chapter_id=future_chapter_id,
+    )
     if error_message:
       return None, error_message
     if action is not None:
@@ -2174,6 +2244,89 @@ def _architecture_guidance(runtime: RuntimeState, instruction: str, messages: li
   return "\n\n".join(parts).strip()
 
 
+def _architecture_resume_signature(runtime: RuntimeState, instruction: str, guidance: str) -> str:
+  payload = {
+    "project_id": runtime.detail.id,
+    "target_chapters": runtime.detail.target_chapters,
+    "instruction": instruction.strip(),
+    "guidance": guidance.strip(),
+    "steps": [step_key for step_key, _label in _ARCHITECTURE_STEPS],
+  }
+  return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _architecture_completed_steps_from_progress(progress: dict[str, object] | None, signature: str, workspace: ArchitectureWorkspace) -> list[str]:
+  if not isinstance(progress, dict) or progress.get("instruction_signature") != signature:
+    return []
+  raw_steps = progress.get("completed_steps")
+  if not isinstance(raw_steps, list):
+    return []
+  valid_steps = {step_key for step_key, _label in _ARCHITECTURE_STEPS}
+  completed_steps: list[str] = []
+  for item in raw_steps:
+    step_key = str(item or "")
+    if step_key in valid_steps and getattr(workspace, step_key, "").strip():
+      completed_steps.append(step_key)
+  return completed_steps
+
+
+def _save_architecture_running_progress(
+  settings: Settings,
+  project_id: str,
+  *,
+  task_id: str,
+  signature: str,
+  completed_steps: list[str],
+  failed_step: str = "",
+  error: str = "",
+) -> None:
+  save_architecture_progress(
+    settings,
+    project_id,
+    {
+      "task_id": task_id,
+      "instruction_signature": signature,
+      "status": "failed" if failed_step else "running",
+      "completed_steps": completed_steps,
+      "failed_step": failed_step,
+      "error": error,
+    },
+  )
+
+
+def _architecture_task_knowledge_query(workspace: ArchitectureWorkspace, guidance: str) -> str:
+  parts = [
+    " ".join(label for _key, label in _ARCHITECTURE_STEPS),
+    guidance.strip(),
+  ]
+  for step_key, _step_label in _ARCHITECTURE_STEPS:
+    value = getattr(workspace, step_key, "")
+    if isinstance(value, str) and value.strip():
+      parts.append(value.strip()[:1200])
+  return "\n\n".join(item for item in parts if item).strip()[:8000]
+
+
+def _build_architecture_task_context_snapshot(
+  settings: Settings,
+  runtime: RuntimeState,
+  workspace: ArchitectureWorkspace,
+  guidance: str,
+):
+  return build_project_context_bundle(
+    settings,
+    runtime.detail.id,
+    include_blueprint=True,
+    include_character_state=True,
+    knowledge_query=_architecture_task_knowledge_query(workspace, guidance),
+    task_pack_kind="architecture",
+    task_instruction=guidance,
+    override_documents={
+      step_key: getattr(workspace, step_key, "")
+      for step_key, _step_label in _ARCHITECTURE_STEPS
+    },
+  )
+
+
 def _generate_full_architecture(
   settings: Settings,
   runtime: RuntimeState,
@@ -2186,32 +2339,80 @@ def _generate_full_architecture(
     for key, _label in _ARCHITECTURE_STEPS
   })
   guidance = _architecture_guidance(runtime, instruction, messages)
-
-  for step_key, _step_label in _ARCHITECTURE_STEPS:
-    result = _generate_architecture_step(
-      settings,
-      ArchitectureStepRequest(
-        project_id=runtime.detail.id,
-        step=step_key,
-        mode="initial",
-        guidance=guidance,
-        workspace=workspace,
-      ),
-      task_id,
-    )
-    setattr(workspace, step_key, result.content)
-
-  update_story_documents(
+  signature = _architecture_resume_signature(runtime, instruction, guidance)
+  completed_steps = _architecture_completed_steps_from_progress(
+    load_architecture_progress(settings, runtime.detail.id),
+    signature,
+    workspace,
+  )
+  _save_architecture_running_progress(
     settings,
     runtime.detail.id,
-    StoryDocumentBatchUpdateRequest(
-      documents=[
-        StoryDocumentPatch(key=step_key, content=getattr(workspace, step_key))
-        for step_key, _step_label in _ARCHITECTURE_STEPS
-      ]
-    ),
+    task_id=task_id,
+    signature=signature,
+    completed_steps=completed_steps,
   )
-  return get_project_detail(settings, runtime.detail.id), workspace
+  context_snapshot = _build_architecture_task_context_snapshot(settings, runtime, workspace, guidance)
+
+  for step_key, _step_label in _ARCHITECTURE_STEPS:
+    if step_key in completed_steps:
+      continue
+    try:
+      result = _generate_architecture_step(
+        settings,
+        ArchitectureStepRequest(
+          project_id=runtime.detail.id,
+          step=step_key,
+          mode="initial",
+          guidance=guidance,
+          workspace=workspace,
+        ),
+        task_id,
+        context_snapshot,
+      )
+      setattr(workspace, step_key, result.content)
+      save_story_document_incremental(settings, runtime.detail.id, step_key, result.content)
+      completed_steps.append(step_key)
+      _save_architecture_running_progress(
+        settings,
+        runtime.detail.id,
+        task_id=task_id,
+        signature=signature,
+        completed_steps=completed_steps,
+      )
+      enqueue_project_auxiliary_tasks(
+        settings,
+        runtime.detail.id,
+        tasks=["knowledge_index", "story_overview_model", "system_memory"],
+        reason=f"architecture_step:{step_key}",
+      )
+    except Exception as error:
+      _save_architecture_running_progress(
+        settings,
+        runtime.detail.id,
+        task_id=task_id,
+        signature=signature,
+        completed_steps=completed_steps,
+        failed_step=step_key,
+        error=str(error),
+      )
+      if completed_steps:
+        enqueue_project_auxiliary_tasks(
+          settings,
+          runtime.detail.id,
+          tasks=["knowledge_index", "story_overview_model", "system_memory"],
+          reason=f"architecture_failed:{step_key}",
+        )
+      raise
+
+  clear_architecture_progress(settings, runtime.detail.id)
+  enqueue_project_auxiliary_tasks(
+    settings,
+    runtime.detail.id,
+    tasks=["knowledge_index", "story_overview_model", "system_memory"],
+    reason="architecture_completed",
+  )
+  return get_project_detail(settings, runtime.detail.id, allow_model_overview=False), workspace
 
 
 def _execute_chapter_workflow(

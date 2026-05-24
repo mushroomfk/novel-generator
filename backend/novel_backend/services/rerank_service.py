@@ -6,6 +6,7 @@ import time
 from novel_backend.config import Settings
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json
 
 
@@ -67,6 +68,7 @@ def rerank_documents(
 
   config = load_config(settings).model
   started = time.perf_counter()
+  runtime_task = None
   try:
     api_key = _resolve_api_key(settings)
     endpoint = _rerank_endpoint(config.base_url)
@@ -77,7 +79,9 @@ def rerank_documents(
     }
     if top_n is not None:
       payload["top_n"] = max(1, min(top_n, len(cleaned_documents)))
-    response_payload = _request_rerank(endpoint, api_key, payload)
+    with model_runtime_slot(settings, lane="retrieval", task_name=task_name) as task:
+      runtime_task = task
+      response_payload = _request_rerank(endpoint, api_key, payload)
     items = response_payload.get("results")
     if not isinstance(items, list):
       output = response_payload.get("output")
@@ -102,9 +106,17 @@ def rerank_documents(
         }
       )
     elapsed = round(time.perf_counter() - started, 3)
-    append_app_log(settings, f"{task_name} completed in {elapsed:.3f}s for {len(cleaned_documents)} docs")
+    append_app_log(
+      settings,
+      (
+        f"{task_name} completed in {elapsed:.3f}s for {len(cleaned_documents)} docs "
+        f"(queue_wait={runtime_task.queue_wait_seconds if runtime_task is not None else 0.0:.3f}s)"
+      ),
+    )
     return ranked
   except Exception as error:
     elapsed = round(time.perf_counter() - started, 3)
+    if runtime_task is not None:
+      mark_model_runtime_cooldown(settings, "retrieval", str(error))
     append_app_log(settings, f"{task_name} skipped in {elapsed:.3f}s: {error}", level="WARNING")
     return []

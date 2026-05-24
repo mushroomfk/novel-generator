@@ -821,7 +821,7 @@ async function importKnowledge() {
           v-if="characters.length === 0"
           class="empty-card"
         >
-          还没有可展示的人物，先写章节或补人物设定文件。
+          模型总览还没有生成，生成完成后这里会显示人物关系。
         </div>
       </aside>
 

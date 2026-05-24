@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from novel_backend.config import Settings
 from novel_backend.models import (
@@ -91,6 +92,19 @@ class ContextBuilderTestCase(unittest.TestCase):
     self.assertGreaterEqual(len(bundle.knowledge_hits), 1)
     self.assertIsNotNone(bundle.budget_report)
     self.assertEqual(bundle.budget_report.trimmed_blocks, [])
+
+  def test_architecture_context_uses_lightweight_knowledge_search(self) -> None:
+    with patch("novel_backend.services.context_builder.search_project_knowledge", return_value=[]) as mocked_search:
+      build_project_context_bundle(
+        self.settings,
+        self.project.id,
+        knowledge_query="铜钥匙",
+        task_pack_kind="architecture",
+      )
+
+    self.assertEqual(mocked_search.call_count, 1)
+    self.assertFalse(mocked_search.call_args.kwargs["ensure_current"])
+    self.assertFalse(mocked_search.call_args.kwargs["include_semantic"])
 
   def test_explicit_length_target_accepts_common_chinese_word_counts(self) -> None:
     cases = {

@@ -5,7 +5,6 @@ import json
 import math
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from uuid import uuid4
 
 from novel_backend.config import Settings
@@ -23,6 +22,7 @@ from novel_backend.models import (
 from novel_backend.services.config_service import load_config
 from novel_backend.services.continuity_guard_service import ContinuityGuardContext, build_continuity_guard_context
 from novel_backend.services.context_builder import (
+  ProjectContextBundle,
   build_chapter_length_guidance,
   build_project_context_bundle,
   build_prompt_support,
@@ -38,6 +38,7 @@ from novel_backend.services.context_builder import (
 )
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.project_service import get_project_detail, search_project_knowledge_evidence
@@ -93,9 +94,9 @@ _ARCHITECTURE_STEP_REQUIREMENTS = {
   "core_seed": "只输出故事切口、核心矛盾和推进引擎，不要写成长简介。",
   "character_design": "只输出主要人物关系、动机和角色分工，不要重复世界设定。",
   "world_building": "只输出世界规则、环境压力和叙事氛围，不要把情节概述写进来。",
-  "plot_structure": "只输出整本推进结构、阶段目标和关键转折，不要写人物小传。",
-  "character_state": "只输出当前阶段人物状态、关系变化和后续隐患。",
-  "blueprint": "输出可直接写入项目文件的章节蓝图，按章节列出标题、目标和钩子。",
+  "plot_structure": "只输出整本推进结构、阶段目标和关键转折，不要写人物小传。必须沿用人物设定里已经确定的核心人物名单；如需新增配角，只能作为单次情节功能角色，不要替换核心人物或改名。",
+  "character_state": "只输出当前阶段人物状态、关系变化和后续隐患。必须沿用人物设定里的姓名、身份和关系，不要另造一套联盟成员；如发现人物设定互相冲突，在 summary 或 checklist 指出冲突。",
+  "blueprint": "输出可直接写入项目文件的章节蓝图，按章节列出标题、目标和钩子。必须沿用人物设定和人物状态里的核心人物名单，不要在蓝图里把未设定人物改成核心成员。",
   "global_summary": "输出滚动摘要，浓缩已定设定和目前推进状态，长度控制在 120 到 220 字。",
 }
 
@@ -493,8 +494,11 @@ def _invoke_model(
     f"[{item.get('role', 'user')}] {item.get('content', '')}"
     for item in messages
   ).strip()
+  runtime_task = None
   try:
-    response_payload = _request_chat_completion(endpoint, api_key, chat_payload)
+    with model_runtime_slot(settings, lane="chat", task_name=task_name) as task:
+      runtime_task = task
+      response_payload = _request_chat_completion(endpoint, api_key, chat_payload)
     content = _extract_message_content(response_payload)
     elapsed = round(time.perf_counter() - started, 3)
     append_prompt_history(
@@ -506,6 +510,10 @@ def _invoke_model(
         "response": content,
         "status": "completed",
         "elapsed": elapsed,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
     append_app_log(settings, f"{task_name} completed in {elapsed:.3f}s")
@@ -513,6 +521,8 @@ def _invoke_model(
   except Exception as error:
     elapsed = round(time.perf_counter() - started, 3)
     classified_error = classify_model_error(error)
+    if classified_error.retryable:
+      mark_model_runtime_cooldown(settings, "chat", classified_error.title)
     append_prompt_history(
       settings,
       {
@@ -527,6 +537,10 @@ def _invoke_model(
         "error_title": classified_error.title,
         "error_user_action": classified_error.user_action,
         "error_retryable": classified_error.retryable,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
     append_app_log(
@@ -650,48 +664,71 @@ def _architecture_document_map(project_detail, workspace: ArchitectureWorkspace)
   return project_documents_map(project_detail, overrides=overrides)
 
 
-def _architecture_step_context(settings: Settings, payload: ArchitectureStepRequest) -> tuple[object, dict[str, str], int, str]:
-  project_detail = build_project_context_bundle(settings, payload.project_id).project_detail
-  documents = _architecture_document_map(project_detail, payload.workspace)
+def _architecture_workspace_snapshot_text(documents: dict[str, str]) -> str:
+  lines = []
+  for key, label in _ARCHITECTURE_STEP_LABELS.items():
+    lines.append(f"{label}：{compact_text(documents.get(key, ''), 520) or '无'}")
+  return "\n".join(lines)
+
+
+def _architecture_step_context(
+  settings: Settings,
+  payload: ArchitectureStepRequest,
+  context_snapshot: ProjectContextBundle | None = None,
+) -> tuple[object, dict[str, str], int, str]:
+  if context_snapshot is None:
+    project_detail = get_project_detail(settings, payload.project_id, allow_model_overview=False)
+    documents = _architecture_document_map(project_detail, payload.workspace)
+    knowledge_query = " ".join(
+      item for item in [
+        _ARCHITECTURE_STEP_LABELS.get(payload.step, ""),
+        payload.guidance,
+        documents.get(payload.step, ""),
+      ]
+      if item.strip()
+    )
+    bundle = build_project_context_bundle(
+      settings,
+      payload.project_id,
+      include_blueprint=True,
+      include_character_state=True,
+      knowledge_query=knowledge_query,
+      task_pack_kind="architecture",
+      task_instruction=payload.guidance,
+      override_documents=documents,
+    )
+  else:
+    bundle = context_snapshot
+    project_detail = bundle.project_detail
+    documents = _architecture_document_map(project_detail, payload.workspace)
+
   target_chapters = project_detail.target_chapters + payload.new_chapters if payload.mode == "continue" else project_detail.target_chapters
-  knowledge_query = " ".join(
-    item for item in [
-      _ARCHITECTURE_STEP_LABELS.get(payload.step, ""),
-      payload.guidance,
-      documents.get(payload.step, ""),
-    ]
-    if item.strip()
-  )
-  bundle = build_project_context_bundle(
-    settings,
-    payload.project_id,
-    include_blueprint=True,
-    include_character_state=True,
-    knowledge_query=knowledge_query,
-    task_pack_kind="architecture",
-    task_instruction=payload.guidance,
-    override_documents=documents,
-  )
   knowledge_text = "\n".join(
     f"- {item.section}（{item.match_type}）：{item.preview}"
     for item in bundle.knowledge_hits
   ) or "无"
   dream_text = build_project_dream_prompt_block(project_detail)
   dream_block = f"{dream_text}\n" if dream_text else ""
+  workspace_text = _architecture_workspace_snapshot_text(documents)
   context_text = (
     f"当前模式：{'续写扩展' if payload.mode == 'continue' else '初始架构'}\n"
     f"当前章节数：{project_detail.target_chapters}\n"
     f"目标章节数：{target_chapters}\n"
     f"当前步骤：{_ARCHITECTURE_STEP_LABELS[payload.step]}\n"
     f"{bundle.context_text}\n"
+    f"本次任务架构工作区（优先参考这里的步骤间最新内容）：\n{workspace_text}\n"
     f"{dream_block}"
     f"相关检索：\n{knowledge_text}"
   )
   return project_detail, documents, target_chapters, context_text
 
 
-def _build_architecture_step_messages(settings: Settings, payload: ArchitectureStepRequest) -> list[dict[str, str]]:
-  project_detail, documents, target_chapters, context_text = _architecture_step_context(settings, payload)
+def _build_architecture_step_messages(
+  settings: Settings,
+  payload: ArchitectureStepRequest,
+  context_snapshot: ProjectContextBundle | None = None,
+) -> list[dict[str, str]]:
+  project_detail, documents, target_chapters, context_text = _architecture_step_context(settings, payload, context_snapshot)
   current_content = documents.get(payload.step, "")
   messages = [{"role": "system", "content": _ARCHITECTURE_STEP_SYSTEM_PROMPT}]
   support = build_prompt_support(settings, task_key="architecture")
@@ -753,15 +790,20 @@ def _parse_architecture_step_payload(text: str, payload: ArchitectureStepRequest
   )
 
 
-def _generate_architecture_step(settings: Settings, payload: ArchitectureStepRequest, task_id: str) -> ArchitectureStepResult:
+def _generate_architecture_step(
+  settings: Settings,
+  payload: ArchitectureStepRequest,
+  task_id: str,
+  context_snapshot: ProjectContextBundle | None = None,
+) -> ArchitectureStepResult:
   content = _invoke_model(
     settings,
-    _build_architecture_step_messages(settings, payload),
+    _build_architecture_step_messages(settings, payload, context_snapshot),
     task_name=f"architecture_step:{payload.step}:{payload.mode}",
   )
   result = _parse_architecture_step_payload(content, payload, task_id)
   if payload.mode == "continue":
-    project_detail = get_project_detail(settings, payload.project_id)
+    project_detail = context_snapshot.project_detail if context_snapshot is not None else get_project_detail(settings, payload.project_id)
     return result.model_copy(update={"target_chapters": project_detail.target_chapters + payload.new_chapters})
   return result
 
@@ -1466,11 +1508,12 @@ def _judge_continuation(
     ("人物口气", _CONTINUATION_VOICE_JUDGE_SYSTEM_PROMPT, "continuation_judge:voice"),
     ("可读性", _CONTINUATION_READER_JUDGE_SYSTEM_PROMPT, "continuation_judge:reader"),
   ]
-  dimension_results: list[dict[str, object] | None] = [None] * len(dimension_specs)
-  with ThreadPoolExecutor(max_workers=len(dimension_specs)) as executor:
-    future_map = {
-      executor.submit(
-        _judge_continuation_dimension,
+  if load_config(settings).model_runtime.chapter_candidate_mode == "fast":
+    dimension_specs = dimension_specs[:1]
+  dimension_results: list[dict[str, object]] = []
+  for dimension, system_prompt, task_name in dimension_specs:
+    dimension_results.append(
+      _judge_continuation_dimension(
         settings,
         system_prompt=system_prompt,
         dimension=dimension,
@@ -1480,13 +1523,10 @@ def _judge_continuation(
         canon=canon,
         scene_result=scene_result,
         content=content,
-      ): index
-      for index, (dimension, system_prompt, task_name) in enumerate(dimension_specs)
-    }
-    for future in as_completed(future_map):
-      dimension_results[future_map[future]] = future.result()
+      )
+    )
 
-  ordered_dimension_results = [item for item in dimension_results if item is not None]
+  ordered_dimension_results = dimension_results
 
   summaries: list[str] = []
   issues: list[dict[str, str]] = []
@@ -1553,8 +1593,12 @@ def _generate_continuation_candidates(
   task_name_prefix: str,
   candidate_count: int | None = None,
 ) -> list[dict[str, object]]:
-  variants = _CONTINUATION_CANDIDATE_VARIANTS[: max(1, candidate_count or len(_CONTINUATION_CANDIDATE_VARIANTS))]
-  candidates: list[dict[str, object] | None] = [None] * len(variants)
+  runtime_mode = load_config(settings).model_runtime.chapter_candidate_mode
+  resolved_candidate_count = max(1, candidate_count or len(_CONTINUATION_CANDIDATE_VARIANTS))
+  if runtime_mode in {"fast", "standard"}:
+    resolved_candidate_count = 1
+  variants = _CONTINUATION_CANDIDATE_VARIANTS[:resolved_candidate_count]
+  candidates: list[dict[str, object]] = []
 
   def build_candidate(index: int, variant: dict[str, object]) -> dict[str, object]:
     write_messages = _continuation_write_messages(
@@ -1595,14 +1639,9 @@ def _generate_continuation_candidates(
       "judge": judge,
     }
 
-  with ThreadPoolExecutor(max_workers=len(variants)) as executor:
-    future_map = {
-      executor.submit(build_candidate, index, variant): index - 1
-      for index, variant in enumerate(variants, start=1)
-    }
-    for future in as_completed(future_map):
-      candidates[future_map[future]] = future.result()
-  return [item for item in candidates if item is not None]
+  for index, variant in enumerate(variants, start=1):
+    candidates.append(build_candidate(index, variant))
+  return candidates
 
 
 def _choose_best_continuation_candidate(candidates: list[dict[str, object]]) -> dict[str, object]:
@@ -2063,7 +2102,7 @@ def _run_continuation_pipeline(
     summary_parts = [
       str(canon.get("summary") or "").strip(),
       length_guidance,
-      f"已并行生成 {len(candidates)} 个候选，并由承接事实、人物口气、可读性三类审校择优。",
+      f"已生成 {len(candidates)} 个候选，并由承接事实、人物口气、可读性三类审校择优。",
       str(judge.get("summary") or "").strip(),
       "候选审校后已修订一次。" if repair_applied else "",
     ]

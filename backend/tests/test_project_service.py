@@ -37,6 +37,7 @@ from novel_backend.models import (
   ProjectMemoryEntryInput,
   ProjectMemoryUpdateRequest,
   ProjectRenameRequest,
+  ReviewModelConfig,
   SnapshotCreateRequest,
   StyleSaveRequest,
   StoryDocumentBatchUpdateRequest,
@@ -64,6 +65,7 @@ from novel_backend.services.project_service import (
   save_project_agent_threads,
   search_project_knowledge,
   refresh_chapter_review,
+  refresh_project_model_story_overview,
   update_project_memory,
   update_chapter_content,
   update_chapter_content_with_review_status,
@@ -98,8 +100,8 @@ class ProjectServiceTestCase(unittest.TestCase):
     chapter_path.parent.mkdir(parents=True, exist_ok=True)
     chapter_path.write_text(content, encoding="utf-8")
 
-  def test_story_overview_normalizes_entities_and_links_single_character(self) -> None:
-    summary = self.create_demo_project("抽取测试")
+  def test_story_overview_without_model_cache_does_not_extract_graph(self) -> None:
+    summary = self.create_demo_project("无模型总览")
     project_dir = Path(summary.path)
     (project_dir / "character_design.txt").write_text(
       "林追：港口里最会追线索的人，擅长开锁，习惯在黑夜里行动。\n",
@@ -108,200 +110,33 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.write_chapter(
       summary.path,
       1,
-      "# 第一章 雨夜靠港\n林追在旧码头仓库用开锁技巧打开铁门，找到一把铜钥匙，随后闯进白石商会，并避开灯塔议会的巡逻。\n",
+      "# 第一章 雨夜靠港\n林追在旧码头仓库用开锁技巧打开铁门，找到一把铜钥匙，随后闯进白石商会。\n",
     )
 
     detail = get_project_detail(self.settings, summary.id)
 
-    character_names = [item.name for item in detail.story_overview.characters]
-    location_names = [item.name for item in detail.story_overview.locations]
-    organization_names = [item.name for item in detail.story_overview.organizations]
-    skill_names = [item.name for item in detail.story_overview.skills]
-
-    self.assertIn("林追", character_names)
-    self.assertIn("旧码头仓库", location_names)
-    self.assertNotIn("林追在旧码头仓库", location_names)
-    self.assertIn("白石商会", organization_names)
-    self.assertIn("灯塔议会", organization_names)
-    self.assertNotIn("随后闯进白石商会", organization_names)
-    self.assertIn("追线索", skill_names)
-    self.assertIn("开锁", skill_names)
-
-    active_character = next(item for item in detail.story_overview.characters if item.name == "林追")
-    self.assertEqual(len(active_character.timeline), 2)
-    self.assertIn("旧码头仓库", active_character.locations)
-    self.assertIn("白石商会", active_character.organizations)
-    self.assertIn("追线索", active_character.skills)
-    self.assertIn("开锁", active_character.skills)
-    self.assertIn("开锁", active_character.timeline[-1].skills)
-
-  def test_story_overview_filters_architecture_terms_from_character_names(self) -> None:
-    summary = self.create_demo_project("结构化人物")
-    project_dir = Path(summary.path)
-    (project_dir / "core_seed.txt").write_text(
-      "方鸿渐试图在高校谋职却因历史问题屡遭审查，孙柔嘉选择主动配合，赵辛楣归国后陷入理想与现实之间。",
-      encoding="utf-8",
-    )
-    (project_dir / "character_design.txt").write_text(
-      json.dumps(
-        {
-          "headline": "确立四位核心人物，严格承接原著结尾的人物状态与性格逻辑。",
-          "summary": (
-            "本设定严格延续终章方鸿渐与孙柔嘉婚姻濒临破裂、赵辛楣远赴海外的结局。"
-            "新增李慕白的激进源于时代机制而非个人偏执，后续制造站队危机。"
-          ),
-          "content": [
-            {"name": "方鸿渐", "身份": "旧式知识分子", "核心动机": "保全尊严与生存"},
-            {"name": "孙柔嘉", "身份": "方鸿渐之妻", "核心动机": "换取社会身份与安全感"},
-            {"name": "赵辛楣", "身份": "归国工程师", "核心动机": "践行建设理想"},
-            {"name": "李慕白", "身份": "历史系学生", "核心动机": "证明自身立场"},
-          ],
-          "checklist": [
-            "赵辛楣归国动机须与后期对政局的失望形成反差",
-            "所有互动都要保留语言张力",
-          ],
-        },
-        ensure_ascii=False,
-      ),
-      encoding="utf-8",
-    )
-    (project_dir / "character_state.txt").write_text(
-      json.dumps(
-        {
-          "summary": "方鸿渐与孙柔嘉困于无爱婚姻，李慕白的激进源于时代机制。",
-          "content": {
-            "方鸿渐": {"当前状态": "暂居孙柔嘉娘家阁楼，靠代写公文维生。"},
-            "孙柔嘉": {"当前状态": "积极参加夜校政治学习，争取进步家属证明。"},
-            "赵辛楣": {"当前状态": "负责高校课程改革方案，白天起草文件。"},
-            "李慕白": {"当前状态": "学生督导组成员，负责教师思想汇报会。"},
-          },
-        },
-        ensure_ascii=False,
-      ),
-      encoding="utf-8",
-    )
-    (project_dir / "plot_structure.txt").write_text(
-      "方鸿渐因历史问题不清位列名单；赵辛楣签名后呕吐不止；全篇三幕围绕思想围城推进。",
-      encoding="utf-8",
-    )
-    (project_dir / "blueprint.txt").write_text(
-      json.dumps(
-        {
-          "summary": "每章钩子均植根于人物性格与体制张力，避免简化为个人恩怨。",
-          "content": [
-            {"chapter": 10, "title": "唐晓芙的回音", "goal": "唐晓芙从西南来信，劝方鸿渐放下过去。"},
-            {"chapter": 11, "title": "赵辛楣的妥协", "hook": "赵辛楣在签名后呕吐不止。"},
-          ],
-        },
-        ensure_ascii=False,
-      ),
-      encoding="utf-8",
-    )
-
-    detail = get_project_detail(self.settings, summary.id)
-
-    character_names = [item.name for item in detail.story_overview.characters]
-    self.assertEqual(character_names, ["方鸿渐", "孙柔嘉", "赵辛楣", "李慕白", "唐晓芙"])
-
-    for wrong_name in [
-      "严格承",
-      "危机",
-      "史问题",
-      "终章方",
-      "于时代",
-      "国动机",
-      "后呕吐",
-      "全篇三",
-      "章钩子",
-      "主角",
-      "父亲",
-      "老板",
-    ]:
-      self.assertNotIn(wrong_name, character_names)
-
-    fang = next(item for item in detail.story_overview.characters if item.name == "方鸿渐")
-    self.assertIn("旧式知识分子", fang.profile)
-    self.assertIn("阁楼", fang.current_state)
-
-  def test_story_overview_filters_word_fragments_from_discovered_character_names(self) -> None:
-    summary = self.create_demo_project("边界识别")
-    project_dir = Path(summary.path)
-    (project_dir / "character_design.txt").write_text(
-      (
-        "林晚在事业巅峰期被当众羞辱，导师苏青保持观望。陈小雨曾是其实习生。\n"
-        "林晚在系统性压迫下拒绝封口费，导师苏青继续观察。陈小雨曾经提醒林晚。\n"
-        "林晚对导师苏青仍有戒备，项目文档关键词包含养老金。项目文档关键词包含养老金。"
-      ),
-      encoding="utf-8",
-    )
-
-    detail = get_project_detail(self.settings, summary.id)
-
-    character_names = [item.name for item in detail.story_overview.characters]
-    self.assertIn("林晚", character_names)
-    self.assertIn("苏青", character_names)
-    self.assertIn("陈小雨", character_names)
-    for wrong_name in ["林晚在", "苏青保", "苏青继", "苏青仍", "习生", "项目文", "关键词", "养老金", "封口费"]:
-      self.assertNotIn(wrong_name, character_names)
-
-  def test_story_overview_reads_nested_model_character_json(self) -> None:
-    summary = self.create_demo_project("模型结构化人物")
-    project_dir = Path(summary.path)
-    (project_dir / "character_design.txt").write_text(
-      json.dumps(
-        {
-          "headline": "人物设定已经整理。",
-          "content": {
-            "characters": [
-              {
-                "name": "林晚",
-                "role": "创意总监",
-                "initial_state": "事业巅峰期被当众羞辱。",
-                "relationships": {"苏青": "导师，需要主动接触。"},
-                "events": ["公开羞辱：林晚被当众羞辱。"],
-                "locations": ["发布会现场"],
-                "props": ["证据账本"],
-                "skills": ["危机公关"],
-                "organizations": ["明成集团"],
-              },
-              {
-                "name": "陈小雨",
-                "role": "前实习生",
-                "initial_state": "掌握关键证据。",
-              },
-            ]
-          },
-        },
-        ensure_ascii=False,
-      ),
-      encoding="utf-8",
-    )
-
-    detail = get_project_detail(self.settings, summary.id)
-
-    character_names = [item.name for item in detail.story_overview.characters]
-    self.assertEqual(character_names[:2], ["林晚", "陈小雨"])
-    lin_wan = next(item for item in detail.story_overview.characters if item.name == "林晚")
-    self.assertIn("创意总监", lin_wan.profile)
-    self.assertIn("事业巅峰期被当众羞辱", lin_wan.current_state)
-    self.assertTrue(any("苏青" in item for item in lin_wan.relationships))
-    self.assertIn("公开羞辱", lin_wan.events)
-    self.assertIn("发布会现场", lin_wan.locations)
-    self.assertIn("证据账本", lin_wan.props)
-    self.assertIn("危机公关", lin_wan.skills)
-    self.assertIn("明成集团", lin_wan.organizations)
-    self.assertIn("公开羞辱", [item.name for item in detail.story_overview.events])
-    self.assertIn("发布会现场", [item.name for item in detail.story_overview.locations])
-    self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
-    self.assertIn("明成集团", [item.name for item in detail.story_overview.organizations])
+    documents = {item.key: item.content for item in detail.story_overview.documents}
+    self.assertIn("林追", documents["character_design"])
+    self.assertEqual(detail.story_overview.characters, [])
+    self.assertEqual(detail.story_overview.events, [])
+    self.assertEqual(detail.story_overview.locations, [])
+    self.assertEqual(detail.story_overview.props, [])
+    self.assertEqual(detail.story_overview.skills, [])
+    self.assertEqual(detail.story_overview.scenes, [])
+    self.assertEqual(detail.story_overview.organizations, [])
 
   def test_story_overview_uses_validated_model_cache_for_all_sections(self) -> None:
     save_config(
       self.settings,
-      ModelConfig(
-        api_key="real-key",
-        base_url="https://model.local/v1",
-        model_name="overview-model",
+      AppConfigUpdateRequest(
+        model=ModelConfig(),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          api_key="real-key",
+          base_url="https://model.local/v1",
+          model_name="overview-model",
+          max_tokens=4096,
+        ),
       ),
     )
     summary = self.create_demo_project("模型总览")
@@ -361,7 +196,7 @@ class ProjectServiceTestCase(unittest.TestCase):
       "novel_backend.services.project_service.request_json_with_retries",
       return_value={"choices": [{"message": {"content": model_content}}]},
     ) as mocked_request:
-      detail = get_project_detail(self.settings, summary.id)
+      detail = get_project_detail(self.settings, summary.id, allow_model_overview=True)
 
     self.assertEqual(mocked_request.call_count, 1)
     character_names = [item.name for item in detail.story_overview.characters]
@@ -383,13 +218,174 @@ class ProjectServiceTestCase(unittest.TestCase):
       cached_detail = get_project_detail(self.settings, summary.id)
     self.assertIn("林晚", [item.name for item in cached_detail.story_overview.characters])
 
+    replacement_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "陈小雨",
+            "current_state": "掌握证据账本。",
+            "evidence": ["陈小雨手里"],
+          }
+        ],
+        "events": [],
+        "locations": [],
+        "props": [{"name": "证据账本", "related_characters": ["陈小雨"], "evidence": ["证据账本落在陈小雨手里"]}],
+        "skills": [],
+        "scenes": [],
+        "organizations": [],
+      },
+      ensure_ascii=False,
+    )
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": replacement_content}}]},
+    ) as mocked_refresh:
+      refreshed_detail = refresh_project_model_story_overview(self.settings, summary.id, force=True)
+    self.assertEqual(mocked_refresh.call_count, 1)
+    refreshed_names = [item.name for item in refreshed_detail.story_overview.characters]
+    self.assertIn("陈小雨", refreshed_names)
+
+  def test_story_overview_uses_primary_model_when_review_model_disabled(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(
+          api_key="real-key",
+          base_url="https://primary.local/v1",
+          model_name="primary-overview-model",
+          max_tokens=4096,
+        ),
+        review_model=ReviewModelConfig(enabled=False),
+      ),
+    )
+    summary = self.create_demo_project("写作模型总览")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林晚在发布会现场被当众羞辱，陈小雨拿走证据账本。",
+      encoding="utf-8",
+    )
+    model_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "林晚",
+            "current_state": "在发布会现场被当众羞辱。",
+            "relationships": ["陈小雨：拿走证据账本"],
+            "events": ["发布会羞辱"],
+            "evidence": ["林晚在发布会现场被当众羞辱"],
+          }
+        ],
+        "events": [{"name": "发布会羞辱", "related_characters": ["林晚"], "evidence": ["发布会现场被当众羞辱"]}],
+        "locations": [],
+        "props": [{"name": "证据账本", "related_characters": ["林晚"], "evidence": ["陈小雨拿走证据账本"]}],
+        "skills": [],
+        "scenes": [],
+        "organizations": [],
+      },
+      ensure_ascii=False,
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": model_content}}]},
+    ) as mocked_request:
+      detail = get_project_detail(self.settings, summary.id, allow_model_overview=True)
+
+    self.assertEqual(mocked_request.call_count, 1)
+    self.assertEqual(mocked_request.call_args.args[0], "https://primary.local/v1/chat/completions")
+    self.assertEqual(mocked_request.call_args.kwargs["payload"]["model"], "primary-overview-model")
+    self.assertEqual(mocked_request.call_args.kwargs["timeout"], 240)
+    self.assertIn("林晚", [item.name for item in detail.story_overview.characters])
+    self.assertIn("发布会羞辱", [item.name for item in detail.story_overview.events])
+    self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
+
+  def test_story_overview_review_request_allows_model_overview(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(
+          api_key="real-key",
+          base_url="https://primary.local/v1",
+          model_name="primary-overview-model",
+          max_tokens=4096,
+        ),
+        review_model=ReviewModelConfig(enabled=False),
+      ),
+    )
+    summary = self.create_demo_project("打开总览触发模型")
+    Path(summary.path, "character_design.txt").write_text(
+      "林晚在发布会现场被当众羞辱，陈小雨拿走证据账本。",
+      encoding="utf-8",
+    )
+    model_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "林晚",
+            "current_state": "在发布会现场被当众羞辱。",
+            "relationships": ["陈小雨：拿走证据账本"],
+            "evidence": ["林晚在发布会现场被当众羞辱"],
+          }
+        ],
+        "events": [],
+        "locations": [],
+        "props": [
+          {
+            "name": "证据账本",
+            "related_characters": ["林晚"],
+            "evidence": ["陈小雨拿走证据账本"],
+          }
+        ],
+        "skills": [],
+        "scenes": [],
+        "organizations": [],
+      },
+      ensure_ascii=False,
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": model_content}}]},
+    ) as mocked_request:
+      detail = get_project_detail(self.settings, summary.id, review_characters=True)
+
+    self.assertEqual(mocked_request.call_count, 1)
+    self.assertIn("林晚", [item.name for item in detail.story_overview.characters])
+    self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
+
+  def test_refresh_story_overview_raises_when_no_model_cache_is_created(self) -> None:
+    summary = self.create_demo_project("总览生成失败")
+    Path(summary.path, "core_seed.txt").write_text("林晚在雨夜收到旧账本。", encoding="utf-8")
+
+    with patch.dict(
+      os.environ,
+      {
+        "NOVEL_MODEL_API_KEY": "",
+        "DASHSCOPE_API_KEY": "",
+        "ARK_API_KEY": "",
+        "NOVEL_API_KEY": "",
+        "OPENAI_API_KEY": "",
+        "NOVEL_REVIEW_MODEL_API_KEY": "",
+        "NOVEL_AUXILIARY_MODEL_API_KEY": "",
+      },
+    ):
+      with self.assertRaisesRegex(RuntimeError, "模型总览生成失败"):
+        refresh_project_model_story_overview(self.settings, summary.id, force=True)
+
+    self.assertFalse((Path(summary.path) / ".gaoxia" / "story_overview_model.json").exists())
+
   def test_story_overview_model_reads_every_source_chunk(self) -> None:
     save_config(
       self.settings,
-      ModelConfig(
-        api_key="real-key",
-        base_url="https://model.local/v1",
-        model_name="overview-model",
+      AppConfigUpdateRequest(
+        model=ModelConfig(),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          api_key="real-key",
+          base_url="https://model.local/v1",
+          model_name="overview-model",
+          max_tokens=4096,
+        ),
       ),
     )
     summary = self.create_demo_project("模型分片总览")
@@ -442,7 +438,7 @@ class ProjectServiceTestCase(unittest.TestCase):
       patch("novel_backend.services.project_service._MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT", 100),
       patch("novel_backend.services.project_service.request_json_with_retries", side_effect=fake_model_response) as mocked_request,
     ):
-      detail = get_project_detail(self.settings, summary.id)
+      detail = get_project_detail(self.settings, summary.id, allow_model_overview=True)
 
     self.assertGreaterEqual(mocked_request.call_count, 2)
     character_names = [item.name for item in detail.story_overview.characters]
@@ -483,7 +479,7 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIsNotNone(report)
     self.assertFalse(report.is_stale)
     self.assertTrue(report.source_profile.summary)
-    self.assertGreaterEqual(len(report.source_profile.character_notes), 1)
+    self.assertEqual(report.source_profile.character_notes, [])
     pack_kinds = [item.kind for item in report.packs]
     self.assertIn("continuation", pack_kinds)
     self.assertIn("architecture", pack_kinds)
@@ -533,8 +529,8 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIn("任务包：persona", persona_review)
     self.assertEqual(resolve_task_pack_kind(rewrite_mode="humanize"), "imitation")
 
-  def test_story_overview_falls_back_to_main_character_when_text_has_no_name(self) -> None:
-    summary = self.create_demo_project("主角回填")
+  def test_story_overview_without_model_cache_does_not_backfill_main_character(self) -> None:
+    summary = self.create_demo_project("无模型主角")
     self.write_chapter(
       summary.path,
       1,
@@ -543,9 +539,8 @@ class ProjectServiceTestCase(unittest.TestCase):
 
     detail = get_project_detail(self.settings, summary.id)
 
-    self.assertEqual(detail.story_overview.characters[0].name, "主角")
-    self.assertEqual(len(detail.story_overview.characters[0].timeline), 1)
-    self.assertIn("旧码头", detail.story_overview.characters[0].locations)
+    self.assertEqual(detail.story_overview.characters, [])
+    self.assertEqual(detail.story_overview.scenes, [])
 
   def test_restore_project_snapshot_recovers_saved_chapter_content(self) -> None:
     summary = self.create_demo_project("快照恢复")
@@ -901,7 +896,7 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertTrue(any(item.source == "资料库" for item in hits))
     self.assertTrue(any(item.section == "旧船队口述记录" for item in hits))
 
-  def test_imported_source_material_populates_reference_characters_and_events(self) -> None:
+  def test_imported_source_material_without_model_cache_does_not_populate_graph(self) -> None:
     summary = self.create_demo_project("原著承接")
 
     import_project_knowledge(
@@ -926,15 +921,14 @@ class ProjectServiceTestCase(unittest.TestCase):
 
     character_names = [item.name for item in detail.story_overview.characters]
     event_names = [item.name for item in detail.story_overview.events]
-    self.assertIn("方鸿渐", character_names)
-    self.assertIn("孙柔嘉", character_names)
-    self.assertIn("赵辛楣", character_names)
-    self.assertIn("围城原文节选", event_names)
+    self.assertEqual(character_names, [])
+    self.assertEqual(event_names, [])
+    self.assertEqual(detail.story_overview.materials[0].title, "围城原文节选")
 
     report = detail.story_overview.distillation_report
     self.assertIsNotNone(report)
-    self.assertTrue(any("方鸿渐" in item for item in report.source_profile.character_notes))
-    self.assertTrue(any("围城原文节选" in item for item in report.source_profile.event_notes))
+    self.assertEqual(report.source_profile.character_notes, [])
+    self.assertEqual(report.source_profile.event_notes, [])
 
   def test_search_project_knowledge_supports_semantic_ranking(self) -> None:
     summary = self.create_demo_project("语义检索")

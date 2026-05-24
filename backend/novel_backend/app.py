@@ -11,6 +11,10 @@ from novel_backend.api import app_control, config, generate, license, projects, 
 from novel_backend.config import get_settings
 from novel_backend.services.config_service import initialize_app_storage
 from novel_backend.services.history_watch_service import ProjectHistoryWatcher, close_project_history_watcher
+from novel_backend.services.project_auxiliary_service import (
+  ProjectAuxiliaryScheduler,
+  close_project_auxiliary_scheduler,
+)
 from novel_backend.services.self_evolution_scheduler_service import (
   SelfEvolutionScheduler,
   close_self_evolution_scheduler,
@@ -27,12 +31,16 @@ async def lifespan(app: FastAPI):
   await history_watcher.start()
   self_evolution_scheduler = SelfEvolutionScheduler(settings)
   await self_evolution_scheduler.start()
+  project_auxiliary_scheduler = ProjectAuxiliaryScheduler(settings)
+  await project_auxiliary_scheduler.start()
   app.state.settings = settings
   app.state.project_history_watcher = history_watcher
   app.state.self_evolution_scheduler = self_evolution_scheduler
+  app.state.project_auxiliary_scheduler = project_auxiliary_scheduler
   try:
     yield
   finally:
+    await close_project_auxiliary_scheduler(project_auxiliary_scheduler)
     await close_self_evolution_scheduler(self_evolution_scheduler)
     await close_project_history_watcher(history_watcher)
 

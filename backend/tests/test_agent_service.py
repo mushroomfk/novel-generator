@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from novel_backend.config import Settings
@@ -21,13 +22,15 @@ from novel_backend.models import (
   KnowledgeImportRequest,
   ModelConfig,
 )
-from novel_backend.services.agent_service import _build_runtime_state, _review_project_knowledge, agent_session_stream
+from novel_backend.services.agent_service import _build_runtime_state, _generate_full_architecture, _review_project_knowledge, agent_session_stream
 from novel_backend.services.agent_trajectory_service import get_agent_trajectory_records
 from novel_backend.services.config_service import initialize_app_storage, save_config
+from novel_backend.services import context_builder as context_builder_module
 from novel_backend.services.project_service import (
   create_project,
   get_project_detail,
   import_project_knowledge,
+  load_architecture_progress,
   update_chapter_content,
 )
 
@@ -348,6 +351,76 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["plan"]["actions"][1]["task_pack_kind"], "architecture")
     self.assertIn("先通读资料库里的 1 份资料", result_event[1]["reply"])
 
+  def test_full_architecture_saves_each_step_and_resumes_after_failure(self) -> None:
+    instruction = "重新生成整书架构"
+    runtime = _build_runtime_state(self.settings, self.project.id)
+    first_calls: list[str] = []
+
+    def fail_on_character_state(_settings, payload, _task_id, *_args):
+      first_calls.append(payload.step)
+      if payload.step == "character_state":
+        raise RuntimeError("network down")
+      return SimpleNamespace(content=f"{payload.step} 内容")
+
+    with patch("novel_backend.services.agent_service._generate_architecture_step", side_effect=fail_on_character_state):
+      with self.assertRaises(RuntimeError):
+        _generate_full_architecture(self.settings, runtime, instruction, [], "task-architecture")
+
+    self.assertEqual(first_calls, ["core_seed", "character_design", "world_building", "plot_structure", "character_state"])
+    project_dir = Path(self.project.path)
+    self.assertEqual((project_dir / "core_seed.txt").read_text(encoding="utf-8"), "core_seed 内容")
+    self.assertEqual((project_dir / "plot_structure.txt").read_text(encoding="utf-8"), "plot_structure 内容")
+    self.assertFalse((project_dir / "character_state.txt").read_text(encoding="utf-8").strip())
+
+    progress = load_architecture_progress(self.settings, self.project.id)
+    self.assertIsNotNone(progress)
+    assert progress is not None
+    self.assertEqual(progress["failed_step"], "character_state")
+    self.assertEqual(progress["completed_steps"], ["core_seed", "character_design", "world_building", "plot_structure"])
+
+    second_calls: list[str] = []
+
+    def resume_from_failed_step(_settings, payload, _task_id, *_args):
+      second_calls.append(payload.step)
+      return SimpleNamespace(content=f"{payload.step} 新内容")
+
+    resumed_runtime = _build_runtime_state(self.settings, self.project.id)
+    with patch("novel_backend.services.agent_service._generate_architecture_step", side_effect=resume_from_failed_step):
+      _detail, workspace = _generate_full_architecture(self.settings, resumed_runtime, instruction, [], "task-architecture-2")
+
+    self.assertEqual(second_calls, ["character_state", "blueprint", "global_summary"])
+    self.assertEqual(workspace.character_state, "character_state 新内容")
+    self.assertEqual((project_dir / "blueprint.txt").read_text(encoding="utf-8"), "blueprint 新内容")
+    self.assertIsNone(load_architecture_progress(self.settings, self.project.id))
+
+  def test_full_architecture_reuses_single_context_snapshot(self) -> None:
+    runtime = _build_runtime_state(self.settings, self.project.id)
+    snapshot_queries: list[str] = []
+
+    def build_snapshot(*args, **kwargs):
+      snapshot_queries.append(str(kwargs.get("knowledge_query") or ""))
+      return context_builder_module.build_project_context_bundle(*args, **kwargs)
+
+    def fake_model(_settings, _messages, *, task_name: str, **_kwargs):
+      return json.dumps(
+        {
+          "headline": "已生成",
+          "summary": "已生成",
+          "content": f"{task_name} 内容",
+          "checklist": [],
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.agent_service.build_project_context_bundle", side_effect=build_snapshot), patch(
+      "novel_backend.services.generation_service.build_project_context_bundle",
+      side_effect=AssertionError("整书架构步骤不应重复构建项目上下文"),
+    ), patch("novel_backend.services.generation_service._invoke_model", side_effect=fake_model):
+      _generate_full_architecture(self.settings, runtime, "重新生成整书架构", [], "task-context-snapshot")
+
+    self.assertEqual(len(snapshot_queries), 1)
+    self.assertIn("核心种子", snapshot_queries[0])
+
   def test_model_first_planner_prefers_architecture_over_chapter_keyword_overlap(self) -> None:
     with patch(
       "novel_backend.services.agent_service._planner_available",
@@ -606,6 +679,123 @@ class AgentServiceTestCase(unittest.TestCase):
     chapter_action = next(item for item in result_event[1]["plan"]["actions"] if item["kind"] == "chapter_generate")
     self.assertEqual(chapter_action["chapter_id"], "chapter-002")
     self.assertEqual(chapter_action["label"], "生成第 2 章正文")
+
+  def test_model_plan_can_chain_rewrite_after_new_chapter_generation(self) -> None:
+    with patch(
+      "novel_backend.services.agent_service._planner_available",
+      return_value=True,
+    ), patch(
+      "novel_backend.services.agent_service._invoke_model",
+      return_value=json.dumps(
+        {
+          "mode": "plan",
+          "title": "生成第一章正文并进行后续处理",
+          "summary": "用户明确要求写第一章，按章节工作流执行初稿生成、去AI化和一致性检查。",
+          "requires_confirmation": True,
+          "actions": [
+            {
+              "kind": "chapter_generate",
+              "label": "生成第一章初稿",
+              "instruction": "",
+              "chapter_target": "next",
+              "chapter_index": 0,
+              "chapter_title": "第 1 章",
+              "mode": "draft",
+            },
+            {
+              "kind": "rewrite_chapter",
+              "label": "去AI化处理",
+              "instruction": "",
+              "chapter_target": "last_written",
+              "mode": "humanize",
+            },
+            {
+              "kind": "consistency_check",
+              "label": "一致性检查",
+              "instruction": "",
+              "chapter_target": "last_written",
+            },
+          ],
+        },
+        ensure_ascii=False,
+      ),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=self.project.id,
+              messages=[AgentMessage(role="user", content="写第一章")],
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertEqual(result_event[1]["mode"], "plan")
+    self.assertNotIn("当前规划指向了一个不存在或不可处理的章节", result_event[1]["reply"])
+    action_kinds = [item["kind"] for item in result_event[1]["plan"]["actions"]]
+    self.assertEqual(action_kinds, ["generate_architecture", "chapter_generate", "rewrite_chapter", "consistency_check"])
+    chapter_actions = [item for item in result_event[1]["plan"]["actions"] if item["chapter_id"]]
+    self.assertTrue(chapter_actions)
+    self.assertEqual({item["chapter_id"] for item in chapter_actions}, {"chapter-001"})
+    self.assertEqual(result_event[1]["plan"]["actions"][2]["mode"], "humanize")
+
+  def test_model_plan_uses_project_chapter_budget_for_standard_chapter_generation(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="章节容量",
+        genre="悬疑",
+        target_chapters=30,
+        target_words=200000,
+      ),
+    )
+    project_dir = Path(project.path)
+    for filename in ("core_seed.txt", "character_design.txt", "world_building.txt", "plot_structure.txt", "blueprint.txt"):
+      (project_dir / filename).write_text("林晚追查职场陷害真相。", encoding="utf-8")
+
+    with patch(
+      "novel_backend.services.agent_service._planner_available",
+      return_value=True,
+    ), patch(
+      "novel_backend.services.agent_service._invoke_model",
+      return_value=json.dumps(
+        {
+          "mode": "plan",
+          "title": "生成第一章正文",
+          "summary": "用户要求写第一章。",
+          "requires_confirmation": True,
+          "actions": [
+            {
+              "kind": "chapter_generate",
+              "label": "生成第一章初稿",
+              "instruction": "",
+              "chapter_target": "next",
+              "target_words": 0,
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+    ):
+      events = asyncio.run(
+        collect_stream(
+          agent_session_stream(
+            self.settings,
+            AgentChatRequest(
+              project_id=project.id,
+              messages=[AgentMessage(role="user", content="写第一章")],
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    chapter_action = next(item for item in result_event[1]["plan"]["actions"] if item["kind"] == "chapter_generate")
+    self.assertEqual(chapter_action["chapter_id"], "chapter-001")
+    self.assertEqual(chapter_action["target_words"], 6667)
 
   def test_auto_matches_custom_skill_for_natural_language_plan(self) -> None:
     self._write_custom_skill(

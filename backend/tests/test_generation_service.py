@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from novel_backend.config import Settings
 from novel_backend.models import (
+  AppConfigUpdateRequest,
   ArchitectureRequest,
   ProjectDreamRunRequest,
   ArchitectureStepRequest,
@@ -21,6 +22,7 @@ from novel_backend.models import (
   KnowledgeImportItem,
   KnowledgeImportRequest,
   ModelConfig,
+  ModelRuntimeConfig,
   ProjectMemoryEntry,
   ProjectMemoryEntryInput,
   ProjectMemoryUpdateRequest,
@@ -930,7 +932,13 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertEqual(report["rewrite_focus"], ["增强段尾压力"])
     self.assertEqual(report["issues"][0]["title"], "可读性：段尾偏弱")
 
-  def test_generate_continuation_candidates_keeps_parallel_results_ordered(self) -> None:
+  def test_generate_continuation_candidates_deep_mode_keeps_results_ordered(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model_runtime=ModelRuntimeConfig(chapter_candidate_mode="deep"),
+      ),
+    )
     scene_result = ChapterWorkflowResult(
       task_id="scene-task",
       mode="draft",

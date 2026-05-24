@@ -5,8 +5,9 @@ from pathlib import Path
 
 from novel_backend.config import Settings
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_runtime_service import model_runtime_should_defer_background
 from novel_backend.services.project_service import list_projects
-from novel_backend.services.self_evolution_service import run_self_evolution_scheduled_tasks
+from novel_backend.services.self_evolution_service import _load_schedule, run_self_evolution_scheduled_tasks
 
 
 class SelfEvolutionScheduler:
@@ -50,8 +51,19 @@ class SelfEvolutionScheduler:
     results: list[dict[str, object]] = []
     projects = list_projects(self.settings)
     for project in projects:
+      project_dir = Path(project.path)
       try:
-        result = run_self_evolution_scheduled_tasks(self.settings, Path(project.path), force=False)
+        schedule = _load_schedule(project_dir)
+        tasks = [str(item) for item in schedule.get("tasks") or []]
+        if "model_review" in tasks and model_runtime_should_defer_background(self.settings):
+          result = {"status": "deferred", "ran": [], "schedule": schedule}
+        else:
+          result = await asyncio.to_thread(
+            run_self_evolution_scheduled_tasks,
+            self.settings,
+            project_dir,
+            force=False,
+          )
       except Exception as error:
         append_app_log(self.settings, f"项目 {project.id} 自学习排程失败：{error}", level="WARNING")
         result = {"status": "failed", "error": str(error), "ran": []}

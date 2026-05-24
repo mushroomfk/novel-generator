@@ -34,6 +34,7 @@ from novel_backend.models import (
   LocalHistoryChangedFile,
   LocalHistoryState,
   ModelConfig,
+  ReviewModelConfig,
   ProjectDeleteResult,
   ProjectDirectoryOpenResult,
   ProjectDreamPromoteRequest,
@@ -61,6 +62,7 @@ from novel_backend.models import (
 from novel_backend.services.embedding_service import embed_texts, embedding_config_signature
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_http_service import request_json_with_retries
 from novel_backend.services.rerank_service import rerank_documents
 from novel_backend.services.project_dream_service import (
@@ -97,8 +99,12 @@ _LOCAL_HISTORY_DIRNAME = ".novel-history"
 _APP_STATE_DIRNAME = ".gaoxia"
 _AGENT_THREADS_DIRNAME = "threads"
 _MODEL_STORY_OVERVIEW_FILENAME = "story_overview_model.json"
+_MODEL_STORY_OVERVIEW_FAILURE_FILENAME = "story_overview_model_failure.json"
 _MODEL_STORY_OVERVIEW_SCHEMA_VERSION = "1"
-_MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 22000
+_MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 4500
+_MODEL_STORY_OVERVIEW_FAILURE_COOLDOWN_SECONDS = 600
+_ARCHITECTURE_PROGRESS_FILENAME = "architecture_progress.json"
+_ARCHITECTURE_PROGRESS_SCHEMA_VERSION = "1"
 _AGENT_THREAD_CONTEXT_DIRNAME = "thread_context"
 _AGENT_THREAD_CONTEXT_SCHEMA_VERSION = "1"
 _AGENT_THREAD_CHUNK_SIZE = 1200
@@ -846,6 +852,18 @@ def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_datetime(value: object) -> datetime | None:
+  if not isinstance(value, str) or not value.strip():
+    return None
+  try:
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  if parsed.tzinfo is None:
+    return parsed.replace(tzinfo=timezone.utc)
+  return parsed.astimezone(timezone.utc)
+
+
 def _safe_folder_name(name: str) -> str:
   cleaned = "".join("_" if char in '<>:"/\\|?*' else char for char in name).strip()
   cleaned = cleaned.replace("  ", " ")
@@ -1005,6 +1023,14 @@ def _agent_threads_index_path(project_dir: Path) -> Path:
 
 def _model_story_overview_path(project_dir: Path) -> Path:
   return _app_state_dir(project_dir) / _MODEL_STORY_OVERVIEW_FILENAME
+
+
+def _model_story_overview_failure_path(project_dir: Path) -> Path:
+  return _app_state_dir(project_dir) / _MODEL_STORY_OVERVIEW_FAILURE_FILENAME
+
+
+def _architecture_progress_path(project_dir: Path) -> Path:
+  return _app_state_dir(project_dir) / _ARCHITECTURE_PROGRESS_FILENAME
 
 
 def _agent_thread_path(project_dir: Path, thread_id: str) -> Path:
@@ -2535,7 +2561,7 @@ def _sync_knowledge_vectors(
   embedding_signature: str,
   *,
   prune_missing: bool = True,
-) -> None:
+) -> str:
   active_chunk_ids = {row["chunk_id"] for row in chunk_rows}
   existing_rows: dict[str, tuple[str, str, bool]] = {}
 
@@ -2581,14 +2607,14 @@ def _sync_knowledge_vectors(
         "DELETE FROM knowledge_vectors WHERE chunk_id = ?",
         [(chunk_id,) for chunk_id in active_chunk_ids],
       )
-    return
+    return ""
 
   rows_to_embed = [
     row for row in chunk_rows
     if existing_rows.get(row["chunk_id"]) != (row["content_hash"], embedding_signature, True)
   ]
   if not rows_to_embed:
-    return
+    return ""
 
   try:
     vectors = embed_texts(
@@ -2598,7 +2624,7 @@ def _sync_knowledge_vectors(
     )
   except Exception as error:
     append_app_log(settings, f"project_knowledge_embedding skipped: {error}", level="ERROR")
-    return
+    return str(error)
 
   updated_at = _now_iso()
   connection.executemany(
@@ -2630,6 +2656,7 @@ def _sync_knowledge_vectors(
       for row, vector in zip(rows_to_embed, vectors)
     ],
   )
+  return ""
 
 
 def _insert_knowledge_chunk_rows(connection: sqlite3.Connection, chunk_rows: list[dict[str, str]]) -> None:
@@ -2860,7 +2887,7 @@ def _refresh_project_knowledge_for_paths(
   _refresh_project_knowledge_sources(settings, project_dir, target_chapters, source_keys)
 
 
-def _rebuild_project_knowledge(project_dir: Path, target_chapters: int, settings: Settings) -> None:
+def _rebuild_project_knowledge(project_dir: Path, target_chapters: int, settings: Settings) -> dict[str, object]:
   db_path = _knowledge_db_path(project_dir)
   _initialize_knowledge_db(db_path)
   connection = sqlite3.connect(db_path)
@@ -2973,12 +3000,18 @@ def _rebuild_project_knowledge(project_dir: Path, target_chapters: int, settings
     )
 
     embedding_signature = embedding_config_signature(settings)
-    _sync_knowledge_vectors(settings, connection, chunk_rows, embedding_signature)
+    embedding_error = _sync_knowledge_vectors(settings, connection, chunk_rows, embedding_signature)
     _set_knowledge_state(connection, "source_signature", _knowledge_source_signature(project_dir, target_chapters))
     _set_knowledge_state(connection, "embedding_signature", embedding_signature)
     _set_knowledge_state(connection, "schema_version", _KNOWLEDGE_SCHEMA_VERSION)
     _set_knowledge_state(connection, "indexed_at", now)
     connection.commit()
+    return {
+      "status": "partial" if embedding_error else "completed",
+      "chunk_count": len(chunk_rows),
+      "embedding_signature": embedding_signature,
+      "embedding_error": embedding_error,
+    }
   finally:
     connection.close()
 
@@ -3132,7 +3165,14 @@ def _semantic_search_project_knowledge(
   return scored[: max(1, min(limit, 20))]
 
 
-def _search_project_knowledge(settings: Settings, project_dir: Path, query: str, limit: int = 8) -> list[KnowledgeSearchResult]:
+def _search_project_knowledge(
+  settings: Settings,
+  project_dir: Path,
+  query: str,
+  limit: int = 8,
+  *,
+  include_semantic: bool = True,
+) -> list[KnowledgeSearchResult]:
   normalized = query.strip()
   if not normalized:
     return []
@@ -3145,12 +3185,16 @@ def _search_project_knowledge(settings: Settings, project_dir: Path, query: str,
   connection = sqlite3.connect(db_path)
   try:
     keyword_hits = _keyword_search_project_knowledge(connection, normalized, _knowledge_candidate_limit(search_limit))
-    semantic_hits = _semantic_search_project_knowledge(
-      settings,
-      connection,
-      normalized,
-      search_limit,
-      candidate_chunk_ids=[str(item["chunk_id"]) for item in keyword_hits] if keyword_hits else None,
+    semantic_hits = (
+      _semantic_search_project_knowledge(
+        settings,
+        connection,
+        normalized,
+        search_limit,
+        candidate_chunk_ids=[str(item["chunk_id"]) for item in keyword_hits] if keyword_hits else None,
+      )
+      if include_semantic
+      else []
     )
   finally:
     connection.close()
@@ -3614,12 +3658,15 @@ def _story_entity_review_cache_path(project_dir: Path) -> Path:
 
 
 def _character_review_model_signature(settings: Settings) -> str:
-  config = load_config(settings).model
+  config, api_key = _auxiliary_model_enabled(settings)
+  if config is None:
+    return "auxiliary-model:not-configured"
   return hashlib.sha1(
     json.dumps(
       {
         "base_url": config.base_url.strip(),
         "model_name": config.model_name.strip(),
+        "api_key": hashlib.sha1(api_key.encode("utf-8")).hexdigest() if api_key else "",
         "temperature": 0,
       },
       ensure_ascii=False,
@@ -3657,18 +3704,8 @@ def _story_entity_review_source_signature(
 
 
 def _has_character_review_model_config(settings: Settings) -> bool:
-  config = load_config(settings).model
-  return any(
-    item.strip()
-    for item in (
-      config.api_key,
-      os.getenv("NOVEL_MODEL_API_KEY", ""),
-      os.getenv("DASHSCOPE_API_KEY", ""),
-      os.getenv("ARK_API_KEY", ""),
-      os.getenv("NOVEL_API_KEY", ""),
-      os.getenv("OPENAI_API_KEY", ""),
-    )
-  )
+  config, api_key = _auxiliary_model_enabled(settings)
+  return config is not None and bool(api_key)
 
 
 def _character_candidate_evidence_items(
@@ -3878,15 +3915,12 @@ def _model_review_character_candidates(
   ]
 
   try:
-    from novel_backend.services.generation_service import _invoke_model
-
-    content = _invoke_model(
+    content = _invoke_auxiliary_model(
       settings,
       messages,
       task_name="story_overview_character_review",
       temperature=0,
       max_tokens=1200,
-      enable_thinking=False,
     )
     payload = _json_object_from_model_text(content)
     if payload is None:
@@ -3992,15 +4026,12 @@ def _model_review_story_entities(
   ]
 
   try:
-    from novel_backend.services.generation_service import _invoke_model
-
-    content = _invoke_model(
+    content = _invoke_auxiliary_model(
       settings,
       messages,
       task_name="story_overview_entity_review",
       temperature=0,
       max_tokens=1800,
-      enable_thinking=False,
     )
     payload = _json_object_from_model_text(content)
     if payload is None:
@@ -4629,7 +4660,24 @@ def _chat_completions_endpoint(base_url: str) -> str:
   return f"{normalized}/chat/completions" if not normalized.endswith("/chat/completions") else normalized
 
 
-def _resolve_model_api_key(config: ModelConfig) -> str:
+def _resolve_review_model_api_key(config: ReviewModelConfig) -> str:
+  candidates = [
+    config.api_key,
+    os.getenv("NOVEL_REVIEW_MODEL_API_KEY", ""),
+    os.getenv("NOVEL_AUXILIARY_MODEL_API_KEY", ""),
+    os.getenv("OPENAI_API_KEY", ""),
+    os.getenv("DASHSCOPE_API_KEY", ""),
+    os.getenv("ARK_API_KEY", ""),
+    os.getenv("NOVEL_API_KEY", ""),
+  ]
+  for item in candidates:
+    value = item.strip()
+    if value:
+      return value
+  return ""
+
+
+def _resolve_primary_model_api_key(config: ModelConfig) -> str:
   candidates = [
     config.api_key,
     os.getenv("NOVEL_MODEL_API_KEY", ""),
@@ -4645,20 +4693,43 @@ def _resolve_model_api_key(config: ModelConfig) -> str:
   return ""
 
 
-def _is_placeholder_model_config(config: ModelConfig, api_key: str) -> bool:
+def _is_placeholder_model_config(config: ModelConfig | ReviewModelConfig, api_key: str) -> bool:
   base_url = config.base_url.strip().lower()
   model_name = config.model_name.strip().lower()
   return "example.com" in base_url or api_key.strip() == "test-key" or model_name in {"demo-model", "test-model"}
 
 
-def _model_overview_enabled(settings: Settings) -> tuple[ModelConfig | None, str]:
+def _auxiliary_model_enabled(settings: Settings) -> tuple[ReviewModelConfig | None, str]:
+  config = load_config(settings).review_model
+  if not config.enabled:
+    return None, ""
+
+  resolved = config.model_copy(
+    update={
+      "base_url": os.getenv("NOVEL_REVIEW_MODEL_BASE_URL", "").strip() or config.base_url,
+      "model_name": os.getenv("NOVEL_REVIEW_MODEL_NAME", "").strip() or config.model_name,
+    }
+  )
+  api_key = _resolve_review_model_api_key(resolved)
+  if not api_key or not resolved.base_url.strip() or not resolved.model_name.strip():
+    return None, ""
+  if _is_placeholder_model_config(resolved, api_key):
+    return None, ""
+  return resolved, api_key
+
+
+def _story_overview_model_enabled(settings: Settings) -> tuple[ModelConfig | ReviewModelConfig | None, str, str]:
+  review_config, review_api_key = _auxiliary_model_enabled(settings)
+  if review_config is not None and review_api_key:
+    return review_config, review_api_key, "review_model"
+
   config = load_config(settings).model
-  api_key = _resolve_model_api_key(config)
+  api_key = _resolve_primary_model_api_key(config)
   if not api_key or not config.base_url.strip() or not config.model_name.strip():
-    return None, ""
+    return None, "", ""
   if _is_placeholder_model_config(config, api_key):
-    return None, ""
-  return config, api_key
+    return None, "", ""
+  return config, api_key, "primary_model"
 
 
 def _strip_json_code_fence(text: str) -> str:
@@ -4719,39 +4790,66 @@ def _model_overview_messages(source_text: str) -> list[dict[str, str]]:
         "3. relationships 写成“对方：关系说明”，对方必须是来源中出现的人物或明确称谓。\n"
         "4. events、locations、props、skills、scenes、organizations 都只写来源里明确存在的内容。\n"
         "5. 不要推测、不要补设定、不要为了填满字段编内容。\n\n"
+        "数量限制：每个分片只输出最明确的核心节点，characters 最多 12 个，events 最多 12 个，"
+        "locations、props、skills、scenes、organizations 各最多 10 个；合并同类项，"
+        "不要把每个章节标题都拆成事件。profile、current_state、summary 都控制在 60 个中文字符以内；"
+        "每个人物 relationships 最多 3 条，events 最多 4 条；每个节点 evidence 最多 2 条，"
+        "evidence 必须是原文里可直接匹配的短片段。\n"
+        "人物筛选：characters 只输出稳定人物。稳定人物必须在人物状态中有专属段落，"
+        "或在两个以上来源文件中持续出现；只在单个旧设定文件出现的旧名字、职务泛称、"
+        "临时配角和章节功能角色不要放进 characters。若人物设定与人物状态、情节骨架、章节蓝图互相冲突，"
+        "优先采用后续文件中反复出现的姓名，不要同时保留被替换的旧名字。\n\n"
         f"项目来源：\n{source_text}"
       ),
     },
   ]
 
 
-def _request_model_story_overview(settings: Settings, source_text: str) -> dict[str, object] | None:
-  config, api_key = _model_overview_enabled(settings)
+def _invoke_auxiliary_model(
+  settings: Settings,
+  messages: list[dict[str, str]],
+  *,
+  task_name: str,
+  temperature: float,
+  max_tokens: int,
+  model_config: ModelConfig | ReviewModelConfig | None = None,
+  api_key: str = "",
+  model_source: str = "review_model",
+  timeout: int = 45,
+) -> str:
+  config = model_config
   if config is None or not api_key:
-    return None
+    config, api_key = _auxiliary_model_enabled(settings)
+    model_source = "review_model"
+  if config is None or not api_key:
+    raise RuntimeError("辅助模型未配置")
 
   endpoint = _chat_completions_endpoint(config.base_url)
-  messages = _model_overview_messages(source_text)
   chat_payload = {
     "model": config.model_name,
     "messages": messages,
-    "temperature": 0.1,
-    "max_tokens": min(max(config.max_tokens, 4096), 16000),
+    "temperature": temperature,
+    "max_tokens": max(256, min(max_tokens, 16000)),
   }
   prompt_text = "\n\n".join(f"[{item['role']}] {item['content']}" for item in messages)
   started = time.perf_counter()
+  runtime_task = None
   try:
-    response_payload = request_json_with_retries(
-      endpoint,
-      headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-      },
-      payload=chat_payload,
-      error_prefix="模型请求失败",
-      invalid_json_message="模型返回的不是合法 JSON",
-      invalid_payload_message="模型返回格式不正确",
-    )
+    with model_runtime_slot(settings, lane="chat", task_name=task_name) as task:
+      runtime_task = task
+      response_payload = request_json_with_retries(
+        endpoint,
+        headers={
+          "Content-Type": "application/json",
+          "Authorization": f"Bearer {api_key}",
+        },
+        payload=chat_payload,
+        error_prefix="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_payload_message="模型返回格式不正确",
+        timeout=timeout,
+        retry_delays=(1.0,),
+      )
     choices = response_payload.get("choices")
     if not isinstance(choices, list) or not choices:
       raise RuntimeError("模型返回为空")
@@ -4763,24 +4861,32 @@ def _request_model_story_overview(settings: Settings, source_text: str) -> dict[
     append_prompt_history(
       settings,
       {
-        "task": "story_overview_model",
+        "task": task_name,
         "model": config.model_name,
+        "model_source": model_source,
         "prompt": prompt_text,
         "response": content,
         "status": "completed",
         "elapsed": elapsed,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
-    append_app_log(settings, f"story_overview_model completed in {elapsed:.3f}s")
-    return _extract_json_object_from_text(content)
+    append_app_log(settings, f"{task_name} completed in {elapsed:.3f}s")
+    return content
   except Exception as error:
     elapsed = round(time.perf_counter() - started, 3)
     classified_error = classify_model_error(error)
+    if classified_error.retryable:
+      mark_model_runtime_cooldown(settings, "chat", classified_error.title)
     append_prompt_history(
       settings,
       {
-        "task": "story_overview_model",
+        "task": task_name,
         "model": config.model_name,
+        "model_source": model_source,
         "prompt": prompt_text,
         "response": "",
         "status": "failed",
@@ -4790,9 +4896,38 @@ def _request_model_story_overview(settings: Settings, source_text: str) -> dict[
         "error_title": classified_error.title,
         "error_user_action": classified_error.user_action,
         "error_retryable": classified_error.retryable,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
-    append_app_log(settings, f"story_overview_model failed: {classified_error.title}: {error}", level="ERROR")
+    append_app_log(settings, f"{task_name} failed: {classified_error.title}: {error}", level="ERROR")
+    raise
+
+
+def _request_model_story_overview(settings: Settings, source_text: str) -> dict[str, object] | None:
+  messages = _model_overview_messages(source_text)
+  config, api_key, model_source = _story_overview_model_enabled(settings)
+  if config is None:
+    append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
+    return None
+  try:
+    content = _invoke_auxiliary_model(
+      settings,
+      messages,
+      task_name="story_overview_model",
+      temperature=0.1,
+      max_tokens=8192,
+      model_config=config,
+      api_key=api_key,
+      model_source=model_source,
+      timeout=240,
+    )
+    return _extract_json_object_from_text(content)
+  except Exception as error:
+    if str(error) == "辅助模型未配置":
+      append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
     return None
 
 
@@ -5170,18 +5305,56 @@ def _merge_model_story_overviews(
   )
 
 
+def _model_story_overview_failure_active(project_dir: Path) -> bool:
+  payload = read_json(_model_story_overview_failure_path(project_dir), None)
+  if not isinstance(payload, dict):
+    return False
+  retry_after = _parse_iso_datetime(payload.get("retry_after"))
+  if retry_after is None:
+    return False
+  return retry_after > datetime.now(timezone.utc)
+
+
+def _write_model_story_overview_failure(project_dir: Path, error: str) -> None:
+  retry_after_timestamp = datetime.now(timezone.utc).timestamp() + _MODEL_STORY_OVERVIEW_FAILURE_COOLDOWN_SECONDS
+  atomic_write_json(
+    _model_story_overview_failure_path(project_dir),
+    {
+      "schema_version": _MODEL_STORY_OVERVIEW_SCHEMA_VERSION,
+      "failed_at": _now_iso(),
+      "retry_after": datetime.fromtimestamp(retry_after_timestamp, timezone.utc).isoformat(),
+      "error": str(error or "模型总览生成失败"),
+    },
+  )
+
+
+def _clear_model_story_overview_failure(project_dir: Path) -> None:
+  try:
+    _model_story_overview_failure_path(project_dir).unlink()
+  except FileNotFoundError:
+    pass
+
+
 def _model_story_overview_or_none(
   settings: Settings,
   project_dir: Path,
   documents: list[StoryDocument],
   material_payloads: list[dict[str, str]],
   chapters: list[ChapterSummary],
+  *,
+  allow_request: bool = False,
+  force: bool = False,
 ) -> StoryOverview | None:
   source_signature = _overview_source_signature(documents, material_payloads, chapters)
   cached = _model_cache_to_overview(project_dir, documents, source_signature)
-  if cached is not None:
+  if cached is not None and not force:
     return cached
-  if _model_overview_enabled(settings)[0] is None:
+  if not allow_request:
+    return None
+  if not force and _model_story_overview_failure_active(project_dir):
+    return None
+  if _story_overview_model_enabled(settings)[0] is None:
+    append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
     return None
 
   source_blocks = _overview_source_blocks(documents, material_payloads, chapters)
@@ -5201,6 +5374,7 @@ def _model_story_overview_or_none(
     model_payload = _request_model_story_overview(settings, chunk_text)
     if model_payload is None:
       append_app_log(settings, f"story_overview_model chunk {index}/{len(source_chunks)} failed", level="WARNING")
+      _write_model_story_overview_failure(project_dir, f"chunk {index}/{len(source_chunks)} failed")
       return None
     chunk_overview = _validated_model_story_overview(
       model_payload,
@@ -5215,6 +5389,7 @@ def _model_story_overview_or_none(
   overview = _merge_model_story_overviews(project_dir, documents, chunk_overviews)
   if overview is None:
     append_app_log(settings, "story_overview_model returned no validated overview nodes", level="WARNING")
+    _write_model_story_overview_failure(project_dir, "returned no validated overview nodes")
     return None
   atomic_write_json(
     _model_story_overview_path(project_dir),
@@ -5233,6 +5408,7 @@ def _model_story_overview_or_none(
       },
     },
   )
+  _clear_model_story_overview_failure(project_dir)
   return overview
 
 
@@ -5328,450 +5504,27 @@ def _build_story_overview(
   chapters: list[ChapterSummary],
   *,
   review_character_candidates: bool = False,
+  allow_model_overview: bool = False,
+  force_model_overview: bool = False,
 ) -> StoryOverview:
   documents = _build_story_documents(project_dir)
   material_payloads = _load_knowledge_material_payloads(project_dir)
-  model_overview = _model_story_overview_or_none(settings, project_dir, documents, material_payloads, chapters)
+  model_overview = _model_story_overview_or_none(
+    settings,
+    project_dir,
+    documents,
+    material_payloads,
+    chapters,
+    allow_request=allow_model_overview,
+    force=force_model_overview,
+  )
   if model_overview is not None:
     return model_overview
-
-  document_map = {item.key: item for item in documents}
-  character_design_sections = _extract_character_sections(document_map["character_design"].content)
-  character_state_sections = _extract_character_sections(document_map["character_state"].content)
-  seed_character_names = _ordered_unique(
-    list(character_design_sections.keys()) + list(character_state_sections.keys())
-  )
-  has_seed_characters = _has_named_character(seed_character_names)
-  project_source_texts = [
-    *(item.content for item in documents if item.content.strip()),
-    *(item.content for item in chapters if item.exists and item.content.strip()),
-  ]
-  overview_source_texts = [
-    *(item.content for item in documents if item.content.strip()),
-    *(item["content"] for item in material_payloads if item.get("content")),
-    *(item.content for item in chapters if item.exists and item.content.strip()),
-  ]
-  character_discovery_texts = project_source_texts if has_seed_characters else overview_source_texts
-  graph_material_payloads = [] if has_seed_characters else material_payloads
-  discovered_characters = _model_review_character_candidates(
-    settings,
-    project_dir,
-    character_discovery_texts,
-    _discover_character_names(character_discovery_texts),
-    allow_model_call=review_character_candidates,
-  )
-
-  known_characters = _ordered_unique(
-    seed_character_names + discovered_characters
-  )
-
-  for document in documents:
-    known_characters = _ordered_unique(
-      known_characters + _extract_character_mentions(document.content, known_characters)
-    )
-
-  for material in graph_material_payloads:
-    known_characters = _ordered_unique(
-      known_characters + _extract_character_mentions(material.get("content", ""), known_characters)
-    )
-
-  for chapter in chapters:
-    if not chapter.exists or not chapter.content.strip():
-      continue
-    known_characters = _ordered_unique(
-      known_characters + _extract_character_mentions(chapter.content, known_characters)
-    )
-
-  if len(known_characters) == 0 and any(chapter.exists and chapter.content.strip() for chapter in chapters):
-    known_characters = ["主角"]
-
-  character_store: dict[str, dict] = {
-    name: _new_character_store_item()
-    for name in known_characters
-  }
-  entity_store = {
-    "events": {},
-    "locations": {},
-    "props": {},
-    "skills": {},
-    "scenes": {},
-    "organizations": {},
-  }
-
-  for name, lines in character_design_sections.items():
-    summary = _compact_text("\n".join(lines), limit=220)
-    skills = _extract_skills("\n".join(lines))
-    character_store.setdefault(
-      name,
-      _new_character_store_item(),
-    )
-    character_store[name]["profile"] = summary
-    character_store[name]["skills"] = _ordered_unique(character_store[name]["skills"] + skills)
-    for item in skills:
-      _register_entity(entity_store["skills"], item, summary=summary, related_characters=[name])
-    structured_entities = _apply_structured_character_fields(
-      character_store,
-      entity_store,
-      name,
-      lines,
-      summary=summary,
-    )
-    character_store[name]["timeline"].append(
-      CharacterTimelineEntry(
-        id=f"{name}-design",
-        source_label="人物设定",
-        summary=summary,
-        relations=character_store[name]["relationships"],
-        events=structured_entities.get("events", []),
-        locations=structured_entities.get("locations", []),
-        props=structured_entities.get("props", []),
-        skills=_ordered_unique(skills + structured_entities.get("skills", [])),
-        scenes=structured_entities.get("scenes", []),
-        organizations=structured_entities.get("organizations", []),
-      )
-    )
-
-  for name, lines in character_state_sections.items():
-    summary = _compact_text("\n".join(lines), limit=220)
-    skills = _extract_skills("\n".join(lines))
-    character_store.setdefault(
-      name,
-      _new_character_store_item(),
-    )
-    character_store[name]["current_state"] = summary
-    character_store[name]["skills"] = _ordered_unique(character_store[name]["skills"] + skills)
-    for item in skills:
-      _register_entity(entity_store["skills"], item, summary=summary, related_characters=[name])
-    structured_entities = _apply_structured_character_fields(
-      character_store,
-      entity_store,
-      name,
-      lines,
-      summary=summary,
-    )
-    character_store[name]["timeline"].append(
-      CharacterTimelineEntry(
-        id=f"{name}-state",
-        source_label="人物状态",
-        summary=summary,
-        relations=character_store[name]["relationships"],
-        events=structured_entities.get("events", []),
-        locations=structured_entities.get("locations", []),
-        props=structured_entities.get("props", []),
-        skills=_ordered_unique(skills + structured_entities.get("skills", [])),
-        scenes=structured_entities.get("scenes", []),
-        organizations=structured_entities.get("organizations", []),
-      )
-    )
-
-  for document in documents:
-    if not document.content:
-      continue
-
-    mentioned_characters = _extract_character_mentions(document.content, known_characters)
-    structured_overview_entities = _extract_json_structured_overview_entities(document.content)
-    for kind, records in structured_overview_entities.items():
-      for entity_name, entity_summary, related_characters in records:
-        entity_related_characters = _ordered_unique(
-          related_characters + _extract_character_mentions(f"{entity_name}\n{entity_summary}", known_characters)
-        )
-        _register_entity(
-          entity_store[kind],
-          entity_name,
-          summary=entity_summary or _compact_text(document.content, limit=120),
-          related_characters=entity_related_characters,
-        )
-        for character_name in entity_related_characters:
-          store = character_store.setdefault(character_name, _new_character_store_item())
-          store[kind] = _ordered_unique(store[kind] + [entity_name])
-
-    locations = _extract_locations(document.content)
-    organizations = _extract_organizations(document.content)
-    props = _extract_props(document.content)
-    skills = _extract_skills(document.content)
-    summary = _compact_text(document.content, limit=120)
-
-    for item in locations:
-      _register_entity(entity_store["locations"], item, summary=summary, related_characters=mentioned_characters)
-    for item in organizations:
-      _register_entity(entity_store["organizations"], item, summary=summary, related_characters=mentioned_characters)
-    for item in props:
-      _register_entity(entity_store["props"], item, summary=summary, related_characters=mentioned_characters)
-    for item in skills:
-      _register_entity(entity_store["skills"], item, summary=summary, related_characters=mentioned_characters)
-
-  for material in graph_material_payloads:
-    title = material.get("title", "").strip()
-    raw_content = material.get("content", "").strip()
-    if not title or not raw_content:
-      continue
-
-    analysis_text = _material_analysis_text(raw_content)
-    mentioned_characters = _extract_character_mentions(raw_content, known_characters)
-    material_locations = _extract_locations(f"{title}\n{analysis_text}")
-    material_organizations = _extract_organizations(f"{title}\n{analysis_text}")
-    material_props = _extract_props(f"{title}\n{analysis_text}")
-    material_skills = _extract_skills(f"{title}\n{analysis_text}")
-    material_summary = _material_tail_anchor(raw_content)
-    if not material_summary:
-      material_summary = _compact_text(analysis_text, limit=120)
-    material_events = _ordered_unique([title])
-    material_relations = _extract_relationship_summaries(analysis_text, mentioned_characters)
-
-    _register_entity(
-      entity_store["scenes"],
-      title,
-      summary=_compact_text(material_summary or analysis_text, limit=120),
-      related_characters=mentioned_characters,
-    )
-
-    for event_name in material_events:
-      _register_entity(
-        entity_store["events"],
-        event_name,
-        summary=material_summary,
-        related_characters=mentioned_characters,
-      )
-
-    for item in material_locations:
-      _register_entity(
-        entity_store["locations"],
-        item,
-        summary=material_summary,
-        related_characters=mentioned_characters,
-      )
-    for item in material_organizations:
-      _register_entity(
-        entity_store["organizations"],
-        item,
-        summary=material_summary,
-        related_characters=mentioned_characters,
-      )
-    for item in material_props:
-      _register_entity(
-        entity_store["props"],
-        item,
-        summary=material_summary,
-        related_characters=mentioned_characters,
-      )
-    for item in material_skills:
-      _register_entity(
-        entity_store["skills"],
-        item,
-        summary=material_summary,
-        related_characters=mentioned_characters,
-      )
-
-    for character_name in mentioned_characters:
-      if character_name not in character_store:
-        character_store[character_name] = _new_character_store_item()
-
-      store = character_store[character_name]
-      character_anchor = _character_anchor_from_text(analysis_text, character_name, limit=160)
-      if character_anchor and not store["profile"]:
-        store["profile"] = character_anchor
-      store["events"] = _ordered_unique(store["events"] + material_events)
-      store["locations"] = _ordered_unique(store["locations"] + material_locations)
-      store["props"] = _ordered_unique(store["props"] + material_props)
-      store["skills"] = _ordered_unique(store["skills"] + material_skills)
-      store["scenes"] = _ordered_unique(store["scenes"] + [title])
-      store["organizations"] = _ordered_unique(store["organizations"] + material_organizations)
-      store["relationships"] = _ordered_unique(
-        store["relationships"] + material_relations.get(character_name, [])
-      )
-      if character_anchor and character_name not in character_state_sections and not store["current_state"]:
-        store["current_state"] = _compact_text(character_anchor, limit=120)
-
-      store["timeline"].append(
-        CharacterTimelineEntry(
-          id=f"{character_name}-material-{hashlib.sha1(title.encode('utf-8')).hexdigest()[:8]}",
-          source_label=f"参考资料：{title}",
-          summary=character_anchor or material_summary,
-          relations=material_relations.get(character_name, []),
-          events=material_events,
-          locations=material_locations,
-          props=material_props,
-          skills=material_skills,
-          scenes=[title],
-          organizations=material_organizations,
-        )
-      )
-
-  for chapter in chapters:
-    if not chapter.exists or not chapter.content.strip():
-      continue
-
-    chapter_body = _extract_chapter_body(chapter)
-    chapter_text = chapter_body or chapter.preview or chapter.title
-    chapter_characters = _extract_character_mentions(chapter_text, known_characters)
-    if len(chapter_characters) == 0 and len(known_characters) == 1:
-      chapter_characters = [known_characters[0]]
-    elif len(chapter_characters) == 0 and len(known_characters) == 0:
-      chapter_characters = ["主角"]
-    chapter_sentences = [
-      sentence
-      for sentence in _split_sentences(chapter_text)
-      if not _is_meta_sentence(sentence)
-    ]
-    chapter_event_summary = _chapter_event_summary(chapter_sentences, chapter_characters)
-    chapter_summary = chapter_event_summary or _compact_text(
-      chapter_sentences[0] if chapter_sentences else chapter.title,
-      limit=90,
-    )
-    chapter_locations = _extract_locations(f"{chapter.title}\n{chapter_text}")
-    chapter_organizations = _extract_organizations(f"{chapter.title}\n{chapter_text}")
-    chapter_props = _extract_props(f"{chapter.title}\n{chapter_text}")
-    chapter_skills = _extract_skills(f"{chapter.title}\n{chapter_text}")
-    chapter_events = _ordered_unique([chapter_event_summary])
-    chapter_relations = _extract_relationship_summaries(chapter_text, chapter_characters)
-
-    _register_entity(
-      entity_store["scenes"],
-      chapter.title,
-      summary=_compact_text(chapter_summary or chapter.preview or chapter_text, limit=120),
-      related_characters=chapter_characters,
-      chapter_index=chapter.index,
-    )
-
-    for event_name in chapter_events:
-      _register_entity(
-        entity_store["events"],
-        event_name,
-        summary=chapter_summary,
-        related_characters=chapter_characters,
-        chapter_index=chapter.index,
-      )
-
-    for item in chapter_locations:
-      _register_entity(
-        entity_store["locations"],
-        item,
-        summary=chapter_summary,
-        related_characters=chapter_characters,
-        chapter_index=chapter.index,
-      )
-
-    for item in chapter_organizations:
-      _register_entity(
-        entity_store["organizations"],
-        item,
-        summary=chapter_summary,
-        related_characters=chapter_characters,
-        chapter_index=chapter.index,
-      )
-
-    for item in chapter_props:
-      _register_entity(
-        entity_store["props"],
-        item,
-        summary=chapter_summary,
-        related_characters=chapter_characters,
-        chapter_index=chapter.index,
-      )
-    for item in chapter_skills:
-      _register_entity(
-        entity_store["skills"],
-        item,
-        summary=chapter_summary,
-        related_characters=chapter_characters,
-        chapter_index=chapter.index,
-      )
-
-    for character_name in chapter_characters:
-      if character_name not in character_store:
-        character_store[character_name] = _new_character_store_item()
-
-      store = character_store[character_name]
-      store["events"] = _ordered_unique(store["events"] + chapter_events)
-      store["locations"] = _ordered_unique(store["locations"] + chapter_locations)
-      store["props"] = _ordered_unique(store["props"] + chapter_props)
-      store["skills"] = _ordered_unique(store["skills"] + chapter_skills)
-      store["scenes"] = _ordered_unique(store["scenes"] + [chapter.title])
-      store["organizations"] = _ordered_unique(store["organizations"] + chapter_organizations)
-      store["relationships"] = _ordered_unique(
-        store["relationships"] + chapter_relations.get(character_name, [])
-      )
-      if character_name not in character_state_sections:
-        store["current_state"] = _compact_text(chapter_summary, limit=120)
-
-      store["timeline"].append(
-        CharacterTimelineEntry(
-          id=f"{character_name}-chapter-{chapter.index:03d}",
-          chapter_id=chapter.id,
-          chapter_index=chapter.index,
-          chapter_title=chapter.title,
-          source_label="章节正文",
-          summary=chapter_summary,
-          relations=chapter_relations.get(character_name, []),
-          events=chapter_events,
-          locations=chapter_locations,
-          props=chapter_props,
-          skills=chapter_skills,
-          scenes=[chapter.title],
-          organizations=chapter_organizations,
-        )
-      )
-
-  entity_review_texts = project_source_texts if has_seed_characters else overview_source_texts
-  valid_entities = _model_review_story_entities(
-    settings,
-    project_dir,
-    entity_review_texts,
-    entity_store,
-    allow_model_call=review_character_candidates,
-  )
-  _apply_story_entity_review(entity_store, character_store, valid_entities)
-
-  ordered_characters = _ordered_unique(list(character_store.keys()))
-  character_items = [
-    StoryCharacter(
-      name=name,
-      profile=character_store[name]["profile"],
-      current_state=character_store[name]["current_state"],
-      relationships=character_store[name]["relationships"],
-      events=character_store[name]["events"],
-      locations=character_store[name]["locations"],
-      props=character_store[name]["props"],
-      skills=character_store[name]["skills"],
-      scenes=character_store[name]["scenes"],
-      organizations=character_store[name]["organizations"],
-      timeline=sorted(
-        character_store[name]["timeline"],
-        key=lambda item: (item.chapter_index or 0, item.source_label),
-      ),
-    )
-    for name in ordered_characters
-  ]
-
-  def build_entities(kind: str) -> list[StoryEntityReference]:
-    payload = entity_store[kind]
-    return [
-      StoryEntityReference(
-        name=name,
-        summary=str(item["summary"]),
-        related_characters=_ordered_unique(list(item["related_characters"])),
-        chapter_indexes=sorted(int(value) for value in item["chapter_indexes"]),
-      )
-      for name, item in sorted(
-        payload.items(),
-        key=lambda entity: (
-          -(len(entity[1]["chapter_indexes"]) + len(entity[1]["related_characters"])),
-          entity[0],
-        ),
-      )
-    ]
 
   return StoryOverview(
     documents=documents,
     materials=_build_knowledge_materials(project_dir),
     memory_entries=load_project_memory(project_dir),
-    characters=character_items,
-    events=build_entities("events"),
-    locations=build_entities("locations"),
-    props=build_entities("props"),
-    skills=build_entities("skills"),
-    scenes=build_entities("scenes"),
-    organizations=build_entities("organizations"),
   )
 
 
@@ -5786,6 +5539,7 @@ def get_project_detail(
   project_id: str,
   *,
   review_characters: bool = False,
+  allow_model_overview: bool = False,
 ) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
@@ -5799,6 +5553,7 @@ def get_project_detail(
     project_dir,
     chapters,
     review_character_candidates=review_characters,
+    allow_model_overview=allow_model_overview or review_characters,
   )
   auto_entries, memory_signature = build_auto_project_memory(
     documents=overview.documents,
@@ -5852,6 +5607,47 @@ def get_project_detail(
     local_history=local_history,
     story_overview=overview,
   )
+
+
+def refresh_project_model_story_overview(
+  settings: Settings,
+  project_id: str,
+  *,
+  force: bool = False,
+) -> ProjectDetail:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  chapters = [
+    _build_chapter_summary(project_dir, index)
+    for index in range(1, summary.target_chapters + 1)
+  ]
+  overview = _model_story_overview_or_none(
+    settings,
+    project_dir,
+    _build_story_documents(project_dir),
+    _load_knowledge_material_payloads(project_dir),
+    chapters,
+    allow_request=True,
+    force=force,
+  )
+  if overview is None or not _model_story_overview_path(project_dir).exists():
+    raise RuntimeError(
+      "模型总览生成失败：没有生成 .gaoxia/story_overview_model.json，请检查写作模型或第二审查模型配置和模型调用日志。"
+    )
+  return get_project_detail(settings, project_id, allow_model_overview=False)
+
+
+def refresh_project_knowledge_index(settings: Settings, project_id: str) -> dict[str, object]:
+  summary = _project_summary_or_404(settings, project_id)
+  result = _rebuild_project_knowledge(_project_dir(summary), summary.target_chapters, settings)
+  embedding_error = str(result.get("embedding_error") or "").strip()
+  if embedding_error:
+    raise RuntimeError(f"知识库向量索引刷新失败：{embedding_error}")
+  return result
+
+
+def refresh_project_system_memory(settings: Settings, project_id: str, *, focus: str = "辅助任务刷新") -> ProjectDetail:
+  return _auto_refresh_system_memory(settings, project_id, focus=focus)
 
 
 def project_count(settings: Settings) -> int:
@@ -6352,6 +6148,47 @@ def update_story_documents(
   return _update_story_documents(settings, summary, request.documents)
 
 
+def save_story_document_incremental(
+  settings: Settings,
+  project_id: str,
+  document_key: str,
+  content: str,
+) -> None:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  filename, _key, _label = _story_document_spec_or_404(document_key)
+  atomic_write_text(project_dir / filename, content)
+  _touch_project_timestamp(settings, summary.id, _now_iso())
+
+
+def load_architecture_progress(settings: Settings, project_id: str) -> dict[str, object] | None:
+  summary = _project_summary_or_404(settings, project_id)
+  payload = read_json(_architecture_progress_path(_project_dir(summary)), None)
+  if not isinstance(payload, dict):
+    return None
+  if payload.get("schema_version") != _ARCHITECTURE_PROGRESS_SCHEMA_VERSION:
+    return None
+  return payload
+
+
+def save_architecture_progress(settings: Settings, project_id: str, payload: dict[str, object]) -> None:
+  summary = _project_summary_or_404(settings, project_id)
+  next_payload = {
+    **payload,
+    "schema_version": _ARCHITECTURE_PROGRESS_SCHEMA_VERSION,
+    "updated_at": _now_iso(),
+  }
+  atomic_write_json(_architecture_progress_path(_project_dir(summary)), next_payload)
+
+
+def clear_architecture_progress(settings: Settings, project_id: str) -> None:
+  summary = _project_summary_or_404(settings, project_id)
+  try:
+    _architecture_progress_path(_project_dir(summary)).unlink()
+  except FileNotFoundError:
+    pass
+
+
 def update_project_memory(
   settings: Settings,
   project_id: str,
@@ -6667,11 +6504,15 @@ def search_project_knowledge(
   project_id: str,
   query: str,
   limit: int = 8,
+  *,
+  ensure_current: bool = True,
+  include_semantic: bool = True,
 ) -> list[KnowledgeSearchResult]:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
-  _ensure_project_knowledge_current(settings, project_dir, summary.target_chapters)
-  return _search_project_knowledge(settings, project_dir, query, limit)
+  if ensure_current:
+    _ensure_project_knowledge_current(settings, project_dir, summary.target_chapters)
+  return _search_project_knowledge(settings, project_dir, query, limit, include_semantic=include_semantic)
 
 
 def search_project_knowledge_evidence(

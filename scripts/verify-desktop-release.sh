@@ -88,11 +88,27 @@ app_executable_path() {
   printf '%s\n' "$APP_BUNDLE/Contents/MacOS/$executable_name"
 }
 
+app_pids_for_executable() {
+  local executable="$1"
+  ps -axo pid=,command= | awk -v target="$executable" 'index($0, target) > 0 { print $1 }'
+}
+
+kill_app_bundle_sidecars() {
+  local sidecar="$APP_BUNDLE/Contents/MacOS/novel-backend"
+  local sidecar_pids
+  sidecar_pids="$(app_pids_for_executable "$sidecar" || true)"
+  if [[ -n "$sidecar_pids" ]]; then
+    printf '%s\n' "$sidecar_pids" | xargs kill 2>/dev/null || true
+  fi
+}
+
 smoke_app_launch() {
   local app_executable
   local log_file
   local pid
   local status
+  local before_pids
+  local current_pids
 
   app_executable="$(app_executable_path)"
   log_file="$BUILD_LOG_DIR/app-launch.log"
@@ -103,15 +119,35 @@ smoke_app_launch() {
     exit 1
   fi
 
-  "$app_executable" >"$log_file" 2>&1 &
-  pid=$!
+  before_pids="$(app_pids_for_executable "$app_executable" || true)"
+  open -n "$APP_BUNDLE" >"$log_file" 2>&1
+
+  for _ in $(seq 1 20); do
+    current_pids="$(app_pids_for_executable "$app_executable" || true)"
+    pid="$(
+      comm -13 \
+        <(printf '%s\n' "$before_pids" | sed '/^$/d' | sort -n) \
+        <(printf '%s\n' "$current_pids" | sed '/^$/d' | sort -n) \
+        | head -n 1
+    )"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  if [[ -z "${pid:-}" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo ".app 启动后没有保持运行" >&2
+    cat "$log_file" >&2 || true
+    kill_app_bundle_sidecars
+    exit 1
+  fi
 
   for _ in $(seq 1 20); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      wait "$pid" 2>/dev/null || status=$?
-      status="${status:-0}"
-      echo ".app 启动后提前退出: ${status}" >&2
+      echo ".app 启动后提前退出" >&2
       cat "$log_file" >&2 || true
+      kill_app_bundle_sidecars
       exit 1
     fi
     sleep 0.5
@@ -119,6 +155,7 @@ smoke_app_launch() {
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  kill_app_bundle_sidecars
 }
 
 log "运行 backend 回归"

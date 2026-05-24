@@ -17,6 +17,7 @@ from novel_backend.models import (
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log, append_prompt_history
 from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json
 from novel_backend.services.project_memory_service import append_project_memory, append_system_project_memory
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
@@ -341,8 +342,11 @@ def _invoke_model(
     for item in messages
   ).strip()
   started = time.perf_counter()
+  runtime_task = None
   try:
-    response_payload = _request_chat_completion(endpoint, api_key, chat_payload)
+    with model_runtime_slot(settings, lane="chat", task_name=task_name) as task:
+      runtime_task = task
+      response_payload = _request_chat_completion(endpoint, api_key, chat_payload)
     content = _extract_message_content(response_payload)
     elapsed = round(time.perf_counter() - started, 3)
     append_prompt_history(
@@ -354,6 +358,10 @@ def _invoke_model(
         "response": content,
         "status": "completed",
         "elapsed": elapsed,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
     append_app_log(settings, f"{task_name} completed in {elapsed:.3f}s")
@@ -361,6 +369,8 @@ def _invoke_model(
   except Exception as error:
     elapsed = round(time.perf_counter() - started, 3)
     classified_error = classify_model_error(error)
+    if classified_error.retryable:
+      mark_model_runtime_cooldown(settings, "chat", classified_error.title)
     append_prompt_history(
       settings,
       {
@@ -375,6 +385,10 @@ def _invoke_model(
         "error_title": classified_error.title,
         "error_user_action": classified_error.user_action,
         "error_retryable": classified_error.retryable,
+        "runtime_task_id": runtime_task.task_id if runtime_task is not None else "",
+        "runtime_lane": runtime_task.lane if runtime_task is not None else "chat",
+        "runtime_priority": runtime_task.priority if runtime_task is not None else 0,
+        "queue_wait_seconds": runtime_task.queue_wait_seconds if runtime_task is not None else 0.0,
       },
     )
     append_app_log(

@@ -16,6 +16,38 @@
 - 模型配置、许可证导入校验、整本导出
 - Tauri 桌面壳、sidecar backend、浏览器层 smoke 和桌面发布回归
 
+## 2026-05-24
+
+### Agent 章节目标字数修正
+
+- 修改摘要：Agent 对话里普通“写第一章 / 生成第 N 章”请求，在作品架构齐全且用户没有指定短稿或具体字数时，会按作品目标字数和目标章节数计算本章目标容量；例如 200000 字 / 30 章会把单章目标设为约 6667 字，不再沿用 1800 字默认短目标。
+- 影响范围：`agent_service` 章节生成计划目标字数、章节生成说明文档；保留用户明确指定字数、短稿、片段、开头、试写等短文本请求的处理方式，不改变 Studio 章节生成接口和章节保存路径。
+- 验证结果：`PYTHONPATH=backend python3 -m unittest backend.tests.test_agent_service` 通过，25 个用例通过。
+
+### 0.1.2 测试版发布
+
+- 修改摘要：发布版本号更新为 `0.1.2`，用于打包包含模型运行调度、辅助任务状态修正、模型总览生成状态修正、章节生成计划后续动作解析修正和 Agent 章节目标字数修正的测试版；同步 Tauri Rust crate 版本，并修正 macOS `.app` 启动验证方式，按真实 app bundle 启动并清理应用内 sidecar。
+- 影响范围：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`scripts/verify-desktop-release.sh`、README Release 链接、桌面发布回归说明和 macOS 测试包命名。
+- 验证结果：`npm run verify:ui` 通过；`npm run release:test:macos` 通过，包含 166 个后端 unittest、前端生产构建、Python sidecar 打包与健康检查、Tauri debug app/dmg 构建、签名修复、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理。测试包路径：`release/test-release/macos/稿匣_0.1.2_测试包`；DMG SHA256：`5190c083650e3838996c8214677839165d36efcd0af1b28486879416c5930da8`。
+
+### 架构总览打开触发模型总览修正
+
+- 修改摘要：打开架构总览时，`review_characters=true` 请求会允许后端生成或读取模型总览；移除本地规则后，前端按钮不再只拿到空人物关系图。界面 smoke 的假模型也补齐模型总览结构化返回，并改用非占位模型名。
+- 影响范围：`project_service` 项目详情、架构总览弹窗、UI smoke 假模型和总览回归检查；不改变 `.gaoxia/story_overview_model.json` 缓存格式。
+- 验证结果：`PYTHONPATH=backend python3 -m pytest backend/tests/test_project_service.py backend/tests/test_agent_service.py` 通过，60 个用例通过；`npm run verify:ui` 通过；`npm run release:test:macos` 通过。
+
+### 章节生成计划后续动作解析修正
+
+- 修改摘要：Agent 计划里如果先生成一个新章节，后续同一计划里的去 AI、润色或一致性检查会绑定到前面即将生成的章节；不会因为执行前还没有“最近已写章节”而拒绝执行。
+- 影响范围：`agent_service` 计划解析和章节生成后的后续处理；不改变章节正文生成、改稿、核验接口或前端 SSE 协议。
+- 验证结果：新增 Agent 计划回归用例；`PYTHONPATH=backend python3 -m pytest backend/tests` 通过，164 个用例通过。
+
+### 模型总览生成状态修正
+
+- 修改摘要：模型版故事总览优先使用第二审查模型；第二审查模型不可用时，改用当前写作模型生成 `.gaoxia/story_overview_model.json`。模型总览请求超时时间改为 240 秒，来源分片上限改为约 4500 字符，并限制每个分片输出的核心节点数量；人物关系图只接收稳定人物，排除单一旧设定里的旧名、职务泛称和临时配角。强制刷新会绕过已有缓存重新请求模型。如果没有生成缓存文件，`story_overview_model` 辅助任务会记录为失败并等待重试，不再显示完成。架构分步生成也新增人物名单一致性要求，情节骨架、人物状态和章节蓝图不得默默替换核心人物或改名。
+- 影响范围：`generation_service` 架构分步提示词、`project_service` 模型总览生成、`project_auxiliary_service` 辅助任务状态、关系总览数据来源、README、核心引擎说明和 Agent 执行架构说明；不改变架构文件、章节正文、资料库文本索引或模型总览缓存格式。
+- 验证结果：`PYTHONPATH=backend python3 -m pytest backend/tests` 通过，163 个用例通过；`npm run build` 通过；`git diff --check` 通过。
+
 ## 2026-05-23
 
 ### 分支合并与文档同步
@@ -39,6 +71,32 @@
 - 修改摘要：设置页恢复“单独设置 Embedding”开关和独立输入项。默认仍按当前写作模型推导 Embedding；勾选后可单独填写 Embedding 服务商、模型、接口地址、API Key、向量维度、检索数量和批量大小。后端保存完整配置时保留传入的 `embedding`，不再按写作模型强制覆盖；旧的单独 `ModelConfig` 保存路径仍会自动推导 Embedding。
 - 影响范围：模型设置页、`AppConfigUpdateRequest` 保存语义、Embedding 配置持久化、界面 smoke 设置页检查、README、核心引擎说明、界面回归说明和测试反馈清单；不改变知识库索引文件格式、模型请求接口或环境变量名称。
 - 验证结果：`.venv/bin/python -m unittest backend.tests.test_config_service -v` 通过，7 个用例通过；`npm run backend:test` 通过，123 个后端用例通过；`npm run build` 通过；`npm run verify` 通过；`npm run verify:ui` 通过，包含设置页“单独设置 Embedding”检查；`git diff --check` 通过。
+
+### 架构生成分步保存与辅助任务后台化
+
+- 修改摘要：Agent 整书架构改为七个步骤逐步保存，任务开始时只构建一次项目上下文快照，后续步骤复用快照并通过 workspace 使用前面步骤刚生成的内容；每完成一个步骤就写入对应设定文件，并把进度记录到 `.gaoxia/architecture_progress.json`；中途失败后，同一指令再次执行会重新读取项目文件和进度，跳过已经保存且仍有内容的步骤，从失败步骤继续执行。知识库索引刷新、模型版故事总览和系统记忆刷新改为 `.gaoxia/auxiliary_tasks.json` 后台辅助任务，FastAPI lifespan 启动巡检，失败会记录错误并按重试时间再次处理。
+- 影响范围：`agent_service` 整书架构执行、`project_service` 设定文件轻量写入、架构进度文件、辅助任务队列、项目详情故事总览读取、架构上下文知识检索、第二审查模型使用方式和相关说明文档；不改变章节正文保存路径、SSE 事件协议或主模型配置格式。
+- 配置变化：新增 `NOVEL_AUXILIARY_WORKER_ENABLED` 和 `NOVEL_AUXILIARY_WORKER_INTERVAL_SECONDS`；模型版故事总览、人物候选和世界要素复核使用第二审查模型配置及 `NOVEL_REVIEW_MODEL_API_KEY / NOVEL_REVIEW_MODEL_BASE_URL / NOVEL_REVIEW_MODEL_NAME`。
+- 验证结果：`python3 -m compileall backend/novel_backend backend/tests/test_agent_service.py backend/tests/test_project_service.py` 通过；定向 pytest 4 个用例通过；`npm run verify` 通过，159 个后端 unittest 和前端生产构建通过；`git diff --check` 通过。
+
+### 模型运行调度与后台闲时执行
+
+- 修改摘要：新增 `model_runtime_service` 统一管理聊天模型和检索模型运行通道，默认主模型并发为 1、Embedding/rerank 并发为 1；Prompt 历史新增运行时任务 ID、通道、优先级和排队等待时间。章节候选默认改为 `standard` 单候选，`fast` 减少审校请求，`deep` 保留 3 候选但经调度通道顺序执行。设置页新增模型运行调度配置，工作台顶部会显示当前模型任务和队列状态。
+- 影响范围：主模型调用、辅助模型、项目愿景、Embedding、rerank、qwen-doc 文档抽取、章节候选生成、章节审校、自学习后台排程、辅助任务巡检、模型设置页、Studio 运行状态接口和相关测试；不改变章节保存路径、SSE 事件格式或现有模型服务商配置字段。
+- 后台策略：辅助任务巡检在前台模型或检索任务忙时延后；自学习排程只有包含 `model_review` 时受空闲窗口限制，纯技能整理和写作回归仍可按原排程执行。
+- 验证结果：`python3 -m compileall backend/novel_backend` 通过；`PYTHONPATH=backend python3 -m pytest backend/tests` 通过，162 个用例通过；`npm run build` 通过；`curl -fsS http://127.0.0.1:1420/` 确认可读取本地 Vite 页面。未用真实外部模型做联网联调。
+
+### 辅助知识索引失败状态修正
+
+- 修改摘要：知识库向量刷新失败时，`knowledge_index` 辅助任务不再被误记为完成；队列会把失败原因写入 `.gaoxia/auxiliary_tasks.json`，保留重试次数和下次处理时间，后续巡检按原机制再次处理。
+- 影响范围：辅助任务队列、项目知识索引刷新结果、Embedding 网络异常记录；不改变架构文件、章节正文、知识库文本索引或模型配置字段。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_auxiliary_service -v` 通过；`npm run verify` 通过，163 个后端 unittest 和前端生产构建通过；`git diff --check` 通过。
+
+### 关系总览移除本地规则生成
+
+- 修改摘要：项目详情里的关系总览只读取 `.gaoxia/story_overview_model.json` 模型总览缓存；没有可用缓存时，人物、事件、地点、组织、道具、技能和场景列表保持为空，不再用本地文本规则从架构文件、资料或章节中猜测节点。
+- 影响范围：`project_service` 故事总览构建、项目详情返回数据、项目记忆中的自动人物/要素条目、关系总览空状态文案、README、核心引擎说明和 Agent 执行架构说明；不改变架构文件、章节正文、资料库文本索引、模型总览缓存格式或第二审查模型配置字段。
+- 验证结果：`PYTHONPATH=backend python3 -m pytest backend/tests` 通过，160 个用例通过；`npm run build` 通过。
 
 ## 2026-05-22
 

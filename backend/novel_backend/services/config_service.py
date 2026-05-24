@@ -10,6 +10,7 @@ from novel_backend.models import (
   ChapterAutoRepairConfig,
   EmbeddingConfig,
   ModelConfig,
+  ModelRuntimeConfig,
   ReviewModelConfig,
 )
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
@@ -665,6 +666,7 @@ def load_config(settings: Settings) -> AppConfig:
         embedding=EmbeddingConfig(),
         review_model=ReviewModelConfig(),
         chapter_auto_repair=ChapterAutoRepairConfig(),
+        model_runtime=ModelRuntimeConfig(),
       ),
     )
 
@@ -686,22 +688,32 @@ def _existing_chapter_auto_repair_config(settings: Settings) -> ChapterAutoRepai
   return ChapterAutoRepairConfig()
 
 
+def _existing_model_runtime_config(settings: Settings) -> ModelRuntimeConfig:
+  payload = read_json(app_config_path(settings), None)
+  if isinstance(payload, dict) and isinstance(payload.get("model_runtime"), dict):
+    return ModelRuntimeConfig.model_validate(payload["model_runtime"])
+  return ModelRuntimeConfig()
+
+
 def save_config(settings: Settings, config_update: AppConfigUpdateRequest | ModelConfig) -> AppConfig:
   if isinstance(config_update, ModelConfig):
     model_config = config_update
     embedding_config = resolve_embedding_config(model_config)
     review_model_config = _existing_review_model_config(settings)
     chapter_auto_repair_config = _existing_chapter_auto_repair_config(settings)
+    model_runtime_config = _existing_model_runtime_config(settings)
   else:
     model_config = config_update.model
     embedding_config = config_update.embedding
     review_model_config = ReviewModelConfig.model_validate(config_update.review_model)
     chapter_auto_repair_config = ChapterAutoRepairConfig.model_validate(config_update.chapter_auto_repair)
+    model_runtime_config = ModelRuntimeConfig.model_validate(config_update.model_runtime)
   payload = AppConfig(
     model=model_config,
     embedding=embedding_config,
     review_model=review_model_config,
     chapter_auto_repair=chapter_auto_repair_config,
+    model_runtime=model_runtime_config,
     updated_at=_now_iso(),
   )
   atomic_write_json(app_config_path(settings), payload.model_dump(mode="json"))

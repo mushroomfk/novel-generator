@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -265,7 +265,7 @@ async function seedModelConfig(backendUrl, modelBaseUrl) {
         provider: 'openai-compatible',
         base_url: modelBaseUrl,
         api_key: 'ui-smoke-key',
-        model_name: 'demo-model',
+        model_name: 'ui-smoke-model',
         max_tokens: 4096,
         temperature: 0.7,
       },
@@ -313,12 +313,20 @@ function runTextTool(args) {
   return result.stdout.trim();
 }
 
+async function readTail(filePath, maxLines = 80) {
+  try {
+    const text = await readFile(filePath, 'utf-8');
+    return text.split(/\r?\n/u).slice(-maxLines).join('\n').trim();
+  } catch {
+    return '';
+  }
+}
+
 function createSmokeLicense() {
   const keypair = runJsonTool(['scripts/generate-license-keypair.py', '--json']);
   const content = runTextTool([
     'scripts/create-license.py',
-    '--private-key',
-    keypair.private_key,
+    `--private-key=${keypair.private_key}`,
     '--licensee',
     'UI smoke',
     '--expires-at',
@@ -482,6 +490,13 @@ function mockPlanResult(userText) {
   };
 }
 
+function isSecondChapterRevisionPrompt(userText) {
+  const normalized = String(userText ?? '');
+  return /(?:当前章节|目标章节|待处理章节)[：:]\s*第\s*(?:2|二)\s*章/u.test(normalized)
+    || /原正文[：:][\s\S]{0,120}#\s*(?:第二章|第\s*2\s*章)/u.test(normalized)
+    || /章节正文[：:][\s\S]{0,120}#\s*(?:第二章|第\s*2\s*章)/u.test(normalized);
+}
+
 function mockChatCompletionContent(messages) {
   const systemText = messages
     .filter((item) => item?.role === 'system')
@@ -512,6 +527,203 @@ function mockChatCompletionContent(messages) {
       summary: `这一版先把${stepLabel || '当前步骤'}和现有项目文档接上，方便后面继续写。`,
       content: architectureStepContent(stepLabel),
       checklist: ['检查是否和当前章节冲突', '确认后续还能继续展开'],
+    }, null, 2);
+  }
+
+  if (systemText.includes('中文长篇小说资料整理编辑')) {
+    return JSON.stringify({
+      characters: [
+        {
+          name: '主角',
+          profile: '擅长开锁，被旧钥匙重新卷进港口旧案。',
+          current_state: '刚离开灯塔，已被港务会追兵盯上。',
+          relationships: [
+            '码头旧友：提供线索但立场摇摆',
+            '旧船队后人：掌握关键账册',
+          ],
+          events: [
+            {
+              name: '钥匙重回港口',
+              summary: '旧船队失踪留下的钥匙重回港口。',
+              related_characters: ['主角'],
+              evidence: ['旧船队失踪留下的钥匙重回港口'],
+            },
+            {
+              name: '追兵持续施压',
+              summary: '港务会追兵持续施压。',
+              related_characters: ['主角'],
+              evidence: ['港务会追兵持续施压'],
+            },
+          ],
+          locations: [
+            {
+              name: '灯塔',
+              summary: '灯塔暗号牵连灰色航线。',
+              related_characters: ['主角'],
+              evidence: ['灯塔暗号'],
+            },
+            {
+              name: '港口',
+              summary: '港口秩序被港务会和商会掩盖。',
+              related_characters: ['主角'],
+              evidence: ['港口依赖潮位和灯塔暗号'],
+            },
+          ],
+          props: [
+            {
+              name: '钥匙',
+              summary: '旧船队失踪留下的钥匙。',
+              related_characters: ['主角'],
+              evidence: ['旧船队失踪留下的钥匙'],
+            },
+          ],
+          skills: [
+            {
+              name: '开锁',
+              summary: '主角擅长开锁。',
+              related_characters: ['主角'],
+              evidence: ['主角擅长开锁'],
+            },
+          ],
+          scenes: [
+            {
+              name: '雨夜靠港',
+              summary: '第一章让钥匙回到主角手里。',
+              related_characters: ['主角'],
+              evidence: ['第 1 章《雨夜靠港》'],
+            },
+          ],
+          organizations: [
+            {
+              name: '港务会',
+              summary: '港务会追兵持续施压。',
+              related_characters: ['主角'],
+              evidence: ['港务会追兵持续施压'],
+            },
+          ],
+          evidence: ['主角擅长开锁', '刚离开灯塔'],
+        },
+        {
+          name: '码头旧友',
+          profile: '提供线索，但立场处在摇摆状态。',
+          current_state: '暂时协助主角，仍未完全站队。',
+          relationships: ['主角：提供线索但立场摇摆'],
+          events: [
+            {
+              name: '旧友提供线索',
+              summary: '码头旧友提供线索。',
+              related_characters: ['主角', '码头旧友'],
+              evidence: ['码头旧友提供线索'],
+            },
+          ],
+          locations: [
+            {
+              name: '港口',
+              summary: '码头旧友在港口线索里活动。',
+              related_characters: ['码头旧友'],
+              evidence: ['港口依赖潮位和灯塔暗号'],
+            },
+          ],
+          props: [],
+          skills: [],
+          scenes: [],
+          organizations: [],
+          evidence: ['码头旧友提供线索', '码头旧友立场摇摆'],
+        },
+        {
+          name: '旧船队后人',
+          profile: '掌握关键账册和旧船队真相碎片。',
+          current_state: '暂时不敢露面。',
+          relationships: ['主角：握有后续真相碎片'],
+          events: [
+            {
+              name: '关键账册未露面',
+              summary: '旧船队后人掌握关键账册。',
+              related_characters: ['主角', '旧船队后人'],
+              evidence: ['旧船队后人掌握关键账册'],
+            },
+          ],
+          locations: [],
+          props: [
+            {
+              name: '关键账册',
+              summary: '旧船队后人掌握关键账册。',
+              related_characters: ['旧船队后人'],
+              evidence: ['旧船队后人掌握关键账册'],
+            },
+          ],
+          skills: [],
+          scenes: [],
+          organizations: [],
+          evidence: ['旧船队后人掌握关键账册', '旧船队后人暂时不敢露面'],
+        },
+      ],
+      events: [
+        {
+          name: '钥匙重回港口',
+          summary: '旧船队失踪留下的钥匙重回港口。',
+          related_characters: ['主角'],
+          evidence: ['旧船队失踪留下的钥匙重回港口'],
+        },
+        {
+          name: '追兵持续施压',
+          summary: '港务会追兵持续施压。',
+          related_characters: ['主角'],
+          evidence: ['港务会追兵持续施压'],
+        },
+      ],
+      locations: [
+        {
+          name: '港口',
+          summary: '港口依赖潮位和灯塔暗号维持灰色航线。',
+          related_characters: ['主角', '码头旧友'],
+          evidence: ['港口依赖潮位和灯塔暗号'],
+        },
+        {
+          name: '灯塔',
+          summary: '灯塔暗号维持灰色航线。',
+          related_characters: ['主角'],
+          evidence: ['灯塔暗号'],
+        },
+      ],
+      props: [
+        {
+          name: '钥匙',
+          summary: '旧船队失踪留下的钥匙。',
+          related_characters: ['主角'],
+          evidence: ['旧船队失踪留下的钥匙'],
+        },
+        {
+          name: '关键账册',
+          summary: '旧船队后人掌握关键账册。',
+          related_characters: ['旧船队后人'],
+          evidence: ['旧船队后人掌握关键账册'],
+        },
+      ],
+      skills: [
+        {
+          name: '开锁',
+          summary: '主角擅长开锁。',
+          related_characters: ['主角'],
+          evidence: ['主角擅长开锁'],
+        },
+      ],
+      scenes: [
+        {
+          name: '雨夜靠港',
+          summary: '钥匙回到主角手里，追兵第一次逼近。',
+          related_characters: ['主角'],
+          evidence: ['第 1 章《雨夜靠港》'],
+        },
+      ],
+      organizations: [
+        {
+          name: '港务会',
+          summary: '港务会追兵持续施压。',
+          related_characters: ['主角'],
+          evidence: ['港务会追兵持续施压'],
+        },
+      ],
     }, null, 2);
   }
 
@@ -571,6 +783,36 @@ function mockChatCompletionContent(messages) {
 
   if (systemText.includes('中文小说续写写手')) {
     return '他把钥匙按进掌心，刚离开灯塔就听见潮声后面有人跟来。港务会的人没有点灯，只靠靴底刮过木栈道的声音逼近，像在提醒他这次回港不是偶然。';
+  }
+
+  if (systemText.includes('中文小说去 AI 改稿编辑')) {
+    if (isSecondChapterRevisionPrompt(userText)) {
+      return JSON.stringify({
+        headline: '第二章语言已处理',
+        summary: '保留旧船队名单和铜钥匙暗纹线索，只收紧说明腔。',
+        revised: '# 第二章 旧船队名单\n他在旧档案室里把旧船队名单翻出来，发现最后一页被人重新装订过。港务会的人追到门外时，他才看见名单边角压着和铜钥匙同样的暗纹。',
+        changes: ['保留原有情节事实', '减少解释性句子', '保持追查压力'],
+        updated_summary: '',
+        updated_character_state: '',
+      }, null, 2);
+    }
+
+    return JSON.stringify({
+      headline: '第一章语言已处理',
+      summary: '保留灯塔、潮声、追兵和钥匙线索，只压掉模板腔。',
+      revised: '# 第一章 雨夜靠港\n他把钥匙按进掌心，刚离开灯塔就听见潮声后面有人跟来。港务会的人没有点灯，只靠靴底刮过木栈道的声音逼近，像在提醒他这次回港不是偶然。',
+      changes: ['保留原有情节事实', '减少解释性句子', '保持现场压力'],
+      updated_summary: '',
+      updated_character_state: '',
+    }, null, 2);
+  }
+
+  if (systemText.includes('中文小说一致性检查编辑')) {
+    return JSON.stringify({
+      summary: '当前章节与既有设定一致，灯塔、钥匙和追兵线索可以继续推进。',
+      issues: [],
+      suggestions: ['下一步继续追查旧船队名单。'],
+    }, null, 2);
   }
 
   if (systemText.includes('中文小说章节写手')) {
@@ -929,10 +1171,9 @@ async function runSmoke(previewUrl, backendUrl) {
     });
     await page.getByTestId('agent-plan-card').waitFor();
     await page.getByTestId('agent-plan-card').getByText(/生成第 1 章正文|第 1 章《.*》正文/u).first().waitFor();
-    await page.getByText('已经生成并写回项目').first().waitFor({ timeout: 20000 });
     await page.getByTestId('agent-timeline').first().waitFor();
     await page.getByTestId('agent-artifact-card').first().waitFor();
-    await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来');
+    await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来', { timeoutMs: 60000 });
     await waitForChapterPreviewContent(page, '潮声后面有人跟来');
     await page.locator('[data-testid^="agent-session-row-"]').first().waitFor();
     await page.getByTestId('agent-session-window').getByText(/续写这一章|追兵/u).first().waitFor();
@@ -948,8 +1189,7 @@ async function runSmoke(previewUrl, backendUrl) {
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
     await page.getByTestId('agent-plan-card').getByText(/生成第 2 章正文/u).first().waitFor();
-    await page.getByText(/第 2 章《.*》已经生成并写回项目/u).first().waitFor({ timeout: 20000 });
-    await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002');
+    await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002', { timeoutMs: 60000 });
 
     log('检查混合命令优先走架构');
     await page.getByTestId('workspace-composer-input').fill('把资料库的资料分析完，再重新弄续写架构');
@@ -1228,9 +1468,17 @@ async function main() {
       .map((processInfo) => processInfo.readLogs())
       .filter(Boolean)
       .join('\n');
+    const appLog = await readTail(path.join(dataDir, 'logs', 'app.log'), 120);
+    const promptLog = await readTail(path.join(dataDir, 'logs', 'prompt_history.jsonl'), 40);
 
     if (logs) {
       console.error(`\n${logs}`);
+    }
+    if (appLog) {
+      console.error(`\n----- app.log -----\n${appLog}`);
+    }
+    if (promptLog) {
+      console.error(`\n----- prompt_history.jsonl -----\n${promptLog}`);
     }
 
     throw error;

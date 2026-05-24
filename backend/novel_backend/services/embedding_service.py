@@ -8,6 +8,7 @@ from novel_backend.config import Settings
 from novel_backend.models import EmbeddingConfig
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json
 
 
@@ -116,23 +117,34 @@ def embed_texts(settings: Settings, texts: list[str], *, task_name: str = "embed
   endpoint = _embeddings_endpoint(config.base_url)
   started = time.perf_counter()
   vectors: list[list[float]] = []
+  runtime_task = None
 
   try:
-    for batch in _batches(cleaned, config.batch_size):
-      payload: dict[str, object] = {
-        "model": config.model_name,
-        "input": batch,
-      }
-      if config.dimensions is not None:
-        payload["dimensions"] = config.dimensions
-      response_payload = _request_embeddings(endpoint, api_key, payload)
-      vectors.extend(_extract_embedding_vectors(response_payload, len(batch)))
+    with model_runtime_slot(settings, lane="retrieval", task_name=task_name) as task:
+      runtime_task = task
+      for batch in _batches(cleaned, config.batch_size):
+        payload: dict[str, object] = {
+          "model": config.model_name,
+          "input": batch,
+        }
+        if config.dimensions is not None:
+          payload["dimensions"] = config.dimensions
+        response_payload = _request_embeddings(endpoint, api_key, payload)
+        vectors.extend(_extract_embedding_vectors(response_payload, len(batch)))
 
     elapsed = round(time.perf_counter() - started, 3)
-    append_app_log(settings, f"{task_name} completed in {elapsed:.3f}s for {len(cleaned)} chunks")
+    append_app_log(
+      settings,
+      (
+        f"{task_name} completed in {elapsed:.3f}s for {len(cleaned)} chunks "
+        f"(queue_wait={runtime_task.queue_wait_seconds if runtime_task is not None else 0.0:.3f}s)"
+      ),
+    )
     return vectors
   except Exception as error:
     elapsed = round(time.perf_counter() - started, 3)
+    if runtime_task is not None:
+      mark_model_runtime_cooldown(settings, "retrieval", str(error))
     append_app_log(settings, f"{task_name} failed in {elapsed:.3f}s: {error}", level="ERROR")
     raise
 

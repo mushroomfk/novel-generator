@@ -5,7 +5,14 @@ import unittest
 from pathlib import Path
 
 from novel_backend.config import Settings
-from novel_backend.models import AppConfigUpdateRequest, ChapterAutoRepairConfig, EmbeddingConfig, ModelConfig, ReviewModelConfig
+from novel_backend.models import (
+  AppConfigUpdateRequest,
+  ChapterAutoRepairConfig,
+  EmbeddingConfig,
+  ModelConfig,
+  ModelRuntimeConfig,
+  ReviewModelConfig,
+)
 from novel_backend.services.config_service import initialize_app_storage, load_config, save_config
 
 
@@ -28,6 +35,9 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertTrue(config.chapter_auto_repair.enabled)
     self.assertEqual(config.chapter_auto_repair.score_threshold, 65)
     self.assertEqual(config.chapter_auto_repair.max_rounds, 1)
+    self.assertEqual(config.model_runtime.max_chat_concurrency, 1)
+    self.assertEqual(config.model_runtime.max_retrieval_concurrency, 1)
+    self.assertEqual(config.model_runtime.chapter_candidate_mode, "standard")
 
   def test_save_config_persists_chapter_auto_repair_settings(self) -> None:
     config = save_config(
@@ -57,6 +67,7 @@ class ConfigServiceTestCase(unittest.TestCase):
       AppConfigUpdateRequest(
         model=ModelConfig(model_name="demo-model"),
         chapter_auto_repair=ChapterAutoRepairConfig(score_threshold=70, max_rounds=2),
+        model_runtime=ModelRuntimeConfig(background_requires_idle_seconds=15, chapter_candidate_mode="deep"),
       ),
     )
 
@@ -64,6 +75,8 @@ class ConfigServiceTestCase(unittest.TestCase):
 
     self.assertEqual(config.chapter_auto_repair.score_threshold, 70)
     self.assertEqual(config.chapter_auto_repair.max_rounds, 2)
+    self.assertEqual(config.model_runtime.background_requires_idle_seconds, 15)
+    self.assertEqual(config.model_runtime.chapter_candidate_mode, "deep")
 
   def test_save_model_config_auto_uses_aliyun_embedding_for_aliyun_model(self) -> None:
     config = save_config(

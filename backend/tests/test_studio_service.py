@@ -805,7 +805,7 @@ class StudioServiceTestCase(unittest.TestCase):
     blueprint = next(item for item in detail.story_overview.documents if item.key == "blueprint")
     self.assertIn("潮位窗口", blueprint.content)
 
-  def test_chapter_generate_stream_uses_parallel_candidate_pipeline(self) -> None:
+  def test_chapter_generate_stream_uses_standard_single_candidate_pipeline(self) -> None:
     save_config(
       self.settings,
       ModelConfig(
@@ -822,12 +822,12 @@ class StudioServiceTestCase(unittest.TestCase):
     )
 
     def fake_pipeline(_settings, **kwargs):
-      self.assertEqual(kwargs["candidate_count"], 3)
+      self.assertEqual(kwargs["candidate_count"], 1)
       self.assertEqual(kwargs["task_name_prefix"], "chapter_generate")
       self.assertTrue(kwargs["complete_chapter"])
       return {
         "headline": "章节初稿已修订",
-        "summary": "已并行生成 3 个候选，并由三类审校择优。",
+        "summary": "已按标准模式生成候选，并完成审校。",
         "content": (
           "# 第一章 雨夜靠港\n"
           "林追在旧码头仓库找到一把铜钥匙。\n"
@@ -853,7 +853,7 @@ class StudioServiceTestCase(unittest.TestCase):
 
     result_event = next(item for item in events if item[0] == "result")
     self.assertIn("那股看不见的人气已经贴到了门边", result_event[1]["content"])
-    self.assertIn("并行生成 3 个候选", result_event[1]["summary"])
+    self.assertIn("标准模式生成候选", result_event[1]["summary"])
 
   def test_style_analyze_stream_and_related_storage(self) -> None:
     with patch(

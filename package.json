@@ -1,7 +1,7 @@
 {
   "name": "novel-generator",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local desktop writing workbench for long-form novel projects.",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

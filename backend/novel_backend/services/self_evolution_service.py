@@ -27,6 +27,7 @@ from novel_backend.services.generation_service import (
   _string_list_from_keys,
 )
 from novel_backend.services.config_service import load_config
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.project_memory_service import append_project_memory
 from novel_backend.services.skill_service import materialize_skill
 from novel_backend.services.skill_usage_service import (
@@ -1138,16 +1139,21 @@ def _invoke_optional_reviewer_model(settings: Settings, messages: list[dict[str,
   if not api_key or not base_url or not model_name:
     return ""
   endpoint = _chat_completions_endpoint(base_url)
-  response_payload = _request_chat_completion(
-    endpoint,
-    api_key,
-    {
-      "model": model_name,
-      "messages": messages,
-      "temperature": temperature,
-      "max_tokens": max_tokens,
-    },
-  )
+  try:
+    with model_runtime_slot(settings, lane="chat", task_name="self_evolution_model_review:cross"):
+      response_payload = _request_chat_completion(
+        endpoint,
+        api_key,
+        {
+          "model": model_name,
+          "messages": messages,
+          "temperature": temperature,
+          "max_tokens": max_tokens,
+        },
+      )
+  except Exception as error:
+    mark_model_runtime_cooldown(settings, "chat", str(error))
+    raise
   return _extract_message_content(response_payload)
 
 

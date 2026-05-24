@@ -24,6 +24,7 @@ from novel_backend.models import (
 )
 from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json as transport_request_json
 
 
@@ -298,37 +299,44 @@ def _should_use_qwen_doc(settings: Settings | None, suffix: str) -> bool:
 def _extract_with_qwen_doc(settings: Settings, filename: str, data: bytes) -> str:
   api_key = _resolve_qwen_doc_api_key(settings)
   file_id = ""
+  runtime_task = None
   try:
-    file_id = _upload_qwen_doc_file(settings, api_key, filename, data)
-    _wait_for_qwen_doc_file(settings, api_key, file_id)
-    payload = _request_json(
-      _qwen_doc_chat_endpoint(settings),
-      api_key,
-      method="POST",
-      payload={
-        "model": _QWEN_DOC_MODEL_NAME,
-        "messages": [
-          {
-            "role": "system",
-            "content": "你是文档抽取助手，只负责按原意提取文本内容，不做总结，不做改写，不补充说明。",
-          },
-          {
-            "role": "system",
-            "content": f"fileid://{file_id}",
-          },
-          {
-            "role": "user",
-            "content": "请完整提取这份文档的正文，保留标题层级、段落、列表和表格信息。直接输出整理后的文本。",
-          },
-        ],
-        "temperature": 0,
-      },
-    )
-    content = _extract_chat_content(payload).strip()
+    with model_runtime_slot(settings, lane="retrieval", task_name="qwen_doc_extract") as task:
+      runtime_task = task
+      file_id = _upload_qwen_doc_file(settings, api_key, filename, data)
+      _wait_for_qwen_doc_file(settings, api_key, file_id)
+      payload = _request_json(
+        _qwen_doc_chat_endpoint(settings),
+        api_key,
+        method="POST",
+        payload={
+          "model": _QWEN_DOC_MODEL_NAME,
+          "messages": [
+            {
+              "role": "system",
+              "content": "你是文档抽取助手，只负责按原意提取文本内容，不做总结，不做改写，不补充说明。",
+            },
+            {
+              "role": "system",
+              "content": f"fileid://{file_id}",
+            },
+            {
+              "role": "user",
+              "content": "请完整提取这份文档的正文，保留标题层级、段落、列表和表格信息。直接输出整理后的文本。",
+            },
+          ],
+          "temperature": 0,
+        },
+      )
+      content = _extract_chat_content(payload).strip()
     if not content:
       raise RuntimeError("qwen-doc-turbo 没有返回正文")
     append_app_log(settings, f"qwen_doc_extract completed for {filename}")
     return content
+  except Exception as error:
+    if runtime_task is not None:
+      mark_model_runtime_cooldown(settings, "retrieval", str(error))
+    raise
   finally:
     if file_id:
       try:

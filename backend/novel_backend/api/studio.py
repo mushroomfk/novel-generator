@@ -47,6 +47,7 @@ from novel_backend.services.log_service import (
   get_app_log_tail,
   get_prompt_history_records,
 )
+from novel_backend.services.model_runtime_service import get_model_runtime_state
 from novel_backend.services.agent_trajectory_service import get_agent_trajectory_records
 from novel_backend.services.preset_service import (
   activate_prompt_preset,
@@ -169,6 +170,12 @@ def get_self_evolution(
   settings = request.app.state.settings
   detail = get_project_detail(settings, project_id)
   return {"ok": True, "data": get_self_evolution_state(settings, Path(detail.path))}
+
+
+@router.get("/model-runtime")
+def get_model_runtime(request: Request):
+  settings = request.app.state.settings
+  return {"ok": True, "data": get_model_runtime_state(settings)}
 
 
 @router.post("/brainstorm/stream")

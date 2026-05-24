@@ -155,6 +155,10 @@ export async function getSelfEvolutionReport(projectId) {
   return request(`/api/studio/self-evolution?${params.toString()}`);
 }
 
+export async function getModelRuntime() {
+  return request('/api/studio/model-runtime');
+}
+
 export async function listProjects() {
   return request('/api/projects');
 }

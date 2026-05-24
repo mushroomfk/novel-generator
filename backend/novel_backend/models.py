@@ -47,11 +47,23 @@ class ChapterAutoRepairConfig(BaseModel):
   max_rounds: int = Field(default=1, ge=0, le=3)
 
 
+class ModelRuntimeConfig(BaseModel):
+  max_chat_concurrency: int = Field(default=1, ge=1, le=4)
+  max_retrieval_concurrency: int = Field(default=1, ge=1, le=4)
+  background_model_enabled: bool = True
+  background_requires_idle_seconds: int = Field(default=90, ge=0, le=3600)
+  chapter_candidate_mode: str = Field(default="standard", pattern="^(fast|standard|deep)$")
+  queue_policy: str = Field(default="wait", pattern="^(wait|reject)$")
+  max_queue_size: int = Field(default=24, ge=1, le=200)
+  provider_cooldown_seconds: int = Field(default=1800, ge=0, le=86400)
+
+
 class AppConfig(BaseModel):
   model: ModelConfig = Field(default_factory=ModelConfig)
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
   review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
   chapter_auto_repair: ChapterAutoRepairConfig = Field(default_factory=ChapterAutoRepairConfig)
+  model_runtime: ModelRuntimeConfig = Field(default_factory=ModelRuntimeConfig)
   updated_at: str
 
 
@@ -60,6 +72,7 @@ class AppConfigUpdateRequest(BaseModel):
   embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
   review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
   chapter_auto_repair: ChapterAutoRepairConfig = Field(default_factory=ChapterAutoRepairConfig)
+  model_runtime: ModelRuntimeConfig = Field(default_factory=ModelRuntimeConfig)
 
 
 class HealthPayload(BaseModel):

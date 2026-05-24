@@ -64,6 +64,16 @@ const form = reactive({
     score_threshold: 65,
     max_rounds: 1,
   },
+  model_runtime: {
+    max_chat_concurrency: 1,
+    max_retrieval_concurrency: 1,
+    background_model_enabled: true,
+    background_requires_idle_seconds: 90,
+    chapter_candidate_mode: 'standard',
+    queue_policy: 'wait',
+    max_queue_size: 24,
+    provider_cooldown_seconds: 1800,
+  },
 });
 
 const isSaving = ref(false);
@@ -198,6 +208,10 @@ watch(
       ...form.chapter_auto_repair,
       ...(nextConfig.chapter_auto_repair ?? {}),
     });
+    Object.assign(form.model_runtime, {
+      ...form.model_runtime,
+      ...(nextConfig.model_runtime ?? {}),
+    });
     customEmbeddingEnabled.value = !sameEmbeddingConfig(
       form.embedding,
       inferEmbeddingConfig(form.model, form.embedding),
@@ -227,6 +241,7 @@ async function save() {
       embedding: embeddingPayload,
       review_model: { ...form.review_model },
       chapter_auto_repair: { ...form.chapter_auto_repair },
+      model_runtime: { ...form.model_runtime },
     });
     message.value = '写作设置已保存';
     emit('updated');
@@ -517,6 +532,89 @@ async function save() {
         </div>
         <small class="field-helper">状态为 risk 会直接触发；其他状态低于触发分数时触发。建议最多 1 到 2 轮，避免正文偏离原章节目标。</small>
 
+        <div class="section-label">
+          模型运行调度
+        </div>
+        <div class="grid two-columns">
+          <label>
+            <span>主模型并发</span>
+            <input
+              v-model.number="form.model_runtime.max_chat_concurrency"
+              min="1"
+              max="4"
+              type="number"
+            />
+          </label>
+
+          <label>
+            <span>检索并发</span>
+            <input
+              v-model.number="form.model_runtime.max_retrieval_concurrency"
+              min="1"
+              max="4"
+              type="number"
+            />
+          </label>
+        </div>
+        <label class="switch-row">
+          <input
+            v-model="form.model_runtime.background_model_enabled"
+            type="checkbox"
+          />
+          <span>允许后台模型任务</span>
+        </label>
+        <div class="grid two-columns">
+          <label>
+            <span>后台空闲等待秒数</span>
+            <input
+              v-model.number="form.model_runtime.background_requires_idle_seconds"
+              min="0"
+              max="3600"
+              step="5"
+              type="number"
+            />
+          </label>
+
+          <label>
+            <span>失败冷却秒数</span>
+            <input
+              v-model.number="form.model_runtime.provider_cooldown_seconds"
+              min="0"
+              max="86400"
+              step="60"
+              type="number"
+            />
+          </label>
+        </div>
+        <div class="grid two-columns">
+          <label>
+            <span>章节候选模式</span>
+            <select v-model="form.model_runtime.chapter_candidate_mode">
+              <option value="fast">快速：少评审</option>
+              <option value="standard">标准：单候选</option>
+              <option value="deep">深度：多候选排队</option>
+            </select>
+          </label>
+
+          <label>
+            <span>队列策略</span>
+            <select v-model="form.model_runtime.queue_policy">
+              <option value="wait">等待</option>
+              <option value="reject">忙时拒绝</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          <span>队列容量</span>
+          <input
+            v-model.number="form.model_runtime.max_queue_size"
+            min="1"
+            max="200"
+            type="number"
+          />
+        </label>
+        <small class="field-helper">默认主模型和检索都设为 1；章节候选设为标准时会避免一次续写放大成多路模型请求。</small>
+
         <p
           v-if="message"
           class="message"
@@ -698,7 +796,8 @@ label > span {
   gap: 14px;
 }
 
-input {
+input,
+select {
   width: 100%;
   border: 1px solid #d0d7de;
   background: #ffffff;

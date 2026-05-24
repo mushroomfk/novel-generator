@@ -16,6 +16,7 @@ import {
   getApiBaseUrl,
   getConfig,
   getHealth,
+  getModelRuntime,
   getProjectDetail,
   listProjects,
   openProjectDirectory,
@@ -43,6 +44,7 @@ const exportFormat = ref('markdown');
 const isExporting = ref(false);
 const noticeMessage = ref('');
 const noticeMessageTone = ref('success');
+const modelRuntime = ref(null);
 const renameProjectTarget = ref(null);
 const renameProjectDraft = ref('');
 const deleteProjectTarget = ref(null);
@@ -52,6 +54,7 @@ const requestedDiscussionThreadId = ref('');
 const discussionThreadStates = ref({});
 let projectEventStream = null;
 let dashboardRetryTimer = null;
+let modelRuntimeTimer = null;
 const dashboardRetryCount = ref(0);
 const maxDashboardRetryCount = 4;
 const architectureReadyKeys = ['core_seed', 'character_design', 'world_building', 'plot_structure', 'blueprint'];
@@ -89,6 +92,30 @@ const selectedDiscussionThreadState = computed(() => (
     threads: [],
   }
 ));
+
+const modelRuntimeTask = computed(() => (
+  modelRuntime.value?.active?.[0] ?? modelRuntime.value?.waiting?.[0] ?? null
+));
+
+const modelRuntimeLine = computed(() => {
+  const state = modelRuntime.value;
+  if (!state) {
+    return '';
+  }
+  const task = modelRuntimeTask.value;
+  const cooldownEntries = Object.entries(state.cooldowns ?? {});
+  if (state.active_count > 0 && task) {
+    return `模型处理中：${task.task_name} · 等待 ${Number(task.queue_wait_seconds ?? 0).toFixed(1)}s`;
+  }
+  if (state.waiting_count > 0 && task) {
+    return `模型任务排队：${task.task_name} · 前方 ${Math.max(0, state.waiting_count - 1)} 个`;
+  }
+  if (cooldownEntries.length > 0) {
+    const [, cooldown] = cooldownEntries[0];
+    return `后台模型冷却中：约 ${cooldown.remaining_seconds ?? 0}s`;
+  }
+  return '';
+});
 
 const topLevelModalOpen = computed(() => (
   isCreateOpen.value
@@ -205,6 +232,31 @@ function clearDashboardRetryTimer() {
     window.clearTimeout(dashboardRetryTimer);
   }
   dashboardRetryTimer = null;
+}
+
+function clearModelRuntimeTimer() {
+  if (modelRuntimeTimer && typeof window !== 'undefined') {
+    window.clearInterval(modelRuntimeTimer);
+  }
+  modelRuntimeTimer = null;
+}
+
+async function refreshModelRuntimeState() {
+  try {
+    modelRuntime.value = await getModelRuntime();
+  } catch {
+    modelRuntime.value = null;
+  }
+}
+
+function startModelRuntimePolling() {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  clearModelRuntimeTimer();
+  modelRuntimeTimer = window.setInterval(() => {
+    void refreshModelRuntimeState();
+  }, 2000);
 }
 
 function scheduleDashboardRetry() {
@@ -635,11 +687,12 @@ async function refreshDashboard() {
   clearDashboardRetryTimer();
   const nextBootErrors = [];
 
-  const [healthResult, projectsResult, configResult] =
+  const [healthResult, projectsResult, configResult, modelRuntimeResult] =
     await Promise.allSettled([
       getHealth(),
       listProjects(),
       getConfig(),
+      getModelRuntime(),
     ]);
 
   if (healthResult.status === 'fulfilled') {
@@ -658,6 +711,10 @@ async function refreshDashboard() {
     config.value = configResult.value;
   } else {
     nextBootErrors.push(`AI 写作设置读取失败：${configResult.reason instanceof Error ? configResult.reason.message : '未知错误'}`);
+  }
+
+  if (modelRuntimeResult.status === 'fulfilled') {
+    modelRuntime.value = modelRuntimeResult.value;
   }
 
   bootErrors.value = nextBootErrors;
@@ -683,6 +740,7 @@ onMounted(async () => {
   }
 
   await refreshDashboard();
+  startModelRuntimePolling();
 });
 
 onBeforeUnmount(() => {
@@ -691,6 +749,7 @@ onBeforeUnmount(() => {
     window.removeEventListener('keydown', handleWindowKeydown);
   }
   clearDashboardRetryTimer();
+  clearModelRuntimeTimer();
   syncBodyScrollLock(false);
 });
 </script>
@@ -842,6 +901,14 @@ onBeforeUnmount(() => {
           :class="['notice-banner', noticeMessageTone === 'error' ? 'notice-banner-error' : 'notice-banner-success']"
         >
           {{ noticeMessage }}
+        </section>
+
+        <section
+          v-if="modelRuntimeLine"
+          class="model-runtime-banner"
+        >
+          <span>{{ modelRuntimeLine }}</span>
+          <strong v-if="modelRuntime?.waiting_count">队列 {{ modelRuntime.waiting_count }}</strong>
         </section>
 
         <section
@@ -1189,5 +1256,26 @@ onBeforeUnmount(() => {
 .stage-loading-overlay-panel {
   pointer-events: none;
   min-width: min(360px, calc(100% - 48px));
+}
+
+.model-runtime-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px solid #c8d7eb;
+  border-radius: 8px;
+  background: #f4f8ff;
+  color: #243b53;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.model-runtime-banner strong {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: #1d4ed8;
 }
 </style>

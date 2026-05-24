@@ -620,11 +620,24 @@ def build_project_context_bundle(
   rewrite_mode: str = "",
   override_documents: dict[str, str] | None = None,
 ) -> ProjectContextBundle:
-  project_detail = get_project_detail(settings, project_id)
+  resolved_task_pack_kind = resolve_task_pack_kind(
+    kind=task_pack_kind,
+    instruction=task_instruction,
+    rewrite_mode=rewrite_mode,
+  )
+  project_detail = get_project_detail(settings, project_id, allow_model_overview=False)
   documents = project_documents_map(project_detail, overrides=override_documents)
   chapter = next((item for item in project_detail.chapters if item.id == chapter_id), None) if chapter_id else None
+  lightweight_knowledge = resolved_task_pack_kind == "architecture"
   knowledge_hits = (
-    search_project_knowledge(settings, project_id, knowledge_query, knowledge_limit)
+    search_project_knowledge(
+      settings,
+      project_id,
+      knowledge_query,
+      knowledge_limit,
+      ensure_current=not lightweight_knowledge,
+      include_semantic=not lightweight_knowledge,
+    )
     if knowledge_query.strip()
     else []
   )
@@ -633,11 +646,6 @@ def build_project_context_bundle(
     for item in knowledge_hits
   ) or "无"
   memory_text = "\n".join(_memory_lines(project_detail)) or "无"
-  resolved_task_pack_kind = resolve_task_pack_kind(
-    kind=task_pack_kind,
-    instruction=task_instruction,
-    rewrite_mode=rewrite_mode,
-  )
   context_limit = _context_budget_limit(resolved_task_pack_kind, rewrite_mode)
   trimmed_blocks: list[ContextBudgetTrim] = []
 
