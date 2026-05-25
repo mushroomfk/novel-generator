@@ -13,7 +13,7 @@ _RUNS_DIRNAME = "runs"
 _WORKFLOW_FILENAME = "workflow.json"
 _WORKFLOW_SCHEMA_VERSION = "1"
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "TIMED_OUT", "STALLED"}
-_SAFE_FILENAME_PATTERN = re.compile(r"[^a-zA-Z0-9_.:-]+")
+_SAFE_FILENAME_PATTERN = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
 def _now() -> datetime:

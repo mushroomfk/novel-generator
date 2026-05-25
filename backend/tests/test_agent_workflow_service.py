@@ -11,6 +11,7 @@ from novel_backend.services.agent_workflow_service import (
   create_agent_workflow_run,
   load_agent_workflow_run,
   mark_stale_agent_workflows,
+  record_agent_workflow_subtask,
   workflow_path,
 )
 
@@ -70,6 +71,24 @@ class AgentWorkflowServiceTestCase(unittest.TestCase):
     self.assertEqual(payload["status"], "STALLED")
     self.assertEqual(payload["actions"][0]["status"], "STALLED")
     self.assertEqual(payload["message"], "存在执行超时任务。")
+
+  def test_subtask_filename_is_cross_platform_safe(self) -> None:
+    self._create_stale_run("task-subtask", action_status="RUNNING", age_seconds=1)
+
+    record_agent_workflow_subtask(
+      self.project_dir,
+      "task-subtask",
+      step=1,
+      subtask_id="chapter_generate:writer",
+      role="写作 agent",
+      capability="生成候选正文。",
+      status="RUNNING",
+    )
+
+    subtask_files = list((workflow_path(self.project_dir, "task-subtask").parent / "subtasks").glob("*.json"))
+    self.assertEqual(len(subtask_files), 1)
+    self.assertNotIn(":", subtask_files[0].name)
+    self.assertEqual(subtask_files[0].name, "chapter_generate_writer.json")
 
 
 if __name__ == "__main__":

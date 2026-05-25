@@ -20,7 +20,7 @@
 
 ### Agent 执行工作流与评审门禁
 
-- 修改摘要：Agent 执行新增 workflow 状态文件和 action 契约检查，每次执行会写入 `.gaoxia/runs/{task_id}/workflow.json` 和子任务状态文件，记录预检、`DISPATCHED / ACKED / RUNNING / SUCCEEDED / FAILED / BLOCKED / TIMED_OUT / STALLED` 状态、心跳、历史失败门禁、预期产物和产物校验；旧的确认超时和心跳停滞任务会在后续执行前被标记为超时状态。
+- 修改摘要：Agent 执行新增 workflow 状态文件和 action 契约检查，每次执行会写入 `.gaoxia/runs/{task_id}/workflow.json` 和子任务状态文件，记录预检、`DISPATCHED / ACKED / RUNNING / SUCCEEDED / FAILED / BLOCKED / TIMED_OUT / STALLED` 状态、心跳、历史失败门禁、预期产物和产物校验；旧的确认超时和心跳停滞任务会在后续执行前被标记为超时状态；子任务文件名会转换成跨平台安全格式，避免 Windows 文件名限制影响 Agent 执行。
 - 增强摘要：章节核验优先使用第二审查模型或 `NOVEL_REVIEW_MODEL_API_KEY / NOVEL_REVIEW_MODEL_BASE_URL / NOVEL_REVIEW_MODEL_NAME`，未配置时使用当前写作模型；自学习失败案例新增 `severity` 和 `gate` 信息，写作回归新增内置黄金样本评测，用于检查模板腔、对白同质、连续性冲突和正常场景的识别能力。
 - 影响范围：`agent_service` 执行链路、章节核验模型选择、自学习失败案例和写作回归报告、项目目录 `.gaoxia/runs/` 状态文件、README、核心引擎说明、Agent 执行架构说明和记忆系统说明；不改变章节正文保存路径、SSE 兼容事件或现有模型主配置字段。
 - 验证结果：`npm run verify` 通过，包含 169 个后端 unittest 和前端生产构建；`git diff --check` 通过。
