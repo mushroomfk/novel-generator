@@ -48,6 +48,36 @@ _REGRESSION_CASES = (
   ("humanize", "去 AI 样本"),
   ("knowledge", "资料调用样本"),
 )
+_GOLDEN_EVALUATOR_CASES = (
+  {
+    "id": "ai_tone_snippet",
+    "label": "模板腔片段",
+    "mode": "chapter_snippet",
+    "text": "此外，这场追逐不仅仅是一次逃亡，更是主角成长的重要一步。总的来说，这标志着他终于看清了自己的使命。",
+    "expected_findings": ["ai_tone", "formula_conclusion"],
+  },
+  {
+    "id": "dialogue_flat_snippet",
+    "label": "对白同质片段",
+    "mode": "chapter_snippet",
+    "text": "林追说：我知道。宋闻说：我也知道。阿砚说：我早就知道。三个人站在雨里，谁也没有新的动作。",
+    "expected_findings": ["dialogue_flat"],
+  },
+  {
+    "id": "continuity_conflict_snippet",
+    "label": "连续性冲突片段",
+    "mode": "chapter_snippet",
+    "text": "上一章里父亲已经死在旧码头。到了这一章，父亲却打来电话，让他用断掉的左手把箱子提起来。",
+    "expected_findings": ["continuity_conflict"],
+  },
+  {
+    "id": "clean_scene_snippet",
+    "label": "正常场景片段",
+    "mode": "chapter_snippet",
+    "text": "雨线斜过码头灯。林追把钥匙藏进掌心，没回头，只听见铁门后有鞋底擦过积水。",
+    "expected_findings": [],
+  },
+)
 
 
 def _now_iso() -> str:
@@ -893,6 +923,12 @@ def _append_failure_cases(
       "summary": _compact_text(summary or result.reply, 500),
       "latest_user_message": _compact_text(latest_user, 320),
       "plan_actions": actions,
+      "severity": "major" if action_kind in {"chapter_generate", "rewrite_chapter", "generate_architecture"} else "warning",
+      "gate": {
+        "action_kind": action_kind,
+        "check_before_run": ["project_state", "chapter_target", "previous_outputs"],
+        "blocks_on_repeat": True,
+      },
       "prevention": _compact_text(
         f"下次执行 {action_kind or '同类动作'} 前，先检查项目状态、章节选择、输入材料和上一步输出是否齐备。",
         260,
@@ -907,7 +943,7 @@ def _failure_case_context(project_dir: Path, limit: int = 4) -> str:
   cases = _latest_jsonl_items(_failure_case_path(project_dir), limit)
   if not cases:
     return ""
-  lines = ["Agent 失败案例提醒："]
+  lines = ["Agent 失败案例提醒/门禁："]
   for item in cases[:limit]:
     action = _compact_text(str(item.get("action_kind") or "同类任务"), 40)
     prevention = _compact_text(str(item.get("prevention") or item.get("summary") or ""), 180)
@@ -1051,6 +1087,80 @@ def _case_score(case_id: str, chapter_content: str, docs: dict[str, str], state:
   return min(score, 0.96), checks, suggestions
 
 
+def _golden_case_detect(text: str) -> set[str]:
+  normalized = str(text or "")
+  detected: set[str] = set()
+  from novel_backend.services.humanize_service import analyze_humanize_text
+
+  profile = analyze_humanize_text(normalized)
+  issue_codes = {item.code for item in profile.issues}
+  if issue_codes & {"ai_lexicon", "importance_boosters", "explanatory_voice", "negation_parallelism"}:
+    detected.add("ai_tone")
+  if issue_codes & {"formula_conclusion"}:
+    detected.add("formula_conclusion")
+  dialogue_lines = re.findall(r"[\u4e00-\u9fff]{1,8}说[:：][^。！？\n]{0,16}", normalized)
+  if len(dialogue_lines) >= 3 and len({re.sub(r"^[^说]+说[:：]", "", item) for item in dialogue_lines}) <= 2:
+    detected.add("dialogue_flat")
+  if (
+    "已经死" in normalized and "打来电话" in normalized
+    or "断掉的左手" in normalized and "左手把" in normalized
+  ):
+    detected.add("continuity_conflict")
+  return detected
+
+
+def _run_golden_evaluator_benchmark() -> dict[str, object]:
+  results: list[dict[str, object]] = []
+  total_expected = 0
+  total_detected = 0
+  total_matched = 0
+  for item in _GOLDEN_EVALUATOR_CASES:
+    expected = {str(value) for value in item.get("expected_findings", [])}
+    detected = _golden_case_detect(str(item.get("text") or ""))
+    matched = expected & detected
+    missed = expected - detected
+    false_positive = detected - expected
+    total_expected += len(expected)
+    total_detected += len(detected)
+    total_matched += len(matched)
+    if not expected and not detected:
+      case_score = 1.0
+    else:
+      recall = len(matched) / max(len(expected), 1)
+      precision = len(matched) / max(len(detected), 1)
+      case_score = round((recall * 0.65) + (precision * 0.35), 3)
+    results.append(
+      {
+        "id": item.get("id", ""),
+        "label": item.get("label", ""),
+        "mode": item.get("mode", "chapter_snippet"),
+        "expected_findings": sorted(expected),
+        "detected_findings": sorted(detected),
+        "missed_findings": sorted(missed),
+        "false_positive_findings": sorted(false_positive),
+        "score": case_score,
+        "status": _score_status(case_score),
+      }
+    )
+  precision = total_matched / max(total_detected, 1)
+  recall = total_matched / max(total_expected, 1)
+  clean_case_count = sum(1 for item in results if not item["expected_findings"])
+  clean_pass_count = sum(1 for item in results if not item["expected_findings"] and not item["false_positive_findings"])
+  false_positive_control = clean_pass_count / max(clean_case_count, 1)
+  score = round((recall * 0.55) + (precision * 0.3) + (false_positive_control * 0.15), 3)
+  return {
+    "id": f"golden-evaluator-{_candidate_id('golden', _now_iso(), str(score))}",
+    "generated_at": _now_iso(),
+    "score": score,
+    "status": _score_status(score),
+    "precision": round(precision, 3),
+    "recall": round(recall, 3),
+    "false_positive_control": round(false_positive_control, 3),
+    "case_count": len(results),
+    "cases": results,
+  }
+
+
 def run_writing_regression_suite(settings: Settings, project_dir: Path) -> dict[str, object]:
   resolved_project_dir = Path(project_dir).expanduser().resolve()
   state = get_self_evolution_state(settings, resolved_project_dir)
@@ -1082,6 +1192,7 @@ def run_writing_regression_suite(settings: Settings, project_dir: Path) -> dict[
     "average_score": average_score,
     "status": _score_status(average_score),
     "cases": cases,
+    "golden_evaluator_benchmark": _run_golden_evaluator_benchmark(),
   }
   _append_jsonl(_writing_regression_path(resolved_project_dir), run)
   return run

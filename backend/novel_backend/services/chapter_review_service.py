@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,8 +13,10 @@ from novel_backend.models import (
   ChapterReviewIssue,
   ChapterReviewReport,
 )
+from novel_backend.services.config_service import load_config
 from novel_backend.services.humanize_service import analyze_humanize_text
 from novel_backend.services.log_service import append_app_log
+from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.style_service import get_style
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
 
@@ -384,6 +387,43 @@ def _build_review_guard_context(settings: Settings, project_detail, chapter):
     return None
 
 
+def _resolve_independent_review_model(settings: Settings) -> dict[str, object] | None:
+  from novel_backend.services.generation_service import _chat_completions_endpoint
+
+  config = load_config(settings).review_model
+  api_key = os.environ.get("NOVEL_REVIEW_MODEL_API_KEY", "").strip()
+  base_url = os.environ.get("NOVEL_REVIEW_MODEL_BASE_URL", "").strip()
+  model_name = os.environ.get("NOVEL_REVIEW_MODEL_NAME", "").strip()
+  max_tokens = int(os.environ.get("NOVEL_REVIEW_MODEL_MAX_TOKENS", "") or config.max_tokens)
+  temperature = float(os.environ.get("NOVEL_REVIEW_MODEL_TEMPERATURE", "") or config.temperature)
+  if not api_key and config.enabled:
+    api_key = config.api_key.strip()
+  if not base_url and config.enabled:
+    base_url = config.base_url.strip()
+  if not model_name and config.enabled:
+    model_name = config.model_name.strip()
+  if not api_key or not base_url or not model_name:
+    return None
+  return {
+    "endpoint": _chat_completions_endpoint(base_url),
+    "api_key": api_key,
+    "model_name": model_name,
+    "max_tokens": max_tokens,
+    "temperature": temperature,
+  }
+
+
+def _parse_review_model_content(content: str, *, source: str) -> dict[str, object] | None:
+  payload = _extract_json_object(content)
+  if isinstance(payload, dict):
+    payload["__model_source"] = source
+    return payload
+  cleaned = _strip_code_fence(content)
+  if cleaned.strip():
+    return {"summary": _compact_text(cleaned, 220), "suggestions": [], "__model_source": source}
+  return None
+
+
 def _call_model_review(
   settings: Settings,
   project_detail,
@@ -431,21 +471,39 @@ def _call_model_review(
     f"当前章节正文：\n{str(getattr(chapter, 'content', '') or '').strip()}\n\n"
     "请从一致性、结构、剧情推进、悬念和文风五个维度做回归核验。"
   )
+  messages = [
+    {"role": "system", "content": _REVIEW_SYSTEM_PROMPT},
+    {"role": "user", "content": prompt},
+  ]
+  independent_model = _resolve_independent_review_model(settings)
+  if independent_model is not None:
+    from novel_backend.services.generation_service import _extract_message_content, _request_chat_completion
+
+    try:
+      with model_runtime_slot(settings, lane="chat", task_name="chapter_review:evaluator"):
+        response_payload = _request_chat_completion(
+          str(independent_model["endpoint"]),
+          str(independent_model["api_key"]),
+          {
+            "model": str(independent_model["model_name"]),
+            "messages": messages,
+            "temperature": float(independent_model["temperature"]),
+            "max_tokens": int(independent_model["max_tokens"]),
+          },
+        )
+    except Exception as error:
+      mark_model_runtime_cooldown(settings, "chat", str(error))
+      raise
+    return _parse_review_model_content(_extract_message_content(response_payload), source="review_model")
+
   from novel_backend.services.generation_service import _invoke_model
 
   content = _invoke_model(
     settings,
-    [
-      {"role": "system", "content": _REVIEW_SYSTEM_PROMPT},
-      {"role": "user", "content": prompt},
-    ],
+    messages,
     task_name="chapter_review",
   )
-  payload = _extract_json_object(content)
-  if isinstance(payload, dict):
-    return payload
-  cleaned = _strip_code_fence(content)
-  return {"summary": _compact_text(cleaned, 220), "suggestions": []}
+  return _parse_review_model_content(content, source="primary_model")
 
 
 def _model_dimension_score(model_dimension: dict[str, object], *, base: int = 82) -> int:
@@ -867,7 +925,8 @@ def build_chapter_review(
       guard_context=guard_context,
     )
     if isinstance(model_payload, dict):
-      engine = "mixed"
+      source = str(model_payload.get("__model_source") or "")
+      engine = "review_model" if source == "review_model" else "mixed"
       suggestions = _string_list_from_keys(model_payload, "suggestions", "actions", "next_steps")
       summary = _string_from_keys(model_payload, "summary", "结论")
   except Exception as error:

@@ -54,6 +54,11 @@ from novel_backend.services.context_builder import (
 )
 from novel_backend.services.agent_trajectory_service import append_agent_trajectory
 from novel_backend.services.config_service import load_config
+from novel_backend.services.agent_contract_service import (
+  build_agent_preflight_report,
+  evaluate_agent_action_contract,
+  validate_agent_action_outputs,
+)
 from novel_backend.services.chapter_auto_repair_service import (
   ChapterAutoRepairResult,
   auto_repair_chapter_after_review,
@@ -82,6 +87,16 @@ from novel_backend.services.project_service import (
   update_story_documents,
 )
 from novel_backend.services.self_evolution_service import build_agent_capability_context, run_self_evolution_cycle
+from novel_backend.services.agent_workflow_service import (
+  complete_agent_workflow_run,
+  create_agent_workflow_run,
+  heartbeat_agent_workflow_action,
+  mark_stale_agent_workflows,
+  record_agent_workflow_subtask,
+  update_agent_workflow_action,
+  update_agent_workflow_preflight,
+  workflow_summary,
+)
 from novel_backend.services.skill_service import (
   custom_skill_names,
   get_custom_skill_prompt_block,
@@ -3536,24 +3551,28 @@ def _subtask_specs_for_action(action: AgentPlanAction) -> list[dict[str, str]]:
         "role": "写作 agent",
         "capability": "生成候选正文；允许写正文草稿，不直接写项目记忆",
         "parallel_group": group,
+        "allowed_outputs": ["候选正文", "写作说明"],
       },
       {
         "subtask_id": f"{action_id}:continuity",
         "role": "连续性审校 agent",
         "capability": "检查人物关系、事件结果、时间地点和道具状态；只产出报告",
         "parallel_group": group,
+        "allowed_outputs": ["连续性审校报告"],
       },
       {
         "subtask_id": f"{action_id}:voice",
         "role": "人物口气审校 agent",
         "capability": "检查人物声音、对白关系和叙述距离；只产出报告",
         "parallel_group": group,
+        "allowed_outputs": ["人物口气审校报告"],
       },
       {
         "subtask_id": f"{action_id}:reader",
         "role": "可读性审校 agent",
         "capability": "检查节奏、段尾压力和阅读牵引；只产出报告",
         "parallel_group": group,
+        "allowed_outputs": ["可读性审校报告"],
       },
     ]
   if action.kind == "review_knowledge":
@@ -3563,6 +3582,7 @@ def _subtask_specs_for_action(action: AgentPlanAction) -> list[dict[str, str]]:
         "role": "资料分析 agent",
         "capability": "读取资料并产出 artifact；不能写章节、项目记忆或长期记忆",
         "parallel_group": group,
+        "allowed_outputs": ["资料分析报告"],
       }
     ]
   if action.kind == "consistency_check":
@@ -3572,6 +3592,7 @@ def _subtask_specs_for_action(action: AgentPlanAction) -> list[dict[str, str]]:
         "role": "连续性审校 agent",
         "capability": "只检查一致性并产出报告；不能改正文",
         "parallel_group": group,
+        "allowed_outputs": ["一致性报告"],
       }
     ]
   if action.kind == "rewrite_chapter":
@@ -3581,15 +3602,61 @@ def _subtask_specs_for_action(action: AgentPlanAction) -> list[dict[str, str]]:
         "role": "修订 agent",
         "capability": "按用户要求修订正文；写回后仍需章节核验",
         "parallel_group": group,
+        "allowed_outputs": ["候选修订正文"],
       },
       {
         "subtask_id": f"{action_id}:review",
         "role": "核验 agent",
         "capability": "核验修订结果；只产出报告",
         "parallel_group": group,
+        "allowed_outputs": ["核验报告"],
       },
     ]
   return []
+
+
+def _contract_failure_message(report: dict[str, object], default: str) -> str:
+  checks = report.get("checks")
+  if not isinstance(checks, list):
+    return default
+  messages = [
+    str(item.get("message") or "").strip()
+    for item in checks
+    if isinstance(item, dict) and str(item.get("status") or "") == "blocked"
+  ]
+  return "；".join([item for item in messages if item]) or default
+
+
+async def _run_action_handler_with_heartbeat(
+  handler,
+  context: AgentActionExecutionContext,
+  state: AgentExecutionState,
+  project_dir: Path,
+) -> None:
+  stopped = asyncio.Event()
+
+  async def heartbeat_loop() -> None:
+    while not stopped.is_set():
+      try:
+        await asyncio.wait_for(stopped.wait(), timeout=30)
+      except asyncio.TimeoutError:
+        await asyncio.to_thread(
+          heartbeat_agent_workflow_action,
+          project_dir,
+          context.task_id,
+          step=context.step,
+        )
+
+  heartbeat_task = asyncio.create_task(heartbeat_loop(), name=f"agent-workflow-heartbeat-{context.task_id}-{context.step}")
+  try:
+    await handler(context, state)
+  finally:
+    stopped.set()
+    heartbeat_task.cancel()
+    try:
+      await heartbeat_task
+    except asyncio.CancelledError:
+      pass
 
 
 async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: AgentPlan, task_id: str):
@@ -3608,6 +3675,26 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
   if skill_names:
     state.changes.append(f"已启用用户技能：{'、'.join(skill_names[:5])}")
   total = len(plan.actions)
+  project_dir = Path(state.runtime.detail.path)
+  await asyncio.to_thread(mark_stale_agent_workflows, project_dir)
+  preflight_report = build_agent_preflight_report(settings, state.runtime, plan)
+  create_agent_workflow_run(
+    project_dir,
+    task_id=task_id,
+    payload=payload,
+    plan=plan,
+    preflight=preflight_report,
+  )
+  if preflight_report.get("status") == "blocked":
+    update_agent_workflow_preflight(project_dir, task_id, preflight_report)
+    complete_agent_workflow_run(
+      project_dir,
+      task_id,
+      status="BLOCKED",
+      message=_contract_failure_message(preflight_report, "执行预检未通过。"),
+    )
+    raise RuntimeError(_contract_failure_message(preflight_report, "执行预检未通过。"))
+  completed_action_kinds: list[str] = []
 
   for index, action in enumerate(plan.actions, start=1):
     current_task_pack_kind = action.task_pack_kind or _task_pack_kind_for_action(action.kind, action.instruction, action.mode)
@@ -3627,6 +3714,21 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
       task_pack_kind=current_task_pack_kind,
     )
 
+    contract_report = evaluate_agent_action_contract(
+      settings,
+      state.runtime,
+      plan,
+      action,
+      completed_action_kinds=completed_action_kinds,
+    )
+    update_agent_workflow_action(
+      project_dir,
+      task_id,
+      step=index,
+      status="ACKED",
+      message=str(contract_report.get("summary") or ""),
+      contract=contract_report,
+    )
     yield {
       "phase": "started",
       "step": index,
@@ -3636,6 +3738,17 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
     }
     subtask_specs = _subtask_specs_for_action(action)
     for spec in subtask_specs:
+      record_agent_workflow_subtask(
+        project_dir,
+        task_id,
+        step=index,
+        subtask_id=str(spec.get("subtask_id") or ""),
+        role=str(spec.get("role") or ""),
+        capability=str(spec.get("capability") or ""),
+        parallel_group=str(spec.get("parallel_group") or ""),
+        status="RUNNING",
+        allowed_outputs=[str(item) for item in (spec.get("allowed_outputs") or [])],
+      )
       yield {
         "phase": "subtask_started",
         "step": index,
@@ -3647,9 +3760,59 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
 
     trace_count_before = len(state.execution_trace)
     artifact_count_before = len(state.artifacts)
+    failure_status = "FAILED"
     try:
-      await get_action_handler(action.kind)(context, state)
+      if contract_report.get("status") == "blocked":
+        failure_status = "BLOCKED"
+        raise RuntimeError(_contract_failure_message(contract_report, "动作条件未满足。"))
+      update_agent_workflow_action(
+        project_dir,
+        task_id,
+        step=index,
+        status="RUNNING",
+        message="动作执行中。",
+        contract=contract_report,
+      )
+      await _run_action_handler_with_heartbeat(
+        get_action_handler(action.kind),
+        context,
+        state,
+        project_dir,
+      )
+      output_report = validate_agent_action_outputs(
+        state.runtime,
+        state.artifacts,
+        action,
+        artifact_count_before=artifact_count_before,
+      )
+      if output_report.get("status") == "blocked":
+        failure_status = "FAILED"
+        raise RuntimeError(_contract_failure_message(output_report, "动作产物检查未通过。"))
+      update_agent_workflow_action(
+        project_dir,
+        task_id,
+        step=index,
+        status="SUCCEEDED",
+        message=str(output_report.get("summary") or "动作完成。"),
+        contract=contract_report,
+        output_validation=output_report,
+      )
+      completed_action_kinds.append(action.kind)
     except Exception as error:
+      update_agent_workflow_action(
+        project_dir,
+        task_id,
+        step=index,
+        status=failure_status,
+        message=str(error),
+        contract=contract_report,
+      )
+      complete_agent_workflow_run(
+        project_dir,
+        task_id,
+        status=failure_status,
+        message=str(error),
+      )
       _record_action_failure(
         state,
         index,
@@ -3701,6 +3864,18 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
         "trace": state.execution_trace[-1],
       }
       for spec in subtask_specs:
+        record_agent_workflow_subtask(
+          project_dir,
+          task_id,
+          step=index,
+          subtask_id=str(spec.get("subtask_id") or ""),
+          role=str(spec.get("role") or ""),
+          capability=str(spec.get("capability") or ""),
+          parallel_group=str(spec.get("parallel_group") or ""),
+          status=failure_status,
+          summary=str(error),
+          allowed_outputs=[str(item) for item in (spec.get("allowed_outputs") or [])],
+        )
         yield {
           "phase": "subtask_failed",
           "step": index,
@@ -3716,6 +3891,18 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
     artifact_delta = state.artifacts[artifact_count_before:]
     action_summary = str(getattr(trace_delta[-1], "summary", "") if trace_delta else "").strip()
     for spec in subtask_specs:
+      record_agent_workflow_subtask(
+        project_dir,
+        task_id,
+        step=index,
+        subtask_id=str(spec.get("subtask_id") or ""),
+        role=str(spec.get("role") or ""),
+        capability=str(spec.get("capability") or ""),
+        parallel_group=str(spec.get("parallel_group") or ""),
+        status="SUCCEEDED",
+        summary=action_summary,
+        allowed_outputs=[str(item) for item in (spec.get("allowed_outputs") or [])],
+      )
       yield {
         "phase": "subtask_completed",
         "step": index,
@@ -3788,6 +3975,22 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
   state.artifacts.append(self_evolution_artifact)
   if int(self_evolution_artifact.metadata.get("candidate_count") or 0) > 0:
     _append_ordered_unique(state.suggestions, "查看「自学习复盘」，处理技能、记忆和调用规则候选。")
+
+  complete_agent_workflow_run(
+    project_dir,
+    task_id,
+    status="SUCCEEDED",
+    message="执行完成。",
+  )
+  workflow_info = workflow_summary(project_dir, task_id)
+  _append_artifact(
+    state,
+    kind="workflow_run",
+    title="执行状态文件",
+    summary=f"workflow 状态：{workflow_info.get('status', '')}",
+    content_preview=str(workflow_info.get("path") or ""),
+    metadata=workflow_info,
+  )
 
   result_payload = AgentChatResult(
     task_id=task_id,

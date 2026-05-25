@@ -34,6 +34,15 @@
    - 技能更新会保留版本快照，面板可查看差异、回滚版本或把用户技能提升为全局技能
    - 经验候选只展示和记录，不会直接写入作者侧项目记忆，需要作者确认后再保存
 
+6. workflow 状态、动作契约和子任务隔离记录
+   - 新增 `backend/novel_backend/services/agent_workflow_service.py`
+   - 新增 `backend/novel_backend/services/agent_contract_service.py`
+   - 每次 Agent 执行会在项目目录写入 `.gaoxia/runs/{task_id}/workflow.json`
+   - workflow action 使用 `DISPATCHED / ACKED / RUNNING / SUCCEEDED / FAILED / BLOCKED / TIMED_OUT / STALLED` 状态
+   - 执行前会记录预检结果、动作进入条件、失败策略和预期产物
+   - 执行中会刷新 action heartbeat；子任务会单独写入 `.gaoxia/runs/{task_id}/subtasks/*.json`
+   - 执行后会校验 action 产物是否满足契约，并把 workflow 状态作为 `workflow_run` 产物返回
+
 ## 后端结构
 
 ### 1. 事件协议
@@ -76,6 +85,8 @@
 
 `subtask_*` 用来展示 action 内部的父子任务。事件字段包含 `subtask_id`、`parallel_group`、`role`、`capability`、`action_kind` 和当前状态。前端会把它们挂到对应 action 的时间线下面，所以用户能看到“写作 agent、连续性审校 agent、人物口气审校 agent、可读性审校 agent”等子任务状态，而不是只看到一个大步骤。
 
+workflow 文件里还会记录这些子任务的允许产物范围。子任务仍不能直接写项目正文、作者记忆或长期技能，写回动作继续由主 action handler 执行。
+
 ### 2. Action Registry
 
 `registry.py` 里新增了统一执行上下文和注册表。
@@ -105,6 +116,13 @@
 1. 计算当前 action 的任务包
 2. 调用 registry 里的 handler
 3. 把中间状态转换成统一执行结果
+
+现在执行前还会多做两类检查：
+
+- session 预检：项目目录、计划动作、模型配置、第二审查模型配置和失败案例库
+- action 契约：目标章节、项目状态、历史失败门禁、预期产物和失败策略
+
+契约检查不满足时，workflow action 会记为 `BLOCKED`；执行中异常记为 `FAILED`；长时间无确认或无心跳的旧 workflow 可以被标记为 `TIMED_OUT` 或 `STALLED`。
 
 章节写回类 action 会把保存后的章节核验结果一并写入执行反馈：
 
@@ -248,7 +266,9 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 
 `agent_capability_rules.json` 和 `failure_cases.jsonl` 不是只做归档。后续 Agent 进入模型规划和模型路由时，会把高置信调用规则和失败案例提醒作为 system context 一起传入，用来影响 action 顺序、工具选择和失败前检查。
 
-前端技能库 `Agent 自学习` 面板会读取这些接口展示能力看板、确认草案、草案差异预览、写作回归、模型审查、经验候选、调用规则、写作评价、细分质量维度、长期趋势、失败案例、重复失败聚合、技能统计、技能版本和技能包迁移。技能版本会同时显示历史版本、当前版本和 unified diff。写作回归使用同一章样本检查续写、改稿、去 AI、资料调用四类任务的输入条件和自学习信号，不直接改正文。
+失败案例现在也会参与 action 契约。遇到相同 action 时，契约检查会把最近失败案例作为门禁提示写入 workflow，要求执行前复核项目状态、章节目标和上一步产物。
+
+前端技能库 `Agent 自学习` 面板会读取这些接口展示能力看板、确认草案、草案差异预览、写作回归、模型审查、经验候选、调用规则、写作评价、细分质量维度、长期趋势、失败案例、重复失败聚合、技能统计、技能版本和技能包迁移。技能版本会同时显示历史版本、当前版本和 unified diff。写作回归使用同一章样本检查续写、改稿、去 AI、资料调用四类任务的输入条件和自学习信号，并额外运行内置黄金样本，评估本地评审规则对模板腔、对白同质、连续性冲突和正常片段的识别能力，不直接改正文。
 
 自学习排程默认关闭，只有通过面板或接口开启后才按 `interval_hours` 检查；面板里的“执行一次”会强制执行当前任务组。后台 worker 由 FastAPI lifespan 启动，每隔 `NOVEL_SELF_EVOLUTION_WORKER_INTERVAL_SECONDS` 扫描一次已启用排程的作品；`NOVEL_SELF_EVOLUTION_WORKER_ENABLED=false` 可以关闭 worker。多模型交叉审查可以在设置页启用，也可以通过 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 配置；环境变量优先级高于本地配置。
 
@@ -375,21 +395,24 @@ Agent session 结束后，后端会追加一条结构化轨迹：
 
 ### 后端回归
 
-- `npm run backend:test`
+- `npm run verify`
 
 结果：
 
-- 123 个测试通过
+- 后端 169 个 unittest 通过
+- 前端生产构建通过
 
 ### 额外验证
 
 - `backend.tests.test_agent_service`
+- `backend.tests.test_agent_workflow_service`
 - `backend.tests.test_generation_service`
 - `backend.tests.test_project_service`
 - `backend.tests.test_context_builder`
 - `backend.tests.test_model_error_service`
+- `git diff --check`
 
-其中补了一条线程持久化回归，确认 `event_blocks` 和 `artifacts` 能写入并读回。
+其中包含 workflow 状态文件回归，确认 action 契约、产物校验和超时状态能写入并读回。
 
 ## 后续建议
 

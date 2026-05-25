@@ -184,6 +184,10 @@ class SelfEvolutionServiceTestCase(unittest.TestCase):
     regression = run_writing_regression_suite(self.settings, self.project_dir)
     self.assertEqual(len(regression["cases"]), 4)
     self.assertIn(regression["status"], {"good", "watch", "risk"})
+    benchmark = regression["golden_evaluator_benchmark"]
+    self.assertEqual(benchmark["case_count"], 4)
+    self.assertGreaterEqual(benchmark["recall"], 0.75)
+    self.assertGreaterEqual(benchmark["false_positive_control"], 1.0)
 
     with patch(
       "novel_backend.services.generation_service._request_chat_completion",

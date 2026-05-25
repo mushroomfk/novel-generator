@@ -794,6 +794,59 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertEqual(review.style_name, "冷雾叙事")
     self.assertNotEqual(style_dimension.status, "na")
 
+  def test_chapter_review_prefers_independent_review_model(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(api_key="primary-key", base_url="https://primary.local/v1", model_name="primary-model"),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          api_key="review-key",
+          base_url="https://review.local/v1",
+          model_name="review-model",
+        ),
+      ),
+    )
+    summary = self.create_demo_project("独立核验模型")
+    captured_payloads = []
+
+    def fake_request(endpoint, api_key, payload):
+      captured_payloads.append({"endpoint": endpoint, "api_key": api_key, "payload": payload})
+      return {
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "summary": "独立评审完成。",
+                  "suggestions": ["保留当前追兵压力。"],
+                  "consistency": {"summary": "连续性可读。", "strengths": [], "issues": [], "suggestions": []},
+                  "structure": {"summary": "结构完整。", "strengths": [], "issues": [], "suggestions": []},
+                  "plot": {"summary": "推进清楚。", "strengths": [], "issues": [], "suggestions": []},
+                  "suspense": {"summary": "章末有牵引。", "strengths": [], "issues": [], "suggestions": []},
+                  "style": {"summary": "文风可接受。", "strengths": [], "issues": [], "suggestions": []},
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      }
+
+    with patch("novel_backend.services.generation_service._request_chat_completion", side_effect=fake_request):
+      detail = update_chapter_content(
+        self.settings,
+        summary.id,
+        "chapter-001",
+        ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追在旧码头仓库拿到铜钥匙。\n"),
+      )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertEqual(review.engine, "review_model")
+    self.assertEqual(captured_payloads[0]["endpoint"], "https://review.local/v1/chat/completions")
+    self.assertEqual(captured_payloads[0]["api_key"], "review-key")
+    self.assertEqual(captured_payloads[0]["payload"]["model"], "review-model")
+
   def test_update_chapter_content_with_review_status_reports_review_failure(self) -> None:
     summary = self.create_demo_project("核验失败透出")
 

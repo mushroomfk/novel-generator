@@ -1017,6 +1017,16 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["mode"], "execution")
     self.assertIn("已经生成并写回项目", result_event[1]["reply"])
     self.assertIn("已更新第 1 章《第一章 雨夜靠港》正文", result_event[1]["changes"])
+    workflow_artifact = next(item for item in result_event[1]["artifacts"] if item["kind"] == "workflow_run")
+    workflow_path = Path(workflow_artifact["metadata"]["path"])
+    self.assertTrue(workflow_path.exists())
+    workflow_payload = json.loads(workflow_path.read_text(encoding="utf-8"))
+    self.assertEqual(workflow_payload["status"], "SUCCEEDED")
+    self.assertEqual(workflow_payload["actions"][0]["status"], "SUCCEEDED")
+    self.assertEqual(workflow_payload["actions"][0]["contract"]["status"], "pass")
+    self.assertEqual(workflow_payload["actions"][0]["output_validation"]["status"], "pass")
+    subtask_dir = workflow_path.parent / "subtasks"
+    self.assertTrue(any(subtask_dir.glob("*.json")))
 
     detail = get_project_detail(self.settings, self.project.id)
     chapter = next(item for item in detail.chapters if item.id == "chapter-001")
