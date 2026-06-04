@@ -13,11 +13,12 @@ from novel_backend.services.project_service import (
   refresh_project_model_story_overview,
   refresh_project_system_memory,
 )
+from novel_backend.services.self_evolution_service import run_self_evolution_humanize_patrol
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
 
 _AUXILIARY_SCHEMA_VERSION = "1"
 _AUXILIARY_TASK_FILENAME = "auxiliary_tasks.json"
-_AUXILIARY_TASKS = ("knowledge_index", "story_overview_model", "system_memory")
+_AUXILIARY_TASKS = ("knowledge_index", "story_overview_model", "system_memory", "humanize_review")
 _STALE_RUNNING_SECONDS = 20 * 60
 
 
@@ -127,6 +128,14 @@ def _run_task(settings: Settings, project_id: str, task_name: str) -> None:
     return
   if task_name == "system_memory":
     refresh_project_system_memory(settings, project_id, focus="辅助任务刷新")
+    return
+  if task_name == "humanize_review":
+    project = _project_by_id(settings, project_id)
+    if project is None:
+      raise RuntimeError(f"项目不存在：{project_id}")
+    result = run_self_evolution_humanize_patrol(settings, Path(project.path), reason="auxiliary", force=False)
+    if result.get("status") == "failed":
+      raise RuntimeError(str(result.get("error") or "去 AI 智能巡检失败"))
     return
   raise RuntimeError(f"未知辅助任务：{task_name}")
 

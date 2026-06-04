@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import io
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import shutil
 import sys
+import tempfile
 import time
+import zipfile
 from array import array
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -34,6 +40,8 @@ from novel_backend.models import (
   LocalHistoryChangedFile,
   LocalHistoryState,
   ModelConfig,
+  ObsidianVaultConfig,
+  ObsidianVaultState,
   ReviewModelConfig,
   ProjectDeleteResult,
   ProjectDirectoryOpenResult,
@@ -43,6 +51,9 @@ from novel_backend.models import (
   ProjectDetail,
   ProjectExportRequest,
   ProjectExportResult,
+  ProjectMigrationExportResult,
+  ProjectMigrationImportRequest,
+  ProjectMigrationImportResult,
   ProjectRenameRequest,
   ProjectSnapshotDetail,
   ProjectSnapshot,
@@ -64,6 +75,16 @@ from novel_backend.services.log_service import append_app_log, append_prompt_his
 from novel_backend.services.model_error_service import classify_model_error
 from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.obsidian_service import (
+  collect_obsidian_note_records,
+  load_obsidian_state,
+  obsidian_note_record_for_source_key,
+  obsidian_source_signature_entries,
+  select_obsidian_notes_for_query,
+  save_obsidian_config,
+  scoped_obsidian_note_records_for_chapter,
+  sync_obsidian_state,
+)
 from novel_backend.services.rerank_service import rerank_documents
 from novel_backend.services.project_dream_service import (
   build_project_dream_signature,
@@ -78,6 +99,21 @@ from novel_backend.services.project_distillation_service import (
   load_project_distillation,
   save_project_distillation,
 )
+from novel_backend.services.project_narrative_state_service import (
+  confirm_project_obsidian_maintenance_merge_suggestion,
+  confirm_project_obsidian_maintenance_merge_suggestions,
+  ignore_project_obsidian_maintenance_suggestion,
+  ignore_project_obsidian_maintenance_suggestions,
+  publish_project_obsidian_maintenance_suggestion,
+  publish_project_obsidian_maintenance_suggestions,
+  record_project_narrative_state_observation,
+  refresh_project_narrative_state_chapter_cards,
+  reopen_project_obsidian_maintenance_suggestion,
+  reopen_project_obsidian_maintenance_suggestions,
+  stage_project_obsidian_maintenance_suggestion,
+  stage_project_obsidian_maintenance_suggestions,
+)
+from novel_backend.services.project_style_xp_evolution_service import record_project_style_xp_observation
 from novel_backend.services.chapter_review_service import (
   build_chapter_review,
   delete_chapter_review,
@@ -98,9 +134,47 @@ from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, r
 _LOCAL_HISTORY_DIRNAME = ".novel-history"
 _APP_STATE_DIRNAME = ".gaoxia"
 _AGENT_THREADS_DIRNAME = "threads"
+_AGENT_RUNS_DIRNAME = "runs"
+_MIGRATION_MANIFEST_FILENAME = ".gaoxia-project.json"
+_MIGRATION_PROJECT_ROOT = "project"
+_MIGRATION_PACKAGE_SUFFIX = ".gaoxia-project.zip"
+_MIGRATION_SCHEMA_VERSION = "1"
+_MIGRATION_MAX_FILE_COUNT = 20_000
+_MIGRATION_MAX_UNCOMPRESSED_BYTES = 2_000_000_000
 _MODEL_STORY_OVERVIEW_FILENAME = "story_overview_model.json"
 _MODEL_STORY_OVERVIEW_FAILURE_FILENAME = "story_overview_model_failure.json"
 _MODEL_STORY_OVERVIEW_SCHEMA_VERSION = "1"
+_MIGRATION_OBSIDIAN_THREAD_NOTICE = "外部 Obsidian Vault 的资料分析记录已从迁移包移除，导入后需要重新同步 Vault 并重新分析资料。"
+_MIGRATION_AGENT_TEXT_KEYS = {
+  "changes",
+  "content",
+  "content_preview",
+  "detail",
+  "details",
+  "body_markdown",
+  "draft_path",
+  "error",
+  "instruction",
+  "instruction_preview",
+  "label",
+  "latest_user",
+  "latest_user_message",
+  "message",
+  "path",
+  "preview",
+  "prevention",
+  "reason",
+  "relative_path",
+  "reply",
+  "result",
+  "rationale",
+  "source",
+  "source_key",
+  "summary",
+  "title",
+  "vault_path",
+}
+_MIGRATION_AGENT_NOTICE_TITLE = "Obsidian 资料分析已移除"
 _MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 4500
 _MODEL_STORY_OVERVIEW_FAILURE_COOLDOWN_SECONDS = 600
 _ARCHITECTURE_PROGRESS_FILENAME = "architecture_progress.json"
@@ -115,6 +189,7 @@ _SNAPSHOT_FILES_DIRNAME = "files"
 _KNOWLEDGE_SCHEMA_VERSION = "2"
 _KNOWLEDGE_SEMANTIC_CANDIDATE_MIN = 48
 _KNOWLEDGE_SEMANTIC_CANDIDATE_CAP = 240
+_KNOWLEDGE_CHAPTER_FILTER_RESULT_CAP = 80
 _SNAPSHOT_ROOT_FILES = (
   "core_seed.txt",
   "character_design.txt",
@@ -894,6 +969,611 @@ def _assert_project_dir_is_valid(summary: ProjectSummary) -> Path:
     )
 
   return project_dir
+
+
+def _path_is_inside(path: Path, root: Path) -> bool:
+  try:
+    return path.expanduser().resolve().is_relative_to(root.expanduser().resolve())
+  except (OSError, ValueError):
+    return False
+
+
+def _migration_cache_dir(settings: Settings) -> Path:
+  cache_dir = settings.data_dir / "cache" / "project_migrations"
+  cache_dir.mkdir(parents=True, exist_ok=True)
+  return cache_dir
+
+
+def _migration_output_dir(project_dir: Path) -> Path:
+  output_dir = project_dir / "exports"
+  output_dir.mkdir(parents=True, exist_ok=True)
+  return output_dir
+
+
+def _should_skip_migration_file(relative_path: str) -> bool:
+  normalized = relative_path.replace("\\", "/")
+  return normalized.startswith("exports/") and normalized.endswith(_MIGRATION_PACKAGE_SUFFIX)
+
+
+def _migration_external_resource_warnings(project_dir: Path) -> list[str]:
+  warnings: list[str] = []
+  obsidian_payload = read_json(project_dir / _APP_STATE_DIRNAME / "obsidian.json", {})
+  if isinstance(obsidian_payload, dict) and obsidian_payload.get("enabled"):
+    raw_vault_path = str(obsidian_payload.get("vault_path") or "").strip()
+    if raw_vault_path:
+      vault_path = Path(raw_vault_path).expanduser()
+      if not vault_path.is_absolute():
+        vault_path = project_dir / vault_path
+      if not _path_is_inside(vault_path, project_dir):
+        warnings.append(
+          f"Obsidian Vault 位于项目目录外，迁移包只保存配置和项目学习状态，不复制外部 Vault 原文、笔记摘要、维护草稿、蒸馏摘要或索引：{raw_vault_path}"
+        )
+  return warnings
+
+
+def _project_has_external_obsidian_vault(project_dir: Path) -> bool:
+  obsidian_payload = read_json(project_dir / _APP_STATE_DIRNAME / "obsidian.json", {})
+  if not isinstance(obsidian_payload, dict) or not obsidian_payload.get("enabled"):
+    return False
+  raw_vault_path = str(obsidian_payload.get("vault_path") or "").strip()
+  if not raw_vault_path:
+    return False
+  vault_path = Path(raw_vault_path).expanduser()
+  if not vault_path.is_absolute():
+    vault_path = project_dir / vault_path
+  return not _path_is_inside(vault_path, project_dir)
+
+
+def _sanitize_migration_knowledge_db(source_path: Path, output_path: Path) -> None:
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  shutil.copy2(source_path, output_path)
+  _initialize_knowledge_db(output_path)
+  connection = sqlite3.connect(output_path)
+  try:
+    chunk_ids = [
+      str(row[0])
+      for row in connection.execute(
+        """
+        SELECT chunk_id
+        FROM knowledge_chunks
+        WHERE kind = 'obsidian' OR source = 'Obsidian' OR source_key LIKE 'obsidian:%'
+        """
+      ).fetchall()
+    ]
+    if chunk_ids:
+      rows = [(chunk_id,) for chunk_id in chunk_ids]
+      connection.executemany("DELETE FROM knowledge_vectors WHERE chunk_id = ?", rows)
+      connection.executemany("DELETE FROM knowledge_chunks_fts WHERE chunk_id = ?", rows)
+      connection.executemany("DELETE FROM knowledge_chunks WHERE chunk_id = ?", rows)
+    connection.execute(
+      """
+      DELETE FROM knowledge_sources
+      WHERE kind = 'obsidian' OR source = 'Obsidian' OR source_key LIKE 'obsidian:%'
+      """
+    )
+    _set_knowledge_state(connection, "source_signature", "")
+    _set_knowledge_state(connection, "indexed_at", "")
+    connection.commit()
+  finally:
+    connection.close()
+
+
+def _sanitize_migration_obsidian_sync(project_dir: Path, output_path: Path) -> None:
+  config_payload = read_json(project_dir / _APP_STATE_DIRNAME / "obsidian.json", {})
+  if isinstance(config_payload, dict):
+    config = ObsidianVaultConfig.model_validate(config_payload)
+  else:
+    config = ObsidianVaultConfig()
+
+  sync_payload = read_json(project_dir / _APP_STATE_DIRNAME / "obsidian_sync.json", {})
+  warnings: list[str] = []
+  if isinstance(sync_payload, dict):
+    warnings = [str(item) for item in sync_payload.get("warnings") or [] if str(item).strip()]
+  warning = "外部 Obsidian Vault 的笔记摘要已从迁移包移除，导入后需要重新同步 Vault。"
+  if warning not in warnings:
+    warnings.append(warning)
+
+  state = ObsidianVaultState(
+    config=config,
+    enabled=config.enabled,
+    vault_path=config.vault_path.strip(),
+    source_signature="",
+    updated_at=_now_iso(),
+    warnings=warnings,
+  )
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, state.model_dump(mode="json"))
+
+
+def _empty_migration_obsidian_maintenance_summary() -> dict[str, object]:
+  return {
+    "total": 0,
+    "needs_action": 0,
+    "high_priority": 0,
+    "auto_staged": 0,
+    "manual_draft_edits": 0,
+    "preserved_existing_draft": 0,
+    "by_status": {
+      "open": 0,
+      "staged": 0,
+      "published": 0,
+      "draft_missing": 0,
+      "published_missing": 0,
+      "published_outdated": 0,
+      "vault_moved": 0,
+      "ignored": 0,
+    },
+    "top_items": [],
+    "migration_notice": "外部 Obsidian Vault 的维护队列已从迁移包移除，导入后需要重新同步 Vault。",
+  }
+
+
+def _sanitize_migration_narrative_state(source_path: Path, output_path: Path) -> None:
+  payload = read_json(source_path, {})
+  if not isinstance(payload, dict):
+    payload = {}
+  sanitized = dict(payload)
+  sanitized["obsidian_maintenance_suggestions"] = []
+  sanitized["obsidian_maintenance_actions"] = []
+  sanitized["obsidian_maintenance_summary"] = _empty_migration_obsidian_maintenance_summary()
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, sanitized)
+
+
+def _sanitize_migration_distillation_items(items: object) -> list[object]:
+  if not isinstance(items, list):
+    return []
+  sanitized: list[object] = []
+  for item in items:
+    if isinstance(item, str) and item.strip().startswith("Obsidian:"):
+      continue
+    sanitized.append(item)
+  return sanitized
+
+
+def _sanitize_migration_project_distillation(source_path: Path, output_path: Path) -> None:
+  payload = read_json(source_path, {})
+  if not isinstance(payload, dict):
+    payload = {}
+  sanitized = dict(payload)
+  profile = sanitized.get("source_profile")
+  if isinstance(profile, dict):
+    profile = dict(profile)
+    for key in (
+      "narrative_rules",
+      "style_traits",
+      "core_conflicts",
+      "character_notes",
+      "event_notes",
+      "location_notes",
+      "prop_notes",
+      "skill_notes",
+      "material_notes",
+    ):
+      profile[key] = _sanitize_migration_distillation_items(profile.get(key))
+    if str(profile.get("summary") or "").strip().startswith("Obsidian:"):
+      profile["summary"] = ""
+    sanitized["source_profile"] = profile
+
+  packs = sanitized.get("packs")
+  if isinstance(packs, list):
+    sanitized_packs: list[object] = []
+    for pack in packs:
+      if not isinstance(pack, dict):
+        sanitized_packs.append(pack)
+        continue
+      sanitized_pack = dict(pack)
+      for key in ("must_keep", "execution_focus", "voice_rules", "blocked_changes", "prepared_from"):
+        sanitized_pack[key] = _sanitize_migration_distillation_items(sanitized_pack.get(key))
+      sanitized_packs.append(sanitized_pack)
+    sanitized["packs"] = sanitized_packs
+
+  sanitized["source_signature"] = ""
+  sanitized["is_stale"] = True
+  sanitized["migration_notice"] = "外部 Obsidian Vault 的蒸馏摘要已从迁移包移除，导入后需要重新生成项目蒸馏。"
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, sanitized)
+
+
+def _migration_text_mentions_obsidian(value: object) -> bool:
+  if isinstance(value, str):
+    normalized = value.lower()
+    return "obsidian" in normalized or "vault" in normalized or "外部笔记" in value or "维护草稿" in value
+  if isinstance(value, list):
+    return any(_migration_text_mentions_obsidian(item) for item in value)
+  if isinstance(value, dict):
+    return any(_migration_text_mentions_obsidian(item) for item in value.values())
+  return False
+
+
+def _sanitize_migration_agent_artifacts(artifacts: object) -> tuple[list[object], bool]:
+  if not isinstance(artifacts, list):
+    return [], False
+  sanitized: list[object] = []
+  changed = False
+  for item in artifacts:
+    if not isinstance(item, dict):
+      sanitized.append(item)
+      continue
+    kind = str(item.get("kind") or "").strip()
+    sensitive_kind = kind in {"knowledge_summary", "obsidian_maintenance"} or "obsidian" in kind.lower()
+    if sensitive_kind or _migration_text_mentions_obsidian(item):
+      changed = True
+      sanitized.append(
+        {
+          "kind": kind or "migration_sanitized",
+          "title": "Obsidian 资料分析已移除",
+          "summary": _MIGRATION_OBSIDIAN_THREAD_NOTICE,
+          "content_preview": "",
+          "metadata": {"migration_notice": _MIGRATION_OBSIDIAN_THREAD_NOTICE},
+        }
+      )
+      continue
+    sanitized.append(item)
+  return sanitized, changed
+
+
+def _sanitize_migration_agent_traces(traces: object) -> tuple[list[object], bool]:
+  if not isinstance(traces, list):
+    return [], False
+  sanitized: list[object] = []
+  changed = False
+  for item in traces:
+    if not isinstance(item, dict):
+      sanitized.append(item)
+      continue
+    action_kind = str(item.get("action_kind") or "").strip()
+    if action_kind == "review_knowledge" or _migration_text_mentions_obsidian(item):
+      changed = True
+      next_item = dict(item)
+      next_item["summary"] = _MIGRATION_OBSIDIAN_THREAD_NOTICE
+      next_item["changes"] = [_MIGRATION_OBSIDIAN_THREAD_NOTICE]
+      sanitized.append(next_item)
+      continue
+    sanitized.append(item)
+  return sanitized, changed
+
+
+def _sanitize_migration_agent_event_blocks(event_blocks: object) -> tuple[list[object], bool]:
+  if not isinstance(event_blocks, list):
+    return [], False
+  sanitized: list[object] = []
+  changed = False
+  for item in event_blocks:
+    if not isinstance(item, dict):
+      sanitized.append(item)
+      continue
+    action_kind = str(item.get("action_kind") or "").strip()
+    if action_kind == "review_knowledge" or _migration_text_mentions_obsidian(item):
+      changed = True
+      next_item = dict(item)
+      next_item["title"] = "Obsidian 资料分析已移除"
+      next_item["summary"] = _MIGRATION_OBSIDIAN_THREAD_NOTICE
+      sanitized.append(next_item)
+      continue
+    sanitized.append(item)
+  return sanitized, changed
+
+
+def _sanitize_migration_agent_thread_message(message: object) -> tuple[object, bool]:
+  if not isinstance(message, dict):
+    return message, False
+  sanitized = dict(message)
+  changed = False
+
+  artifacts, artifacts_changed = _sanitize_migration_agent_artifacts(sanitized.get("artifacts"))
+  if artifacts_changed:
+    sanitized["artifacts"] = artifacts
+    changed = True
+
+  traces, traces_changed = _sanitize_migration_agent_traces(sanitized.get("execution_trace"))
+  if traces_changed:
+    sanitized["execution_trace"] = traces
+    changed = True
+
+  event_blocks, event_blocks_changed = _sanitize_migration_agent_event_blocks(sanitized.get("event_blocks"))
+  if event_blocks_changed:
+    sanitized["event_blocks"] = event_blocks
+    changed = True
+
+  if changed and str(sanitized.get("role") or "") == "assistant":
+    sanitized["content"] = _MIGRATION_OBSIDIAN_THREAD_NOTICE
+    sanitized["summary"] = _MIGRATION_OBSIDIAN_THREAD_NOTICE
+    sanitized["original_length"] = len(_MIGRATION_OBSIDIAN_THREAD_NOTICE)
+    sanitized["content_hash"] = _agent_thread_content_hash(_MIGRATION_OBSIDIAN_THREAD_NOTICE)
+    sanitized["changes"] = [_MIGRATION_OBSIDIAN_THREAD_NOTICE]
+  return sanitized, changed
+
+
+def _sanitize_migration_agent_thread_file(source_path: Path, output_path: Path) -> None:
+  payload = read_json(source_path, {})
+  if not isinstance(payload, dict):
+    payload = {}
+  sanitized = dict(payload)
+  messages = sanitized.get("messages")
+  if isinstance(messages, list):
+    sanitized_messages: list[object] = []
+    for message in messages:
+      sanitized_message, _changed = _sanitize_migration_agent_thread_message(message)
+      sanitized_messages.append(sanitized_message)
+    sanitized["messages"] = sanitized_messages
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, sanitized)
+
+
+def _migration_agent_workflow_marker(payload: dict[str, object]) -> bool:
+  kind = str(payload.get("kind") or payload.get("action_kind") or "").strip()
+  subtask_id = str(payload.get("subtask_id") or "").strip()
+  artifact_kind = str(payload.get("artifact_kind") or "").strip()
+  return (
+    kind == "review_knowledge"
+    or subtask_id.startswith("review_knowledge")
+    or artifact_kind == "knowledge_summary"
+    or kind in {"knowledge_summary", "obsidian_maintenance"}
+    or "obsidian" in kind.lower()
+    or "obsidian" in artifact_kind.lower()
+  )
+
+
+def _migration_agent_notice_value(key: str) -> object:
+  if key == "content_preview":
+    return ""
+  if key in {"title", "label"}:
+    return _MIGRATION_AGENT_NOTICE_TITLE
+  if key in {"changes", "suggestions"}:
+    return [_MIGRATION_OBSIDIAN_THREAD_NOTICE]
+  return _MIGRATION_OBSIDIAN_THREAD_NOTICE
+
+
+def _sanitize_migration_agent_workflow_value(value: object, *, sensitive: bool = False) -> object:
+  if isinstance(value, list):
+    return [
+      _sanitize_migration_agent_workflow_value(item, sensitive=sensitive)
+      for item in value
+    ]
+  if not isinstance(value, dict):
+    return value
+
+  local_sensitive = sensitive or _migration_agent_workflow_marker(value)
+  sanitized: dict[str, object] = {}
+  for raw_key, raw_value in value.items():
+    key = str(raw_key)
+    if key in {"artifacts", "artifact_delta"}:
+      artifacts, artifacts_changed = _sanitize_migration_agent_artifacts(raw_value)
+      sanitized[key] = artifacts if artifacts_changed else _sanitize_migration_agent_workflow_value(
+        raw_value,
+        sensitive=local_sensitive,
+      )
+      continue
+    if key == "execution_trace":
+      traces, traces_changed = _sanitize_migration_agent_traces(raw_value)
+      sanitized[key] = traces if traces_changed else _sanitize_migration_agent_workflow_value(
+        raw_value,
+        sensitive=local_sensitive,
+      )
+      continue
+    if key == "event_blocks":
+      event_blocks, event_blocks_changed = _sanitize_migration_agent_event_blocks(raw_value)
+      sanitized[key] = event_blocks if event_blocks_changed else _sanitize_migration_agent_workflow_value(
+        raw_value,
+        sensitive=local_sensitive,
+      )
+      continue
+    if key in {"contract", "output_validation", "metadata"} and local_sensitive:
+      sanitized[key] = {"migration_notice": _MIGRATION_OBSIDIAN_THREAD_NOTICE}
+      continue
+    if key in _MIGRATION_AGENT_TEXT_KEYS and (local_sensitive or _migration_text_mentions_obsidian(raw_value)):
+      sanitized[key] = _migration_agent_notice_value(key)
+      continue
+    sanitized[key] = _sanitize_migration_agent_workflow_value(raw_value, sensitive=local_sensitive)
+  return sanitized
+
+
+def _sanitize_migration_agent_workflow_file(source_path: Path, output_path: Path) -> None:
+  payload = read_json(source_path, {})
+  if not isinstance(payload, dict):
+    payload = {}
+  sanitized = _sanitize_migration_agent_workflow_value(payload)
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, sanitized if isinstance(sanitized, dict) else {})
+
+
+def _sanitize_migration_json_file(source_path: Path, output_path: Path) -> None:
+  try:
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    _sanitize_migration_jsonl_file(source_path, output_path)
+    return
+  sanitized = _sanitize_migration_agent_workflow_value(payload)
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_json(output_path, sanitized)
+
+
+def _sanitize_migration_jsonl_file(source_path: Path, output_path: Path) -> None:
+  sanitized_lines: list[str] = []
+  try:
+    raw_lines = source_path.read_text(encoding="utf-8").splitlines()
+  except OSError:
+    raw_lines = []
+
+  for raw_line in raw_lines:
+    if not raw_line.strip():
+      continue
+    try:
+      payload = json.loads(raw_line)
+    except json.JSONDecodeError:
+      if _migration_text_mentions_obsidian(raw_line):
+        payload = {"migration_notice": _MIGRATION_OBSIDIAN_THREAD_NOTICE}
+      else:
+        sanitized_lines.append(raw_line)
+        continue
+    sanitized = _sanitize_migration_agent_workflow_value(payload)
+    sanitized_lines.append(json.dumps(sanitized, ensure_ascii=False))
+
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+  atomic_write_text(output_path, "\n".join(sanitized_lines) + ("\n" if sanitized_lines else ""))
+
+
+def _iter_migration_project_files(
+  project_dir: Path,
+  *,
+  scrub_external_obsidian_index: bool = False,
+) -> tuple[list[Path], list[str]]:
+  files: list[Path] = []
+  warnings: list[str] = []
+
+  for path in sorted(project_dir.rglob("*"), key=lambda item: item.relative_to(project_dir).as_posix()):
+    if not path.is_file():
+      continue
+    relative_path = path.relative_to(project_dir).as_posix()
+    if _should_skip_migration_file(relative_path):
+      continue
+    if scrub_external_obsidian_index and relative_path.startswith(f"{_APP_STATE_DIRNAME}/obsidian_drafts/"):
+      continue
+    if scrub_external_obsidian_index and relative_path.startswith(f"{_APP_STATE_DIRNAME}/{_AGENT_THREAD_CONTEXT_DIRNAME}/"):
+      continue
+    if path.is_symlink():
+      warnings.append(f"已跳过符号链接文件：{relative_path}")
+      continue
+    files.append(path)
+
+  return files, warnings
+
+
+def _safe_import_dirname(value: object, fallback_name: str) -> str:
+  raw_value = str(value or "").strip().replace("\\", "/")
+  candidate = PurePosixPath(raw_value).name if raw_value else ""
+  if candidate in {"", ".", ".."}:
+    candidate = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{_safe_folder_name(fallback_name)}"
+
+  cleaned = "".join("_" if char in '<>:"/\\|?*' or ord(char) < 32 else char for char in candidate)
+  cleaned = cleaned.strip(" .")
+  return cleaned[:120] or f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_novel-project"
+
+
+def _unique_import_project_dir(base_dir: Path, preferred_dirname: str) -> Path:
+  candidate = base_dir / preferred_dirname
+  if not candidate.exists():
+    return candidate
+
+  timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+  first_candidate = base_dir / f"{preferred_dirname}_导入_{timestamp}"
+  if not first_candidate.exists():
+    return first_candidate
+
+  for index in range(2, 1000):
+    next_candidate = base_dir / f"{preferred_dirname}_导入_{timestamp}_{index}"
+    if not next_candidate.exists():
+      return next_candidate
+
+  raise HTTPException(
+    status_code=409,
+    detail={"code": "migration_import_dir_exists", "message": "导入目录已存在，请清理重名目录后再试"},
+  )
+
+
+def _coerce_project_meta_int(value: object, default: int, lower: int, upper: int) -> int:
+  try:
+    parsed = int(value)
+  except (TypeError, ValueError):
+    return default
+  return max(lower, min(upper, parsed))
+
+
+def _invalid_migration_package(message: str, *, status_code: int = 400) -> HTTPException:
+  return HTTPException(
+    status_code=status_code,
+    detail={"code": "invalid_migration_package", "message": message},
+  )
+
+
+def _decode_migration_package(content_base64: str) -> bytes:
+  try:
+    return base64.b64decode(content_base64.encode("utf-8"), validate=True)
+  except (binascii.Error, ValueError) as error:
+    raise _invalid_migration_package("迁移包内容不是有效的 Base64") from error
+
+
+def _safe_zip_member_path(filename: str) -> PurePosixPath:
+  normalized = filename.replace("\\", "/")
+  if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+    raise _invalid_migration_package("迁移包包含非法绝对路径")
+
+  path = PurePosixPath(normalized)
+  if any(part in {"", ".", ".."} for part in path.parts):
+    raise _invalid_migration_package("迁移包包含非法相对路径")
+
+  return path
+
+
+def _zip_member_is_symlink(info: zipfile.ZipInfo) -> bool:
+  mode = info.external_attr >> 16
+  return stat.S_ISLNK(stat.S_IFMT(mode))
+
+
+def _read_migration_manifest(archive: zipfile.ZipFile) -> dict:
+  try:
+    raw_manifest = archive.read(_MIGRATION_MANIFEST_FILENAME)
+  except KeyError as error:
+    raise _invalid_migration_package("这不是稿匣项目迁移包") from error
+
+  try:
+    manifest = json.loads(raw_manifest.decode("utf-8"))
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise _invalid_migration_package("迁移包清单无法读取") from error
+
+  if not isinstance(manifest, dict):
+    raise _invalid_migration_package("迁移包清单格式不正确")
+  return manifest
+
+
+def _migration_archive_project_files(archive: zipfile.ZipFile) -> tuple[list[tuple[zipfile.ZipInfo, PurePosixPath]], int]:
+  project_files: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
+  total_size = 0
+
+  for info in archive.infolist():
+    if info.is_dir():
+      continue
+
+    member_path = _safe_zip_member_path(info.filename)
+    member_name = member_path.as_posix()
+    if member_name == _MIGRATION_MANIFEST_FILENAME:
+      continue
+    if not member_name.startswith(f"{_MIGRATION_PROJECT_ROOT}/"):
+      raise _invalid_migration_package("迁移包包含项目目录外的文件")
+    if _zip_member_is_symlink(info):
+      raise _invalid_migration_package("迁移包包含符号链接文件，无法安全导入")
+
+    relative_path = PurePosixPath(member_name[len(f"{_MIGRATION_PROJECT_ROOT}/"):])
+    if any(part in {"", ".", ".."} for part in relative_path.parts):
+      raise _invalid_migration_package("迁移包包含非法项目文件路径")
+
+    total_size += int(info.file_size)
+    if total_size > _MIGRATION_MAX_UNCOMPRESSED_BYTES:
+      raise _invalid_migration_package("迁移包解压后体积超过限制", status_code=413)
+
+    project_files.append((info, relative_path))
+    if len(project_files) > _MIGRATION_MAX_FILE_COUNT:
+      raise _invalid_migration_package("迁移包文件数量超过限制", status_code=413)
+
+  return project_files, total_size
+
+
+def _extract_migration_project(
+  archive: zipfile.ZipFile,
+  project_files: list[tuple[zipfile.ZipInfo, PurePosixPath]],
+  target_dir: Path,
+) -> None:
+  target_root = target_dir.resolve()
+
+  for info, relative_path in project_files:
+    output_path = target_dir.joinpath(*relative_path.parts)
+    if not output_path.resolve().is_relative_to(target_root):
+      raise _invalid_migration_package("迁移包包含非法项目文件路径")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with archive.open(info) as source, output_path.open("wb") as output:
+      shutil.copyfileobj(source, output)
 
 
 def _write_project_index(settings: Settings, projects: list[ProjectSummary]) -> None:
@@ -2419,6 +3099,47 @@ def _knowledge_tokens(text: str) -> str:
   return " ".join(tokens)
 
 
+def _knowledge_search_terms(text: str, limit: int = 160) -> list[str]:
+  tokens = _knowledge_tokens(text).split()
+  long_tokens = [item for item in tokens if len(item) >= 2]
+  if long_tokens:
+    return long_tokens[: max(1, limit)]
+  return tokens[: max(1, min(limit, 32))]
+
+
+def _knowledge_overlap_score(terms: list[str], content: str) -> float:
+  normalized = re.sub(r"\s+", "", str(content or "")).lower()
+  if not normalized:
+    return 0.0
+  hits = 0
+  for term in terms[:120]:
+    if term.lower() in normalized:
+      hits += 1
+  return float(hits)
+
+
+def _knowledge_compact_query_text(value: str) -> str:
+  return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _knowledge_query_matches_safe_text(query: str, content: str, terms: list[str]) -> bool:
+  if not terms:
+    return True
+  normalized_query = _knowledge_compact_query_text(query)
+  normalized_content = _knowledge_compact_query_text(content)
+  if not normalized_content:
+    return False
+  if normalized_query and normalized_query in normalized_content:
+    return True
+  ascii_terms = [item for item in re.findall(r"[A-Za-z0-9_]{3,}", str(query or "").lower()) if item]
+  if ascii_terms and any(item in normalized_content for item in ascii_terms):
+    return True
+  overlap = _knowledge_overlap_score(terms, content)
+  if len(normalized_query) >= 4:
+    return overlap >= 2
+  return overlap > 0
+
+
 def _split_knowledge_chunks(text: str, limit: int = 220) -> list[str]:
   normalized = text.replace("\r\n", "\n").strip()
   if not normalized:
@@ -2487,6 +3208,10 @@ def _knowledge_source_signature(project_dir: Path, target_chapters: int) -> str:
     digest.update(str(path.relative_to(project_dir)).encode("utf-8"))
     digest.update(str(stat.st_mtime_ns).encode("utf-8"))
     digest.update(str(stat.st_size).encode("utf-8"))
+  for source_label, mtime_ns, size in sorted(obsidian_source_signature_entries(project_dir)):
+    digest.update(source_label.encode("utf-8"))
+    digest.update(str(mtime_ns).encode("utf-8"))
+    digest.update(str(size).encode("utf-8"))
   return digest.hexdigest()
 
 
@@ -2519,6 +3244,9 @@ def _knowledge_source_key_for_relative_path(relative_path: str) -> str:
 
   if normalized.startswith(f"{_REFERENCE_DIRNAME}/") and normalized.endswith(".json"):
     return _reference_source_key(Path(normalized).name)
+
+  if normalized.startswith("obsidian:"):
+    return normalized
 
   return ""
 
@@ -2808,6 +3536,20 @@ def _knowledge_rows_for_source_key(project_dir: Path, source_key: str, created_a
     )
     return "资料库", "reference", rows
 
+  if source_key.startswith("obsidian:"):
+    record = obsidian_note_record_for_source_key(project_dir, source_key)
+    if record is None:
+      return "Obsidian", "obsidian", []
+    rows = _build_knowledge_chunk_rows(
+      source_key=source_key,
+      kind="obsidian",
+      source="Obsidian",
+      section=f"{record.summary.title} · {record.summary.relative_path}",
+      content=record.content,
+      created_at=record.summary.updated_at or created_at,
+    )
+    return "Obsidian", "obsidian", rows
+
   return "", "", []
 
 
@@ -2960,6 +3702,23 @@ def _rebuild_project_knowledge(project_dir: Path, target_chapters: int, settings
         )
       )
 
+    obsidian_records, _obsidian_skipped, _obsidian_warnings = collect_obsidian_note_records(project_dir)
+    for record in obsidian_records:
+      connection.execute(
+        "INSERT INTO knowledge_sources (source_key, source, kind, created_at) VALUES (?, ?, ?, ?)",
+        (record.summary.source_key, "Obsidian", "obsidian", record.summary.updated_at or now),
+      )
+      chunk_rows.extend(
+        _build_knowledge_chunk_rows(
+          source_key=record.summary.source_key,
+          kind="obsidian",
+          source="Obsidian",
+          section=f"{record.summary.title} · {record.summary.relative_path}",
+          content=record.content,
+          created_at=record.summary.updated_at or now,
+        )
+      )
+
     connection.executemany(
       """
       INSERT INTO knowledge_chunks (
@@ -3044,6 +3803,21 @@ def _knowledge_candidate_limit(limit: int) -> int:
   )
 
 
+def _knowledge_result_limit(limit: int) -> int:
+  try:
+    raw_limit = int(limit or 1)
+  except (TypeError, ValueError):
+    raw_limit = 1
+  return max(1, min(raw_limit, 20))
+
+
+def _chapter_filtered_search_limit(limit: int) -> int:
+  return max(
+    _KNOWLEDGE_SEMANTIC_CANDIDATE_MIN,
+    min(max(1, limit) * 8, _KNOWLEDGE_CHAPTER_FILTER_RESULT_CAP),
+  )
+
+
 def _keyword_search_project_knowledge(connection: sqlite3.Connection, query: str, limit: int) -> list[dict[str, object]]:
   normalized = query.strip()
   if not normalized:
@@ -3051,12 +3825,12 @@ def _keyword_search_project_knowledge(connection: sqlite3.Connection, query: str
   search_limit = max(1, min(limit, _KNOWLEDGE_SEMANTIC_CANDIDATE_CAP))
 
   if _knowledge_supports_fts(connection):
-    tokens = _knowledge_tokens(normalized).split()
-    fts_query = " OR ".join(tokens[:10]) if tokens else normalized
+    tokens = _knowledge_search_terms(normalized)
+    fts_query = " OR ".join(tokens) if tokens else normalized
     rows = connection.execute(
       """
-      SELECT knowledge_chunks.chunk_id, knowledge_chunks.source, knowledge_chunks.section, knowledge_chunks.content,
-             bm25(knowledge_chunks_fts) AS score
+      SELECT knowledge_chunks.chunk_id, knowledge_chunks.source_key, knowledge_chunks.source,
+             knowledge_chunks.section, knowledge_chunks.content, bm25(knowledge_chunks_fts) AS score
       FROM knowledge_chunks_fts
       JOIN knowledge_chunks ON knowledge_chunks.chunk_id = knowledge_chunks_fts.chunk_id
       WHERE knowledge_chunks_fts MATCH ?
@@ -3068,19 +3842,20 @@ def _keyword_search_project_knowledge(connection: sqlite3.Connection, query: str
     return [
       {
         "chunk_id": str(chunk_id),
+        "source_key": str(source_key),
         "source": str(source),
         "section": str(section),
         "content": str(content),
-        "score": float(-score) if isinstance(score, (int, float)) else 0.0,
+        "score": (float(-score) if isinstance(score, (int, float)) else 0.0) + _knowledge_overlap_score(tokens, str(content)),
         "match_type": "keyword",
       }
-      for chunk_id, source, section, content, score in rows
+      for chunk_id, source_key, source, section, content, score in rows
     ]
 
   like_query = f"%{normalized}%"
   rows = connection.execute(
     """
-    SELECT chunk_id, source, section, content
+    SELECT chunk_id, source_key, source, section, content
     FROM knowledge_chunks
     WHERE content LIKE ? OR tokens LIKE ?
     ORDER BY LENGTH(content) ASC
@@ -3091,13 +3866,14 @@ def _keyword_search_project_knowledge(connection: sqlite3.Connection, query: str
   return [
     {
       "chunk_id": str(chunk_id),
+      "source_key": str(source_key),
       "source": str(source),
       "section": str(section),
       "content": str(content),
       "score": 0.0,
       "match_type": "keyword",
     }
-    for chunk_id, source, section, content in rows
+    for chunk_id, source_key, source, section, content in rows
   ]
 
 
@@ -3133,8 +3909,9 @@ def _semantic_search_project_knowledge(
 
   rows = connection.execute(
     f"""
-    SELECT knowledge_chunks.chunk_id, knowledge_chunks.source, knowledge_chunks.section, knowledge_chunks.content,
-           knowledge_vectors.vector_blob, knowledge_vectors.vector_json, knowledge_vectors.vector_norm
+    SELECT knowledge_chunks.chunk_id, knowledge_chunks.source_key, knowledge_chunks.source,
+           knowledge_chunks.section, knowledge_chunks.content, knowledge_vectors.vector_blob,
+           knowledge_vectors.vector_json, knowledge_vectors.vector_norm
     FROM knowledge_vectors
     JOIN knowledge_chunks ON knowledge_chunks.chunk_id = knowledge_vectors.chunk_id
     {where_sql}
@@ -3143,7 +3920,7 @@ def _semantic_search_project_knowledge(
   ).fetchall()
 
   scored: list[dict[str, object]] = []
-  for chunk_id, source, section, content, vector_blob, vector_json, vector_norm in rows:
+  for chunk_id, source_key, source, section, content, vector_blob, vector_json, vector_norm in rows:
     vector = _vector_from_storage(vector_blob, vector_json)
     if not vector:
       continue
@@ -3153,6 +3930,7 @@ def _semantic_search_project_knowledge(
     scored.append(
       {
         "chunk_id": str(chunk_id),
+        "source_key": str(source_key),
         "source": str(source),
         "section": str(section),
         "content": str(content),
@@ -3181,7 +3959,7 @@ def _search_project_knowledge(
   if not db_path.exists():
     return []
 
-  search_limit = max(1, min(limit, 20))
+  search_limit = max(1, min(limit, _KNOWLEDGE_SEMANTIC_CANDIDATE_CAP))
   connection = sqlite3.connect(db_path)
   try:
     keyword_hits = _keyword_search_project_knowledge(connection, normalized, _knowledge_candidate_limit(search_limit))
@@ -3222,6 +4000,7 @@ def _search_project_knowledge(
   return [
     KnowledgeSearchResult(
       source=str(item["source"]),
+      source_key=str(item.get("source_key") or ""),
       section=str(item["section"]),
       preview=_compact_text(str(item["content"]), limit=180),
       score=float(item["score"]),
@@ -3247,7 +4026,7 @@ def _search_project_knowledge_evidence(
   if not db_path.exists():
     return []
 
-  search_limit = max(1, min(limit, 20))
+  search_limit = max(1, min(limit, _KNOWLEDGE_CHAPTER_FILTER_RESULT_CAP))
   rerank_candidate_limit = max(search_limit, candidate_limit)
   connection = sqlite3.connect(db_path)
   try:
@@ -3306,6 +4085,89 @@ def _search_project_knowledge_evidence(
     ]
 
   return ranked[:search_limit]
+
+
+def _filter_obsidian_evidence_hits_for_chapter(
+  project_dir: Path,
+  hits: list[dict[str, object]],
+  query: str,
+  chapter_index: int = 0,
+) -> list[dict[str, object]]:
+  try:
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  if target_chapter <= 0:
+    return hits
+
+  records = scoped_obsidian_note_records_for_chapter(project_dir, target_chapter)
+  record_by_source_key = {
+    record.summary.source_key: record
+    for record in records
+    if record.summary.source_key
+  }
+  query_terms = _knowledge_search_terms(query)
+  filtered: list[dict[str, object]] = []
+  for hit in hits:
+    if str(hit.get("source") or "").strip() != "Obsidian":
+      filtered.append(hit)
+      continue
+    record = record_by_source_key.get(str(hit.get("source_key") or "").strip())
+    if record is None:
+      continue
+    safe_text = record.content or record.summary.preview or record.summary.title
+    if query_terms and not _knowledge_query_matches_safe_text(query, safe_text, query_terms):
+      continue
+    safe_hit = dict(hit)
+    safe_hit["content"] = safe_text
+    safe_hit["section"] = f"{record.summary.title} · {record.summary.relative_path}"
+    filtered.append(safe_hit)
+  return filtered
+
+
+def _filter_obsidian_search_results_for_chapter(
+  project_dir: Path,
+  hits: list[KnowledgeSearchResult],
+  query: str,
+  chapter_index: int = 0,
+) -> list[KnowledgeSearchResult]:
+  try:
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  if target_chapter <= 0:
+    return hits
+
+  records = scoped_obsidian_note_records_for_chapter(project_dir, target_chapter)
+  record_by_source_key = {
+    record.summary.source_key: record
+    for record in records
+    if record.summary.source_key
+  }
+  query_terms = _knowledge_search_terms(query)
+  filtered: list[KnowledgeSearchResult] = []
+  for hit in hits:
+    if str(hit.source or "").strip() != "Obsidian":
+      filtered.append(hit)
+      continue
+    record = record_by_source_key.get(str(hit.source_key or "").strip())
+    if record is None:
+      continue
+    safe_text = record.content or record.summary.preview or record.summary.title
+    if query_terms and not _knowledge_query_matches_safe_text(query, safe_text, query_terms):
+      continue
+    safe_preview = _compact_text(record.summary.preview or record.content or "", limit=180)
+    if not safe_preview:
+      safe_preview = f"Obsidian 笔记：{record.summary.title or record.summary.relative_path}"
+    filtered.append(
+      hit.model_copy(
+        update={
+          "section": f"{record.summary.title} · {record.summary.relative_path}",
+          "preview": safe_preview,
+        }
+      )
+    )
+  return filtered
 
 
 def _is_character_candidate(name: str) -> bool:
@@ -4575,6 +5437,7 @@ def _overview_source_signature(
   documents: list[StoryDocument],
   material_payloads: list[dict[str, str]],
   chapters: list[ChapterSummary],
+  obsidian_entries: list[tuple[str, int, int]] | None = None,
 ) -> str:
   parts: list[str] = []
   for item in documents:
@@ -4585,6 +5448,8 @@ def _overview_source_signature(
     if not chapter.exists and not (chapter.content or "").strip():
       continue
     parts.append(f"chapter::{chapter.id}::{chapter.title}::{(chapter.content or chapter.preview or '').strip()}")
+  for source_label, mtime_ns, size in obsidian_entries or []:
+    parts.append(f"obsidian::{source_label}::{mtime_ns}::{size}")
   return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -4592,6 +5457,7 @@ def _overview_source_blocks(
   documents: list[StoryDocument],
   material_payloads: list[dict[str, str]],
   chapters: list[ChapterSummary],
+  obsidian_records: list[object] | None = None,
 ) -> list[str]:
   blocks: list[str] = []
   for document in documents:
@@ -4608,6 +5474,13 @@ def _overview_source_blocks(
       continue
     content = _material_analysis_text(_extract_chapter_body(chapter), limit=2600)
     blocks.append(f"【章节:{chapter.index}《{chapter.title}》】\n{content}")
+  for record in (obsidian_records or [])[:80]:
+    summary = getattr(record, "summary", None)
+    title = str(getattr(summary, "title", "") or "").strip() or "未命名笔记"
+    relative_path = str(getattr(summary, "relative_path", "") or "").strip()
+    content = _material_analysis_text(str(getattr(record, "content", "") or ""), limit=2400)
+    if content:
+      blocks.append(f"【Obsidian:{title} / {relative_path}】\n{content}")
   return blocks
 
 
@@ -5344,9 +6217,15 @@ def _model_story_overview_or_none(
   *,
   allow_request: bool = False,
   force: bool = False,
+  use_cache: bool = True,
 ) -> StoryOverview | None:
-  source_signature = _overview_source_signature(documents, material_payloads, chapters)
-  cached = _model_cache_to_overview(project_dir, documents, source_signature)
+  source_signature = _overview_source_signature(
+    documents,
+    material_payloads,
+    chapters,
+    obsidian_source_signature_entries(project_dir),
+  )
+  cached = _model_cache_to_overview(project_dir, documents, source_signature) if use_cache else None
   if cached is not None and not force:
     return cached
   if not allow_request:
@@ -5357,7 +6236,8 @@ def _model_story_overview_or_none(
     append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
     return None
 
-  source_blocks = _overview_source_blocks(documents, material_payloads, chapters)
+  obsidian_records, _obsidian_skipped, _obsidian_warnings = collect_obsidian_note_records(project_dir)
+  source_blocks = _overview_source_blocks(documents, material_payloads, chapters, obsidian_records)
   full_source_text = "\n\n".join(source_blocks).strip()
   if not full_source_text:
     return None
@@ -5506,6 +6386,7 @@ def _build_story_overview(
   review_character_candidates: bool = False,
   allow_model_overview: bool = False,
   force_model_overview: bool = False,
+  use_model_overview_cache: bool = True,
 ) -> StoryOverview:
   documents = _build_story_documents(project_dir)
   material_payloads = _load_knowledge_material_payloads(project_dir)
@@ -5517,14 +6398,23 @@ def _build_story_overview(
     chapters,
     allow_request=allow_model_overview,
     force=force_model_overview,
+    use_cache=use_model_overview_cache,
   )
   if model_overview is not None:
-    return model_overview
+    return model_overview.model_copy(update={"obsidian": load_obsidian_state(project_dir)})
 
   return StoryOverview(
     documents=documents,
     materials=_build_knowledge_materials(project_dir),
+    obsidian=load_obsidian_state(project_dir),
     memory_entries=load_project_memory(project_dir),
+  )
+
+
+def _overview_has_structured_entities(overview: StoryOverview) -> bool:
+  return any(
+    bool(getattr(overview, field, []) or [])
+    for field in ("characters", "events", "locations", "props", "skills", "scenes", "organizations")
   )
 
 
@@ -5540,6 +6430,7 @@ def get_project_detail(
   *,
   review_characters: bool = False,
   allow_model_overview: bool = False,
+  use_model_overview_cache: bool = True,
 ) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
@@ -5554,15 +6445,26 @@ def get_project_detail(
     chapters,
     review_character_candidates=review_characters,
     allow_model_overview=allow_model_overview or review_characters,
+    use_model_overview_cache=use_model_overview_cache,
   )
+  memory_overview = overview
+  if _overview_has_structured_entities(overview):
+    memory_overview = _build_story_overview(
+      settings,
+      project_dir,
+      chapters,
+      review_character_candidates=False,
+      allow_model_overview=False,
+      use_model_overview_cache=False,
+    )
   auto_entries, memory_signature = build_auto_project_memory(
-    documents=overview.documents,
-    characters=overview.characters,
-    events=overview.events,
-    locations=overview.locations,
-    props=overview.props,
-    scenes=overview.scenes,
-    organizations=overview.organizations,
+    documents=memory_overview.documents,
+    characters=memory_overview.characters,
+    events=memory_overview.events,
+    locations=memory_overview.locations,
+    props=memory_overview.props,
+    scenes=memory_overview.scenes,
+    organizations=memory_overview.organizations,
     chapters=chapters,
   )
   overview = overview.model_copy(
@@ -5581,19 +6483,28 @@ def get_project_detail(
       ),
     }
   )
+  distillation_overview = overview
+  if _overview_has_structured_entities(overview):
+    distillation_overview = memory_overview.model_copy(
+      update={
+        "memory_entries": overview.memory_entries,
+        "dream_report": overview.dream_report,
+      }
+    )
   detail = ProjectDetail(
     **summary.model_dump(),
     chapters=chapters,
     local_history=local_history,
     story_overview=overview,
   )
-  distillation_signature = build_project_distillation_signature(detail)
+  distillation_detail = detail.model_copy(update={"story_overview": distillation_overview})
+  distillation_signature = build_project_distillation_signature(distillation_detail)
   distillation_report = load_project_distillation(
     project_dir,
     source_signature=distillation_signature,
   )
   if distillation_report is None or distillation_report.is_stale:
-    distillation_report = generate_project_distillation(detail, source_signature=distillation_signature)
+    distillation_report = generate_project_distillation(distillation_detail, source_signature=distillation_signature)
   overview = overview.model_copy(
     update={
       "chapter_reviews": load_chapter_reviews(project_dir, detail),
@@ -6021,6 +6932,236 @@ def export_project_book(
   )
 
 
+def export_project_migration_package(
+  settings: Settings,
+  project_id: str,
+) -> ProjectMigrationExportResult:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _assert_project_dir_is_valid(summary)
+  scrub_external_obsidian_index = _project_has_external_obsidian_vault(project_dir)
+  project_files, file_warnings = _iter_migration_project_files(
+    project_dir,
+    scrub_external_obsidian_index=scrub_external_obsidian_index,
+  )
+  warnings = [*file_warnings, *_migration_external_resource_warnings(project_dir)]
+  created_at = _now_iso()
+  timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+  filename = f"{timestamp}_{_safe_folder_name(summary.name)}{_MIGRATION_PACKAGE_SUFFIX}"
+  output_path = _migration_output_dir(project_dir) / filename
+  temp_path = _migration_cache_dir(settings) / f"{uuid4().hex}{_MIGRATION_PACKAGE_SUFFIX}"
+  manifest = {
+    "schema_version": _MIGRATION_SCHEMA_VERSION,
+    "app_name": settings.app_name,
+    "app_version": settings.app_version,
+    "exported_at": created_at,
+    "project_root": _MIGRATION_PROJECT_ROOT,
+    "root_dirname": project_dir.name,
+    "project": summary.model_dump(mode="json"),
+    "project_meta": read_json(_project_meta_path(project_dir), {}),
+    "file_count": len(project_files),
+    "warnings": warnings,
+  }
+
+  try:
+    with tempfile.TemporaryDirectory(prefix="project-migration-export-", dir=_migration_cache_dir(settings)) as scratch_dir:
+      scratch_path = Path(scratch_dir)
+      with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+          _MIGRATION_MANIFEST_FILENAME,
+          json.dumps(manifest, ensure_ascii=False, indent=2),
+        )
+        for path in project_files:
+          relative_path = path.relative_to(project_dir).as_posix()
+          archive_path = f"{_MIGRATION_PROJECT_ROOT}/{relative_path}"
+          if scrub_external_obsidian_index and relative_path == "knowledge.db":
+            sanitized_db_path = scratch_path / "knowledge.db"
+            _sanitize_migration_knowledge_db(path, sanitized_db_path)
+            archive.write(sanitized_db_path, archive_path)
+          elif scrub_external_obsidian_index and relative_path == f"{_APP_STATE_DIRNAME}/obsidian_sync.json":
+            sanitized_sync_path = scratch_path / "obsidian_sync.json"
+            _sanitize_migration_obsidian_sync(project_dir, sanitized_sync_path)
+            archive.write(sanitized_sync_path, archive_path)
+          elif scrub_external_obsidian_index and relative_path == f"{_APP_STATE_DIRNAME}/learning/narrative_state.json":
+            sanitized_state_path = scratch_path / "narrative_state.json"
+            _sanitize_migration_narrative_state(path, sanitized_state_path)
+            archive.write(sanitized_state_path, archive_path)
+          elif scrub_external_obsidian_index and relative_path == "project_distillation.json":
+            sanitized_distillation_path = scratch_path / "project_distillation.json"
+            _sanitize_migration_project_distillation(path, sanitized_distillation_path)
+            archive.write(sanitized_distillation_path, archive_path)
+          elif scrub_external_obsidian_index and relative_path.startswith(f"{_APP_STATE_DIRNAME}/learning/") and relative_path.endswith(".jsonl"):
+            sanitized_learning_path = scratch_path / "learning" / Path(relative_path).name
+            _sanitize_migration_jsonl_file(path, sanitized_learning_path)
+            archive.write(sanitized_learning_path, archive_path)
+          elif scrub_external_obsidian_index and relative_path.startswith(f"{_APP_STATE_DIRNAME}/learning/") and relative_path.endswith(".json"):
+            sanitized_learning_path = scratch_path / "learning" / Path(relative_path).name
+            _sanitize_migration_json_file(path, sanitized_learning_path)
+            archive.write(sanitized_learning_path, archive_path)
+          elif (
+            scrub_external_obsidian_index
+            and relative_path.startswith(f"{_APP_STATE_DIRNAME}/{_AGENT_THREADS_DIRNAME}/")
+            and relative_path.endswith(".json")
+          ):
+            sanitized_thread_path = scratch_path / "agent_threads" / Path(relative_path).name
+            _sanitize_migration_agent_thread_file(path, sanitized_thread_path)
+            archive.write(sanitized_thread_path, archive_path)
+          elif (
+            scrub_external_obsidian_index
+            and relative_path.startswith(f"{_APP_STATE_DIRNAME}/{_AGENT_RUNS_DIRNAME}/")
+            and relative_path.endswith(".json")
+          ):
+            sanitized_run_path = scratch_path / "agent_runs" / Path(*PurePosixPath(relative_path).parts)
+            _sanitize_migration_agent_workflow_file(path, sanitized_run_path)
+            archive.write(sanitized_run_path, archive_path)
+          elif (
+            scrub_external_obsidian_index
+            and relative_path.startswith(f"{_APP_STATE_DIRNAME}/")
+            and relative_path != f"{_APP_STATE_DIRNAME}/obsidian.json"
+            and relative_path.endswith(".json")
+          ):
+            sanitized_app_state_path = scratch_path / "app_state" / Path(*PurePosixPath(relative_path).parts)
+            _sanitize_migration_json_file(path, sanitized_app_state_path)
+            archive.write(sanitized_app_state_path, archive_path)
+          else:
+            archive.write(path, archive_path)
+
+    shutil.move(str(temp_path), output_path)
+  finally:
+    temp_path.unlink(missing_ok=True)
+
+  append_app_log(settings, f"project migration package exported: {summary.name} -> {output_path}")
+  return ProjectMigrationExportResult(
+    path=str(output_path),
+    filename=filename,
+    project_id=summary.id,
+    project_name=summary.name,
+    file_count=len(project_files),
+    size_bytes=output_path.stat().st_size,
+    created_at=created_at,
+    warnings=warnings,
+  )
+
+
+def import_project_migration_package(
+  settings: Settings,
+  request: ProjectMigrationImportRequest,
+) -> ProjectMigrationImportResult:
+  package_bytes = _decode_migration_package(request.content_base64)
+  imported_at = _now_iso()
+  base_dir = (
+    Path(request.base_path).expanduser().resolve()
+    if request.base_path
+    else (settings.data_dir / "workspace").resolve()
+  )
+  base_dir.mkdir(parents=True, exist_ok=True)
+
+  try:
+    archive = zipfile.ZipFile(io.BytesIO(package_bytes))
+  except zipfile.BadZipFile as error:
+    raise _invalid_migration_package("迁移包不是有效的 zip 文件") from error
+
+  with archive:
+    manifest = _read_migration_manifest(archive)
+    project_files, total_size = _migration_archive_project_files(archive)
+    if not project_files:
+      raise _invalid_migration_package("迁移包没有包含项目文件")
+
+    raw_project_meta = manifest.get("project_meta")
+    if not isinstance(raw_project_meta, dict):
+      raw_project_meta = {}
+
+    manifest_project = manifest.get("project")
+    if not isinstance(manifest_project, dict):
+      manifest_project = {}
+
+    original_project_id = str(raw_project_meta.get("id") or manifest_project.get("id") or "").strip()
+    original_project_name = str(
+      raw_project_meta.get("name") or manifest_project.get("name") or Path(request.filename).stem
+    ).strip() or "导入作品"
+    project_name = (request.name_override or "").strip() or original_project_name
+    preferred_dirname = _safe_import_dirname(manifest.get("root_dirname"), project_name)
+    target_dir = _unique_import_project_dir(base_dir, preferred_dirname)
+
+    with tempfile.TemporaryDirectory(prefix="project-migration-", dir=_migration_cache_dir(settings)) as temp_dir:
+      extracted_dir = Path(temp_dir) / _MIGRATION_PROJECT_ROOT
+      _extract_migration_project(archive, project_files, extracted_dir)
+      project_meta = read_json(_project_meta_path(extracted_dir), {})
+      if not isinstance(project_meta, dict):
+        raise _invalid_migration_package("迁移包缺少 project.json")
+
+      original_project_id = str(project_meta.get("id") or original_project_id).strip()
+      original_project_name = str(project_meta.get("name") or original_project_name).strip() or "导入作品"
+      project_name = (request.name_override or "").strip() or original_project_name
+      existing_project_ids = {item.id for item in list_projects(settings)}
+      next_project_id = original_project_id if original_project_id and original_project_id not in existing_project_ids else str(uuid4())
+      id_changed = next_project_id != original_project_id
+
+      try:
+        shutil.copytree(extracted_dir, target_dir)
+        _initialize_knowledge_db(target_dir / "knowledge.db")
+        _ensure_history_layout(target_dir)
+
+        target_project_meta = read_json(_project_meta_path(target_dir), {})
+        if not isinstance(target_project_meta, dict):
+          target_project_meta = {}
+        target_project_meta.update(
+          {
+            "id": next_project_id,
+            "name": project_name,
+            "path": str(target_dir),
+            "genre": str(target_project_meta.get("genre") or project_meta.get("genre") or "未定题材"),
+            "target_chapters": _coerce_project_meta_int(
+              target_project_meta.get("target_chapters", project_meta.get("target_chapters")),
+              20,
+              1,
+              1000,
+            ),
+            "target_words": _coerce_project_meta_int(
+              target_project_meta.get("target_words", project_meta.get("target_words")),
+              200000,
+              1000,
+              2000000,
+            ),
+            "updated_at": imported_at,
+          }
+        )
+        target_project_meta.setdefault("created_at", imported_at)
+        atomic_write_json(_project_meta_path(target_dir), target_project_meta)
+      except Exception:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise
+
+  warnings = _migration_external_resource_warnings(target_dir)
+  if id_changed:
+    warnings.insert(0, "当前项目列表已有同 ID 作品，本次导入已生成新的作品 ID")
+
+  summary = ProjectSummary(
+    id=next_project_id,
+    name=project_name,
+    path=str(target_dir),
+    genre=str(target_project_meta["genre"]),
+    target_chapters=int(target_project_meta["target_chapters"]),
+    target_words=int(target_project_meta["target_words"]),
+    updated_at=imported_at,
+  )
+  projects = [item for item in list_projects(settings) if item.id != summary.id]
+  projects.insert(0, summary)
+  _write_project_index(settings, projects)
+
+  append_app_log(settings, f"project migration package imported: {request.filename} -> {target_dir}")
+  return ProjectMigrationImportResult(
+    project=summary,
+    original_project_id=original_project_id,
+    original_project_name=original_project_name,
+    imported_at=imported_at,
+    path=str(target_dir),
+    file_count=len(project_files),
+    size_bytes=total_size,
+    id_changed=id_changed,
+    warnings=warnings,
+  )
+
+
 def import_project_knowledge(
   settings: Settings,
   project_id: str,
@@ -6048,6 +7189,219 @@ def import_project_knowledge(
   _touch_project_timestamp(settings, project_id, updated_at)
   _refresh_project_knowledge_sources(settings, project_dir, summary.target_chapters, changed_source_keys)
   return _auto_refresh_system_memory(settings, project_id, focus="参考资料已导入")
+
+
+def get_project_obsidian_state(settings: Settings, project_id: str):
+  summary = _project_summary_or_404(settings, project_id)
+  return load_obsidian_state(_project_dir(summary))
+
+
+def _refresh_narrative_state_after_obsidian_sync(
+  settings: Settings,
+  project_id: str,
+  project_dir: Path,
+  detail: ProjectDetail,
+) -> ProjectDetail:
+  try:
+    refresh_project_narrative_state_chapter_cards(
+      project_dir,
+      detail,
+      persist=True,
+      auto_stage_drafts=True,
+    )
+  except Exception as error:
+    append_app_log(settings, f"narrative state obsidian refresh failed for {project_id}: {error}")
+  return detail
+
+
+def update_project_obsidian_config(
+  settings: Settings,
+  project_id: str,
+  request: ObsidianVaultConfig,
+) -> ProjectDetail:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  save_obsidian_config(project_dir, request)
+  sync_obsidian_state(project_dir)
+  updated_at = _now_iso()
+  _touch_project_timestamp(settings, project_id, updated_at)
+  _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+  detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 配置已更新")
+  return _refresh_narrative_state_after_obsidian_sync(settings, project_id, project_dir, detail)
+
+
+def sync_project_obsidian(settings: Settings, project_id: str) -> ProjectDetail:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  sync_obsidian_state(project_dir)
+  updated_at = _now_iso()
+  _touch_project_timestamp(settings, project_id, updated_at)
+  _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+  detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 知识库已同步")
+  return _refresh_narrative_state_after_obsidian_sync(settings, project_id, project_dir, detail)
+
+
+def stage_project_obsidian_maintenance_draft(
+  settings: Settings,
+  project_id: str,
+  suggestion_id: str,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return stage_project_obsidian_maintenance_suggestion(Path(detail.path), detail, suggestion_id)
+
+
+def stage_project_obsidian_maintenance_drafts(
+  settings: Settings,
+  project_id: str,
+  suggestion_ids: list[str] | None = None,
+  *,
+  limit: int = 80,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return stage_project_obsidian_maintenance_suggestions(
+    Path(detail.path),
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=limit,
+  )
+
+
+def confirm_project_obsidian_maintenance_merge(
+  settings: Settings,
+  project_id: str,
+  suggestion_id: str,
+) -> dict[str, object]:
+  summary = _project_summary_or_404(settings, project_id)
+  detail = get_project_detail(settings, project_id)
+  project_dir = Path(detail.path)
+  result = confirm_project_obsidian_maintenance_merge_suggestion(project_dir, detail, suggestion_id)
+  sync_obsidian_state(project_dir)
+  updated_at = _now_iso()
+  _touch_project_timestamp(settings, project_id, updated_at)
+  _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+  refreshed_detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 维护笔记已确认合并")
+  refresh_project_narrative_state_chapter_cards(project_dir, refreshed_detail, persist=True)
+  return result
+
+
+def confirm_project_obsidian_maintenance_merges(
+  settings: Settings,
+  project_id: str,
+  suggestion_ids: list[str] | None = None,
+  *,
+  limit: int = 80,
+) -> dict[str, object]:
+  summary = _project_summary_or_404(settings, project_id)
+  detail = get_project_detail(settings, project_id)
+  project_dir = Path(detail.path)
+  result = confirm_project_obsidian_maintenance_merge_suggestions(
+    project_dir,
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=limit,
+  )
+  if int(result.get("confirmed_count") or 0) > 0:
+    sync_obsidian_state(project_dir)
+    updated_at = _now_iso()
+    _touch_project_timestamp(settings, project_id, updated_at)
+    _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+    refreshed_detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 维护笔记已批量确认合并")
+    refresh_project_narrative_state_chapter_cards(project_dir, refreshed_detail, persist=True)
+  return result
+
+
+def ignore_project_obsidian_maintenance_note(
+  settings: Settings,
+  project_id: str,
+  suggestion_id: str,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return ignore_project_obsidian_maintenance_suggestion(Path(detail.path), detail, suggestion_id)
+
+
+def ignore_project_obsidian_maintenance_notes(
+  settings: Settings,
+  project_id: str,
+  suggestion_ids: list[str] | None = None,
+  *,
+  limit: int = 80,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return ignore_project_obsidian_maintenance_suggestions(
+    Path(detail.path),
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=limit,
+  )
+
+
+def reopen_project_obsidian_maintenance_note(
+  settings: Settings,
+  project_id: str,
+  suggestion_id: str,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return reopen_project_obsidian_maintenance_suggestion(Path(detail.path), detail, suggestion_id)
+
+
+def reopen_project_obsidian_maintenance_notes(
+  settings: Settings,
+  project_id: str,
+  suggestion_ids: list[str] | None = None,
+  *,
+  limit: int = 80,
+) -> dict[str, object]:
+  detail = get_project_detail(settings, project_id)
+  return reopen_project_obsidian_maintenance_suggestions(
+    Path(detail.path),
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=limit,
+  )
+
+
+def publish_project_obsidian_maintenance_note(
+  settings: Settings,
+  project_id: str,
+  suggestion_id: str,
+) -> dict[str, object]:
+  summary = _project_summary_or_404(settings, project_id)
+  detail = get_project_detail(settings, project_id)
+  project_dir = Path(detail.path)
+  result = publish_project_obsidian_maintenance_suggestion(project_dir, detail, suggestion_id)
+  sync_obsidian_state(project_dir)
+  updated_at = _now_iso()
+  _touch_project_timestamp(settings, project_id, updated_at)
+  _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+  refreshed_detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 维护笔记已发布")
+  refresh_project_narrative_state_chapter_cards(project_dir, refreshed_detail, persist=True)
+  return result
+
+
+def publish_project_obsidian_maintenance_notes(
+  settings: Settings,
+  project_id: str,
+  suggestion_ids: list[str] | None = None,
+  *,
+  limit: int = 80,
+) -> dict[str, object]:
+  summary = _project_summary_or_404(settings, project_id)
+  detail = get_project_detail(settings, project_id)
+  project_dir = Path(detail.path)
+  result = publish_project_obsidian_maintenance_suggestions(
+    project_dir,
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=limit,
+  )
+  if int(result.get("published_count") or 0) > 0:
+    sync_obsidian_state(project_dir)
+    updated_at = _now_iso()
+    _touch_project_timestamp(settings, project_id, updated_at)
+    _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
+    refreshed_detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 维护笔记已批量发布")
+    refresh_project_narrative_state_chapter_cards(project_dir, refreshed_detail, persist=True)
+  return result
 
 
 def apply_architecture_workspace(
@@ -6114,6 +7468,12 @@ def _auto_refresh_system_memory(
   if candidate_ids:
     promote_dream_candidates(project_dir, candidate_ids, target_source="system")
     _touch_project_timestamp(settings, project_id, _now_iso())
+  try:
+    from novel_backend.services.project_auxiliary_service import enqueue_project_auxiliary_tasks
+
+    enqueue_project_auxiliary_tasks(settings, project_id, tasks=["humanize_review"], reason="dream")
+  except Exception as error:
+    append_app_log(settings, f"做梦后的去 AI 巡检排队失败：{error}", level="WARNING")
   return get_project_detail(settings, project_id)
 
 
@@ -6391,6 +7751,33 @@ def summarize_chapter_review_status(detail: ProjectDetail, chapter_id: str, revi
       "error": "章节核验未生成报告。",
     }
 
+  issue_count = 0
+  critical_issue_count = 0
+  obsidian_required_issue_count = 0
+  obsidian_forbidden_issue_count = 0
+  continuity_contract_issue_count = 0
+  must_repair_issue_count = 0
+  for dimension in review.dimensions:
+    for issue in dimension.issues:
+      issue_count += 1
+      level = str(issue.level or "").strip()
+      title = str(issue.title or "").strip()
+      must_repair = False
+      if level == "critical":
+        critical_issue_count += 1
+        must_repair = True
+      if title.startswith("缺少 Obsidian 必需设定"):
+        obsidian_required_issue_count += 1
+        must_repair = True
+      if title.startswith("触犯 Obsidian 禁用设定"):
+        obsidian_forbidden_issue_count += 1
+        must_repair = True
+      if title.startswith("缺少连续性合同项") or title.startswith("违背连续性合同"):
+        continuity_contract_issue_count += 1
+        must_repair = True
+      if must_repair:
+        must_repair_issue_count += 1
+
   label = {
     "good": "良好",
     "watch": "需关注",
@@ -6411,6 +7798,12 @@ def summarize_chapter_review_status(detail: ProjectDetail, chapter_id: str, revi
     "summary": summary,
     "is_stale": review.is_stale,
     "updated_at": review.updated_at or "",
+    "issue_count": issue_count,
+    "critical_issue_count": critical_issue_count,
+    "obsidian_required_issue_count": obsidian_required_issue_count,
+    "obsidian_forbidden_issue_count": obsidian_forbidden_issue_count,
+    "continuity_contract_issue_count": continuity_contract_issue_count,
+    "must_repair_issue_count": must_repair_issue_count,
   }
 
 
@@ -6468,7 +7861,7 @@ def update_chapter_content_with_review_status(
   detail = _auto_refresh_system_memory(settings, project_id, focus=f"第 {chapter_index} 章已更新")
   if not content.strip():
     return detail, ""
-  return _persist_chapter_review(
+  detail, review_error = _persist_chapter_review(
     settings,
     project_id,
     project_dir,
@@ -6477,6 +7870,34 @@ def update_chapter_content_with_review_status(
     style_name=request.style_name,
     failure_prefix="章节已保存，但核验失败",
   )
+  try:
+    record_project_style_xp_observation(
+      project_dir,
+      detail,
+      chapter_id,
+      style_name=request.style_name,
+      xp_preset=request.xp_preset,
+      review_error=review_error,
+    )
+  except Exception as error:
+    append_app_log(settings, f"style/xp evolution failed for {project_id}/{chapter_id}: {error}")
+  try:
+    record_project_narrative_state_observation(
+      project_dir,
+      detail,
+      chapter_id,
+      settings=settings,
+      review_error=review_error,
+    )
+  except Exception as error:
+    append_app_log(settings, f"narrative state update failed for {project_id}/{chapter_id}: {error}")
+  try:
+    from novel_backend.services.project_auxiliary_service import enqueue_project_auxiliary_tasks
+
+    enqueue_project_auxiliary_tasks(settings, project_id, tasks=["humanize_review"], reason=f"chapter_update:{chapter_id}")
+  except Exception as error:
+    append_app_log(settings, f"章节更新后的去 AI 巡检排队失败：{error}", level="WARNING")
+  return detail, review_error
 
 
 def refresh_chapter_review(
@@ -6507,12 +7928,21 @@ def search_project_knowledge(
   *,
   ensure_current: bool = True,
   include_semantic: bool = True,
+  chapter_index: int = 0,
 ) -> list[KnowledgeSearchResult]:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
   if ensure_current:
     _ensure_project_knowledge_current(settings, project_dir, summary.target_chapters)
-  return _search_project_knowledge(settings, project_dir, query, limit, include_semantic=include_semantic)
+  result_limit = _knowledge_result_limit(limit)
+  try:
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  raw_limit = _chapter_filtered_search_limit(result_limit) if target_chapter > 0 else result_limit
+  hits = _search_project_knowledge(settings, project_dir, query, raw_limit, include_semantic=include_semantic)
+  filtered = _filter_obsidian_search_results_for_chapter(project_dir, hits, query, chapter_index=target_chapter)
+  return filtered[:result_limit]
 
 
 def search_project_knowledge_evidence(
@@ -6522,17 +7952,26 @@ def search_project_knowledge_evidence(
   *,
   limit: int = 8,
   candidate_limit: int = 24,
+  chapter_index: int = 0,
 ) -> list[dict[str, object]]:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
   _ensure_project_knowledge_current(settings, project_dir, summary.target_chapters)
-  return _search_project_knowledge_evidence(
+  result_limit = _knowledge_result_limit(limit)
+  try:
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  raw_limit = _chapter_filtered_search_limit(result_limit) if target_chapter > 0 else result_limit
+  hits = _search_project_knowledge_evidence(
     settings,
     project_dir,
     query,
-    limit=limit,
-    candidate_limit=candidate_limit,
+    limit=raw_limit,
+    candidate_limit=max(candidate_limit, raw_limit),
   )
+  filtered = _filter_obsidian_evidence_hits_for_chapter(project_dir, hits, query, chapter_index=target_chapter)
+  return filtered[:result_limit]
 
 
 def load_project_knowledge_material_contents(
@@ -6575,3 +8014,54 @@ def load_project_knowledge_material_contents(
     reverse=True,
   )
   return items[:max(1, min(limit, 20))]
+
+
+def load_project_obsidian_note_contents(
+  settings: Settings,
+  project_id: str,
+  limit: int = 12,
+  *,
+  chapter_index: int = 0,
+  query: str = "",
+) -> list[dict[str, str]]:
+  summary = _project_summary_or_404(settings, project_id)
+  project_dir = _project_dir(summary)
+  try:
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  if target_chapter > 0:
+    records = scoped_obsidian_note_records_for_chapter(project_dir, target_chapter)
+  else:
+    records, _skipped, _warnings = collect_obsidian_note_records(project_dir)
+  max_items = max(1, min(limit, 20))
+  if records and (target_chapter > 0 or query.strip()):
+    records_by_source_key = {
+      record.summary.source_key: record
+      for record in records
+      if record.summary.source_key
+    }
+    selected_summaries = select_obsidian_notes_for_query(
+      [record.summary for record in records],
+      query,
+      limit=max_items,
+      chapter_index=target_chapter,
+    )
+    selected_records = [
+      records_by_source_key.get(summary.source_key)
+      for summary in selected_summaries
+      if summary.source_key
+    ]
+    records = [record for record in selected_records if record is not None]
+  items = [
+    {
+      "title": record.summary.title,
+      "filename": record.summary.relative_path,
+      "content": record.content,
+      "updated_at": record.summary.updated_at or "",
+      "source": "Obsidian",
+    }
+    for record in records
+    if record.summary.title and record.content.strip()
+  ]
+  return items[:max_items]

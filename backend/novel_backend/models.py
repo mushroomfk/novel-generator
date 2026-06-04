@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field
 
 KNOWLEDGE_IMPORT_CONTENT_MAX_LENGTH = 200_000
 KNOWLEDGE_IMPORT_ITEM_MAX_COUNT = 400
+EXISTING_NOVEL_IMPORT_CONTENT_MAX_LENGTH = 5_000_000
+EXISTING_NOVEL_IMPORT_FILE_MAX_BYTES = 30 * 1024 * 1024
+EXISTING_NOVEL_IMPORT_BASE64_MAX_LENGTH = ((EXISTING_NOVEL_IMPORT_FILE_MAX_BYTES + 2) // 3) * 4
 
 
 class ApiError(BaseModel):
@@ -159,6 +162,7 @@ class StoryDocument(BaseModel):
 
 class KnowledgeSearchResult(BaseModel):
   source: str
+  source_key: str = ""
   section: str
   preview: str
   score: float = 0.0
@@ -191,6 +195,87 @@ class KnowledgeMaterial(BaseModel):
   filename: str
   preview: str = ""
   updated_at: str | None = None
+
+
+class ObsidianVaultConfig(BaseModel):
+  enabled: bool = False
+  vault_path: str = ""
+  include_patterns: list[str] = Field(default_factory=lambda: ["**/*.md", "**/*.canvas"])
+  exclude_patterns: list[str] = Field(default_factory=lambda: [".obsidian/**", ".trash/**", "templates/**"])
+  allowed_statuses: list[str] = Field(
+    default_factory=lambda: ["canonical", "正式", "已确认", "active", "published", "usable"]
+  )
+  excluded_statuses: list[str] = Field(
+    default_factory=lambda: ["draft", "草稿", "private", "私密", "deprecated", "废案", "弃用"]
+  )
+  include_without_status: bool = True
+  require_usable_by_ai: bool = False
+  max_notes: int = Field(default=2000, ge=1, le=10000)
+
+
+class ObsidianNoteSummary(BaseModel):
+  title: str
+  relative_path: str
+  note_type: str = ""
+  status: str = ""
+  summary: str = ""
+  keywords: list[str] = Field(default_factory=list)
+  tags: list[str] = Field(default_factory=list)
+  links: list[str] = Field(default_factory=list)
+  embedded_links: list[str] = Field(default_factory=list)
+  external_links: list[str] = Field(default_factory=list)
+  external_references: list[str] = Field(default_factory=list)
+  graph_relations: list[str] = Field(default_factory=list)
+  resolved_links: list[str] = Field(default_factory=list)
+  backlinks: list[str] = Field(default_factory=list)
+  unresolved_links: list[str] = Field(default_factory=list)
+  ambiguous_links: list[str] = Field(default_factory=list)
+  aliases: list[str] = Field(default_factory=list)
+  required_phrases: list[str] = Field(default_factory=list)
+  forbidden_phrases: list[str] = Field(default_factory=list)
+  chapter_start: int = Field(default=0, ge=0)
+  chapter_end: int = Field(default=0, ge=0)
+  reveal_after_chapter: int = Field(default=0, ge=0)
+  preview: str = ""
+  updated_at: str | None = None
+  usable_by_ai: bool = True
+  source_key: str = ""
+  source_chapter_hash: str = ""
+  source_ids: list[str] = Field(default_factory=list)
+  source_chapters: list[int] = Field(default_factory=list)
+
+
+class ObsidianGraphIssue(BaseModel):
+  kind: str = Field(
+    default="graph",
+    pattern="^(duplicate_label|ambiguous_link|unresolved_link|orphan_note|scope_mismatch|graph)$",
+  )
+  severity: str = Field(default="warning", pattern="^(info|warning|error)$")
+  title: str = ""
+  message: str = ""
+  notes: list[str] = Field(default_factory=list)
+  links: list[str] = Field(default_factory=list)
+
+
+class ObsidianVaultState(BaseModel):
+  config: ObsidianVaultConfig = Field(default_factory=ObsidianVaultConfig)
+  enabled: bool = False
+  vault_path: str = ""
+  note_count: int = 0
+  included_count: int = 0
+  skipped_count: int = 0
+  link_count: int = 0
+  external_link_count: int = 0
+  resolved_link_count: int = 0
+  unresolved_link_count: int = 0
+  ambiguous_link_count: int = 0
+  duplicate_label_count: int = 0
+  orphan_count: int = 0
+  source_signature: str = ""
+  updated_at: str | None = None
+  warnings: list[str] = Field(default_factory=list)
+  issues: list[ObsidianGraphIssue] = Field(default_factory=list)
+  notes: list[ObsidianNoteSummary] = Field(default_factory=list)
 
 
 class ProjectMemoryEntry(BaseModel):
@@ -366,6 +451,7 @@ class StoryOverview(BaseModel):
   documents: list[StoryDocument] = Field(default_factory=list)
   knowledge_hits: list[KnowledgeSearchResult] = Field(default_factory=list)
   materials: list[KnowledgeMaterial] = Field(default_factory=list)
+  obsidian: ObsidianVaultState = Field(default_factory=ObsidianVaultState)
   memory_entries: list[ProjectMemoryEntry] = Field(default_factory=list)
   dream_report: ProjectDreamReport | None = None
   distillation_report: ProjectDistillationReport | None = None
@@ -428,6 +514,87 @@ class ProjectExportResult(BaseModel):
   chapter_count: int
   word_count: int
   created_at: str
+
+
+class ProjectMigrationExportResult(BaseModel):
+  path: str
+  filename: str
+  project_id: str
+  project_name: str
+  file_count: int
+  size_bytes: int
+  created_at: str
+  warnings: list[str] = Field(default_factory=list)
+
+
+class ProjectMigrationImportRequest(BaseModel):
+  filename: str = Field(min_length=1, max_length=240)
+  content_base64: str = Field(min_length=1)
+  base_path: str | None = Field(default=None, max_length=2000)
+  name_override: str | None = Field(default=None, max_length=80)
+
+
+class ProjectMigrationImportResult(BaseModel):
+  project: ProjectSummary
+  original_project_id: str
+  original_project_name: str
+  imported_at: str
+  path: str
+  file_count: int
+  size_bytes: int
+  id_changed: bool = False
+  warnings: list[str] = Field(default_factory=list)
+
+
+class ExistingNovelImportRequest(BaseModel):
+  name: str = Field(min_length=1, max_length=80)
+  base_path: str | None = Field(default=None, max_length=2000)
+  genre: str = Field(default="未定题材", max_length=40)
+  target_chapters: int | None = Field(default=None, ge=1, le=1000)
+  target_words: int | None = Field(default=None, ge=1000, le=2000000)
+  source_filename: str = Field(default="旧稿.txt", max_length=240)
+  content: str = Field(default="", max_length=EXISTING_NOVEL_IMPORT_CONTENT_MAX_LENGTH)
+  content_base64: str = Field(default="", max_length=EXISTING_NOVEL_IMPORT_BASE64_MAX_LENGTH)
+
+
+class ExistingNovelTakeoverChapter(BaseModel):
+  index: int = Field(ge=1, le=1000)
+  title: str
+  source_heading: str = ""
+  character_count: int = Field(default=0, ge=0)
+  start_line: int = Field(default=0, ge=0)
+  end_line: int = Field(default=0, ge=0)
+  warnings: list[str] = Field(default_factory=list)
+
+
+class ExistingNovelTakeoverReport(BaseModel):
+  task_id: str
+  status: str = Field(default="completed")
+  source_filename: str = ""
+  source_hash: str = ""
+  original_character_count: int = Field(default=0, ge=0)
+  detected_chapter_count: int = Field(default=0, ge=0)
+  applied_chapter_count: int = Field(default=0, ge=0)
+  target_chapters: int = Field(default=1, ge=1, le=1000)
+  confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+  next_chapter_index: int | None = Field(default=None, ge=1, le=1000)
+  last_chapter_title: str = ""
+  last_chapter_tail: str = ""
+  warnings: list[str] = Field(default_factory=list)
+  quality_checks: list[str] = Field(default_factory=list)
+  chapters: list[ExistingNovelTakeoverChapter] = Field(default_factory=list)
+  updated_at: str
+
+
+class ExistingNovelTakeoverImportResult(BaseModel):
+  project: ProjectSummary
+  report: ExistingNovelTakeoverReport
+  path: str
+
+
+class ExistingNovelTakeoverStateResult(BaseModel):
+  project_id: str
+  state: dict[str, object] = Field(default_factory=dict)
 
 
 class ChapterUpdateRequest(BaseModel):
@@ -574,6 +741,7 @@ class BrainstormRequest(BaseModel):
   include_plot: bool = True
   include_blueprint: bool = False
   include_character_state: bool = False
+  chapter_id: str = Field(default="", max_length=120)
   skill_id: str = Field(default="", max_length=120)
   extra_context: str = Field(default="", max_length=4000)
 
@@ -595,10 +763,13 @@ class BrainstormResult(BaseModel):
   skill_candidate: SkillSuggestion | None = None
 
 
+AGENT_MESSAGE_CONTENT_MAX_LENGTH = 1_000_000
+
+
 class AgentMessage(BaseModel):
   id: str = Field(default="", max_length=80)
   role: str = Field(pattern="^(user|assistant|system)$")
-  content: str = Field(min_length=1, max_length=6000)
+  content: str = Field(min_length=1, max_length=AGENT_MESSAGE_CONTENT_MAX_LENGTH)
   content_hash: str = Field(default="", max_length=80)
   compacted: bool = False
   original_length: int = Field(default=0, ge=0)
@@ -722,7 +893,7 @@ class AgentChatResult(BaseModel):
 class AgentThreadMessage(BaseModel):
   id: str = Field(default="", max_length=80)
   role: str = Field(pattern="^(user|assistant|system)$")
-  content: str = Field(min_length=1, max_length=1000000)
+  content: str = Field(min_length=1, max_length=AGENT_MESSAGE_CONTENT_MAX_LENGTH)
   content_hash: str = Field(default="", max_length=80)
   original_length: int = Field(default=0, ge=0)
   summary: str = Field(default="", max_length=2000)
@@ -1024,6 +1195,9 @@ class SkillBehavior(BaseModel):
   mode: str = ""
   input_label: str = ""
   submit_label: str = ""
+  agent_action_kind: str = Field(default="", max_length=80)
+  agent_action_mode: str = Field(default="", max_length=40)
+  agent_requires_confirmation: bool = False
 
 
 class SkillItem(BaseModel):

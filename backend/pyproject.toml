@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
   "cryptography>=42.0.0,<47.0.0",
   "fastapi>=0.115.0,<1.0.0",
+  "liteparse>=2.0.4,<3.0.0; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Windows' and platform_machine == 'AMD64') or (platform_system == 'Linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
   "pypdf>=5.0.0,<6.0.0",
   "pydantic-settings>=2.6.0,<3.0.0",
   "uvicorn>=0.32.0,<1.0.0",

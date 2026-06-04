@@ -54,6 +54,7 @@ const isDreamRunning = ref(false);
 const emptyOverview = Object.freeze({
   documents: [],
   materials: [],
+  obsidian: null,
   memory_entries: [],
   dream_report: null,
   characters: [],
@@ -66,9 +67,17 @@ const emptyOverview = Object.freeze({
 });
 
 const overview = computed(() => props.project?.story_overview ?? emptyOverview);
+const selectedChapter = computed(() => {
+  if (!props.selectedChapterId) {
+    return null;
+  }
+  return (props.project?.chapters ?? []).find((item) => item.id === props.selectedChapterId) ?? null;
+});
 const characters = computed(() => overview.value.characters ?? []);
 const documents = computed(() => overview.value.documents ?? []);
 const materials = computed(() => overview.value.materials ?? []);
+const obsidian = computed(() => overview.value.obsidian ?? null);
+const obsidianNotes = computed(() => obsidian.value?.notes ?? []);
 const skills = computed(() => overview.value.skills ?? []);
 const memoryEntries = computed(() => overview.value.memory_entries ?? []);
 const dreamReport = computed(() => overview.value.dream_report ?? null);
@@ -83,6 +92,54 @@ const activeCharacter = computed(() => (
   ?? characters.value[0]
   ?? null
 ));
+
+function obsidianChapterScope(item) {
+  const start = Number(item?.chapter_start ?? 0);
+  const end = Number(item?.chapter_end ?? 0);
+  const revealAfter = Number(item?.reveal_after_chapter ?? 0);
+  const parts = [];
+  if (start && end) {
+    parts.push(start === end ? `适用章节：第 ${start} 章` : `适用章节：第 ${start}-${end} 章`);
+  } else if (start) {
+    parts.push(`适用章节：第 ${start} 章起`);
+  } else if (end) {
+    parts.push(`适用章节：第 ${end} 章前`);
+  }
+  if (revealAfter) {
+    parts.push(`剧透边界：第 ${revealAfter} 章后可用`);
+  }
+  return parts.join('；');
+}
+
+function obsidianSourceChapterText(item) {
+  const values = Array.isArray(item?.source_chapters) ? item.source_chapters : [];
+  const indexes = [];
+  for (const value of values) {
+    const chapterIndex = Number(value || 0);
+    if (Number.isInteger(chapterIndex) && chapterIndex > 0 && !indexes.includes(chapterIndex)) {
+      indexes.push(chapterIndex);
+    }
+  }
+  if (!indexes.length) {
+    return '';
+  }
+  return `来源章节：${indexes.map((index) => `第 ${index} 章`).join('、')}`;
+}
+
+function obsidianExternalReferences(item) {
+  const references = Array.isArray(item?.external_references) ? item.external_references : [];
+  if (references.length) {
+    return {
+      label: '考据来源',
+      values: references.slice(0, 3),
+    };
+  }
+  const links = Array.isArray(item?.external_links) ? item.external_links : [];
+  return {
+    label: '考据链接',
+    values: links.slice(0, 3),
+  };
+}
 
 const filledDocumentCount = computed(() => (
   overview.value.documents.filter((item) => item.content?.trim()).length
@@ -173,6 +230,11 @@ const supportSummaryCards = computed(() => ([
     label: '资料库',
     compactLabel: '资料',
     value: `${materials.value.length} 份`,
+  },
+  {
+    label: 'Obsidian',
+    compactLabel: 'Obsidian',
+    value: `${obsidian.value?.included_count ?? 0} 份`,
   },
   {
     label: '项目记忆',
@@ -618,7 +680,12 @@ async function runKnowledgeSearch() {
   knowledgeMessage.value = '';
 
   try {
-    knowledgeResults.value = await searchProjectKnowledge(props.project.id, knowledgeQuery.value.trim(), 8);
+    knowledgeResults.value = await searchProjectKnowledge(
+      props.project.id,
+      knowledgeQuery.value.trim(),
+      8,
+      { chapterIndex: selectedChapter.value?.index ?? 0 },
+    );
     if (knowledgeResults.value.length === 0) {
       knowledgeMessage.value = '没有找到相关内容';
     }
@@ -1557,6 +1624,124 @@ async function importKnowledge() {
           </div>
         </section>
 
+        <section
+          v-if="obsidian?.enabled"
+          class="knowledge-library"
+          data-testid="story-overview-obsidian"
+        >
+          <div class="knowledge-result-head knowledge-library-head">
+            <strong>Obsidian</strong>
+            <span>{{ obsidian.included_count ?? 0 }} 份 · 解析 {{ obsidian.resolved_link_count ?? 0 }} 条 · 歧义 {{ obsidian.ambiguous_link_count ?? 0 }} 条</span>
+          </div>
+
+          <div
+            v-if="obsidian.warnings?.length"
+            class="empty-card"
+          >
+            {{ obsidian.warnings.join('；') }}
+          </div>
+
+          <div
+            v-if="obsidian.issues?.length"
+            class="knowledge-grid"
+          >
+            <article
+              v-for="item in obsidian.issues.slice(0, 6)"
+              :key="`${item.kind}-${item.title}`"
+              class="entity-card"
+            >
+              <div class="knowledge-result-head">
+                <strong>{{ item.title }}</strong>
+                <span>{{ item.severity || 'info' }}</span>
+              </div>
+              <p>{{ item.message }}</p>
+              <p
+                v-if="item.notes?.length"
+                class="entity-meta-line"
+              >
+                {{ item.notes.slice(0, 4).join(' / ') }}
+              </p>
+            </article>
+          </div>
+
+          <div
+            v-if="obsidianNotes.length > 0"
+            class="knowledge-grid"
+          >
+            <article
+              v-for="item in obsidianNotes.slice(0, 12)"
+              :key="item.relative_path"
+              class="entity-card"
+            >
+              <div class="knowledge-result-head">
+                <strong>{{ item.title }}</strong>
+                <span>{{ item.note_type || item.status || '笔记' }}</span>
+              </div>
+              <p>{{ item.preview || '暂无摘要。' }}</p>
+              <p
+                v-if="obsidianChapterScope(item)"
+                class="entity-meta-line"
+              >
+                {{ obsidianChapterScope(item) }}
+              </p>
+              <p
+                v-if="obsidianSourceChapterText(item)"
+                class="entity-meta-line"
+              >
+                {{ obsidianSourceChapterText(item) }}
+              </p>
+              <p
+                v-if="item.required_phrases?.length"
+                class="entity-meta-line"
+              >
+                必须包含：{{ item.required_phrases.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="item.forbidden_phrases?.length"
+                class="entity-meta-line"
+              >
+                禁止出现：{{ item.forbidden_phrases.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="obsidianExternalReferences(item).values.length"
+                class="entity-meta-line"
+              >
+                {{ obsidianExternalReferences(item).label }}：{{ obsidianExternalReferences(item).values.join(' / ') }}
+              </p>
+              <p
+                v-if="item.links?.length"
+                class="entity-meta-line"
+              >
+                {{ item.links.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="item.graph_relations?.length"
+                class="entity-meta-line"
+              >
+                关系：{{ item.graph_relations.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="item.backlinks?.length"
+                class="entity-meta-line"
+              >
+                被引用：{{ item.backlinks.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="item.unresolved_links?.length"
+                class="entity-meta-line"
+              >
+                未解析：{{ item.unresolved_links.slice(0, 5).join(' / ') }}
+              </p>
+              <p
+                v-if="item.ambiguous_links?.length"
+                class="entity-meta-line"
+              >
+                歧义：{{ item.ambiguous_links.slice(0, 5).join(' / ') }}
+              </p>
+            </article>
+          </div>
+        </section>
+
         <div class="knowledge-search-row">
           <input
             v-model="knowledgeQuery"
@@ -2296,7 +2481,8 @@ async function importKnowledge() {
 }
 
 .document-filename,
-.knowledge-result-head span {
+.knowledge-result-head span,
+.entity-meta-line {
   color: #6b7483;
   font-size: 11px;
 }

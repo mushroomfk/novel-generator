@@ -12,6 +12,7 @@ from novel_backend.models import AppConfigUpdateRequest, ModelRuntimeConfig
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.model_runtime_service import (
   get_model_runtime_state,
+  model_runtime_foreground_session,
   model_runtime_should_defer_background,
   model_runtime_slot,
   reset_model_runtime_for_tests,
@@ -107,3 +108,23 @@ class ModelRuntimeServiceTestCase(unittest.TestCase):
       self.assertTrue(model_runtime_should_defer_background(self.settings))
 
     self.assertTrue(model_runtime_should_defer_background(self.settings))
+
+  def test_foreground_session_blocks_background_tasks_between_model_calls(self) -> None:
+    background_entered = threading.Event()
+
+    def run_background() -> None:
+      with model_runtime_slot(self.settings, lane="chat", task_name="story_overview_model", background=True):
+        background_entered.set()
+
+    with model_runtime_foreground_session():
+      self.assertTrue(model_runtime_should_defer_background(self.settings))
+      with model_runtime_slot(self.settings, lane="chat", task_name="architecture_step:core_seed:initial"):
+        pass
+
+      background_thread = threading.Thread(target=run_background)
+      background_thread.start()
+      time.sleep(0.05)
+      self.assertFalse(background_entered.is_set())
+
+    background_thread.join(timeout=1)
+    self.assertTrue(background_entered.is_set())

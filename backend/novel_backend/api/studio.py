@@ -33,6 +33,7 @@ from novel_backend.models import (
   XPPresetUpdateRequest,
 )
 from novel_backend.services.agent_service import agent_session_stream
+from novel_backend.services.agent_workflow_service import request_agent_workflow_interrupt, workflow_summary
 from novel_backend.services.character_replica_profile_service import (
   delete_character_replica_profile,
   get_character_replica_profile,
@@ -169,7 +170,7 @@ def get_self_evolution(
 ):
   settings = request.app.state.settings
   detail = get_project_detail(settings, project_id)
-  return {"ok": True, "data": get_self_evolution_state(settings, Path(detail.path))}
+  return {"ok": True, "data": get_self_evolution_state(settings, Path(detail.path), detail)}
 
 
 @router.get("/model-runtime")
@@ -188,6 +189,23 @@ async def stream_brainstorm(request: Request, payload: BrainstormRequest):
 async def stream_agent_session(request: Request, payload: AgentChatRequest):
   require_valid_license(request)
   return _stream_response(agent_session_stream(request.app.state.settings, payload))
+
+
+@router.get("/agent/{project_id}/runs/{task_id}")
+def get_agent_workflow_run(request: Request, project_id: str, task_id: str):
+  require_valid_license(request)
+  settings = request.app.state.settings
+  project = get_project_detail(settings, project_id)
+  return {"ok": True, "data": workflow_summary(Path(project.path), task_id)}
+
+
+@router.post("/agent/{project_id}/runs/{task_id}/interrupt")
+def interrupt_agent_workflow_run(request: Request, project_id: str, task_id: str):
+  require_valid_license(request)
+  settings = request.app.state.settings
+  project = get_project_detail(settings, project_id)
+  request_agent_workflow_interrupt(Path(project.path), task_id)
+  return {"ok": True, "data": workflow_summary(Path(project.path), task_id)}
 
 
 @router.post("/character-replica/stream")

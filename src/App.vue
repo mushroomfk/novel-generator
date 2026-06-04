@@ -1,6 +1,7 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import CreateProjectForm from './components/CreateProjectForm.vue';
+import ExistingNovelImportModal from './components/ExistingNovelImportModal.vue';
 import LicensePanel from './components/LicensePanel.vue';
 import LocalHistoryPanel from './components/LocalHistoryPanel.vue';
 import ModelConfigForm from './components/ModelConfigForm.vue';
@@ -13,11 +14,14 @@ import SkillLibraryPanel from './components/SkillLibraryPanel.vue';
 import {
   deleteProject,
   exportProjectBook,
+  exportProjectMigrationPackage,
   getApiBaseUrl,
   getConfig,
   getHealth,
   getModelRuntime,
   getProjectDetail,
+  importExistingNovel,
+  importProjectMigrationPackage,
   listProjects,
   openProjectDirectory,
   renameProject,
@@ -36,12 +40,17 @@ const isProjectLoading = ref(false);
 const isProjectLiveSyncing = ref(false);
 const isSettingsOpen = ref(false);
 const isCreateOpen = ref(false);
+const isExistingNovelImportOpen = ref(false);
 const isHistoryOpen = ref(false);
 const isStoryOverviewOpen = ref(false);
 const isStoryOverviewRefreshing = ref(false);
 const chapterBrowserProjectId = ref('');
 const exportFormat = ref('markdown');
 const isExporting = ref(false);
+const isMigrationImporting = ref(false);
+const isExistingNovelImporting = ref(false);
+const existingNovelImportResult = ref(null);
+const migrationImportInput = ref(null);
 const noticeMessage = ref('');
 const noticeMessageTone = ref('success');
 const modelRuntime = ref(null);
@@ -52,6 +61,8 @@ const projectActionPendingId = ref('');
 const conversationSessionKey = ref(0);
 const requestedDiscussionThreadId = ref('');
 const discussionThreadStates = ref({});
+const skillLaunchRequest = ref(null);
+let skillLaunchToken = 0;
 let projectEventStream = null;
 let dashboardRetryTimer = null;
 let modelRuntimeTimer = null;
@@ -119,6 +130,7 @@ const modelRuntimeLine = computed(() => {
 
 const topLevelModalOpen = computed(() => (
   isCreateOpen.value
+  || isExistingNovelImportOpen.value
   || isSettingsOpen.value
   || isHistoryOpen.value
   || isStoryOverviewOpen.value
@@ -217,6 +229,17 @@ function showNotice(message, tone = 'success') {
 function clearNotice() {
   noticeMessage.value = '';
   noticeMessageTone.value = 'success';
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
 function syncBodyScrollLock(isLocked) {
@@ -420,6 +443,107 @@ async function handleProjectExport(formatOverride = '') {
   }
 }
 
+async function handleProjectMigrationExport(project = null) {
+  const target = project ?? selectedProjectDetail.value;
+  if (!target?.id || projectActionPendingId.value) {
+    return;
+  }
+
+  projectActionPendingId.value = target.id;
+  clearNotice();
+  try {
+    const result = await exportProjectMigrationPackage(target.id);
+    const warningText = result.warnings?.length ? `；提醒：${result.warnings.join('；')}` : '';
+    showNotice(`迁移包已导出：${result.path}${warningText}`);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '迁移包导出失败', 'error');
+  } finally {
+    if (projectActionPendingId.value === target.id) {
+      projectActionPendingId.value = '';
+    }
+  }
+}
+
+function handleProjectMigrationImportRequest() {
+  if (isMigrationImporting.value) {
+    return;
+  }
+  migrationImportInput.value?.click();
+}
+
+function handleExistingNovelImportRequest() {
+  if (isExistingNovelImporting.value) {
+    return;
+  }
+  existingNovelImportResult.value = null;
+  isExistingNovelImportOpen.value = true;
+}
+
+async function handleExistingNovelImportSubmit(payload) {
+  if (isExistingNovelImporting.value) {
+    return;
+  }
+
+  isExistingNovelImporting.value = true;
+  clearNotice();
+  try {
+    const result = await importExistingNovel(payload);
+    existingNovelImportResult.value = result;
+    syncProjectSummary(result.project);
+    selectedProjectId.value = result.project.id;
+    selectedChapterId.value = '';
+    chapterBrowserProjectId.value = result.project.id;
+    activeSurface.value = 'workspace';
+    isHistoryOpen.value = false;
+    isStoryOverviewOpen.value = false;
+    conversationSessionKey.value += 1;
+    await refreshDashboard();
+    await nextTick();
+    showNotice(`已接管《${result.project.name}》：${result.report.applied_chapter_count} 章，拆章置信度 ${Math.round((result.report.confidence ?? 0) * 100)}%`);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '旧稿接管失败', 'error');
+  } finally {
+    isExistingNovelImporting.value = false;
+  }
+}
+
+async function handleProjectMigrationFileSelected(event) {
+  const input = event?.target;
+  const file = input?.files?.[0];
+  if (!file || isMigrationImporting.value) {
+    return;
+  }
+
+  isMigrationImporting.value = true;
+  clearNotice();
+  try {
+    const buffer = await file.arrayBuffer();
+    const result = await importProjectMigrationPackage({
+      filename: file.name,
+      content_base64: arrayBufferToBase64(buffer),
+    });
+    syncProjectSummary(result.project);
+    selectedProjectId.value = result.project.id;
+    selectedChapterId.value = '';
+    chapterBrowserProjectId.value = result.project.id;
+    activeSurface.value = 'workspace';
+    isHistoryOpen.value = false;
+    isStoryOverviewOpen.value = false;
+    conversationSessionKey.value += 1;
+    const warningText = result.warnings?.length ? `；提醒：${result.warnings.join('；')}` : '';
+    await refreshDashboard();
+    await nextTick();
+    showNotice(`已导入《${result.project.name}》：${result.path}${warningText}`);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '迁移包导入失败', 'error');
+  } finally {
+    isMigrationImporting.value = false;
+    if (input) {
+      input.value = '';
+    }
+  }
+}
+
 function handleProjectSelect(projectId) {
   clearNotice();
   activeSurface.value = 'workspace';
@@ -489,6 +613,19 @@ function handleWorkspaceOpen() {
   isHistoryOpen.value = false;
   isStoryOverviewOpen.value = false;
   activeSurface.value = 'workspace';
+}
+
+function handleSkillLaunchRequest(request) {
+  clearNotice();
+  isHistoryOpen.value = false;
+  isStoryOverviewOpen.value = false;
+  chapterBrowserProjectId.value = '';
+  activeSurface.value = 'skills';
+  skillLaunchToken += 1;
+  skillLaunchRequest.value = {
+    ...(request ?? {}),
+    token: skillLaunchToken,
+  };
 }
 
 function handleChapterSelect(chapterId) {
@@ -657,6 +794,11 @@ function closeTransientOverlay() {
     return;
   }
 
+  if (isExistingNovelImportOpen.value) {
+    isExistingNovelImportOpen.value = false;
+    return;
+  }
+
   if (isSettingsOpen.value) {
     isSettingsOpen.value = false;
     return;
@@ -805,14 +947,26 @@ onBeforeUnmount(() => {
           :project-action-pending-id="projectActionPendingId"
           :project-discussion-summary="getProjectDiscussionSummary(selectedProjectDetail)"
           @create-project="isCreateOpen = true"
+          @import-existing-novel="handleExistingNovelImportRequest"
+          @import-project="handleProjectMigrationImportRequest"
           @select="handleProjectSelect"
           @select-chapter="handleChapterSelect"
           @select-discussion-thread="handleDiscussionThreadSelect"
           @toggle-chapters="handleChapterBrowserToggle"
           @open-project-folder="handleProjectFolderOpen"
+          @export-project-migration="handleProjectMigrationExport"
           @request-rename-project="handleRenameProjectRequest"
           @request-delete-project="handleDeleteProjectRequest"
         />
+
+        <input
+          ref="migrationImportInput"
+          accept=".gaoxia-project.zip,.zip"
+          class="visually-hidden"
+          data-testid="project-migration-file-input"
+          type="file"
+          @change="handleProjectMigrationFileSelected"
+        >
 
         <div class="sidebar-footer">
           <button
@@ -883,6 +1037,16 @@ onBeforeUnmount(() => {
                 </button>
 
                 <button
+                  :disabled="projectActionPendingId === selectedProjectDetail.id"
+                  class="stage-tools-item"
+                  data-testid="project-migration-export-button"
+                  type="button"
+                  @click="handleProjectMigrationExport(selectedProjectDetail)"
+                >
+                  {{ projectActionPendingId === selectedProjectDetail.id ? '导出中…' : '导出迁移包' }}
+                </button>
+
+                <button
                   class="stage-tools-item"
                   data-testid="open-history-button"
                   type="button"
@@ -947,6 +1111,7 @@ onBeforeUnmount(() => {
         >
           <SkillLibraryPanel
             :project="selectedProjectDetail"
+            :launch-request="skillLaunchRequest"
             :selected-chapter="selectedChapter"
             :model-name="modelDisplayName"
             @project-detail-updated="handleProjectDetailUpdated"
@@ -976,6 +1141,7 @@ onBeforeUnmount(() => {
                 @discussion-thread-state-updated="handleDiscussionThreadStateUpdated"
                 @focus-chapter="handleChapterSelect"
                 @open-model-settings="isSettingsOpen = true"
+                @open-skill="handleSkillLaunchRequest"
                 @project-detail-updated="handleProjectDetailUpdated"
               />
             </template>
@@ -1045,6 +1211,14 @@ onBeforeUnmount(() => {
           />
         </section>
       </div>
+
+      <ExistingNovelImportModal
+        :open="isExistingNovelImportOpen"
+        :is-submitting="isExistingNovelImporting"
+        :result="existingNovelImportResult"
+        @close="isExistingNovelImportOpen = false"
+        @submit="handleExistingNovelImportSubmit"
+      />
 
       <div
         v-if="renameProjectTarget"
@@ -1233,6 +1407,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+  padding: 0;
+  margin: -1px;
+}
+
 .stage-canvas {
   position: relative;
 }

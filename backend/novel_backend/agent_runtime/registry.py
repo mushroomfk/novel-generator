@@ -21,6 +21,8 @@ class AgentExecutionState:
   last_reply: str = ""
   can_save_discussion_summary: bool = False
   knowledge_summary: str = ""
+  knowledge_summary_chapter_id: str = ""
+  chapter_knowledge_summaries: dict[str, str] = field(default_factory=dict)
   knowledge_review_note: str = ""
   execution_trace: list[AgentExecutionTrace] = field(default_factory=list)
   event_blocks: list[AgentEventBlock] = field(default_factory=list)

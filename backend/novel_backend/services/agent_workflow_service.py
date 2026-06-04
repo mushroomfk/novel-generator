@@ -12,8 +12,17 @@ from novel_backend.utils.jsonfile import atomic_write_json, read_json
 _RUNS_DIRNAME = "runs"
 _WORKFLOW_FILENAME = "workflow.json"
 _WORKFLOW_SCHEMA_VERSION = "1"
-_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "TIMED_OUT", "STALLED"}
+_TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "BLOCKED", "TIMED_OUT", "STALLED", "CANCELLED"}
+_OPEN_ACTION_STATUSES = {"DISPATCHED", "ACKED", "RUNNING"}
 _SAFE_FILENAME_PATTERN = re.compile(r"[^a-zA-Z0-9_.-]+")
+_WINDOWS_RESERVED_FILENAMES = {
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  *(f"COM{index}" for index in range(1, 10)),
+  *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 def _now() -> datetime:
@@ -37,8 +46,12 @@ def workflow_path(project_dir: Path, task_id: str) -> Path:
 
 
 def _safe_filename(value: str) -> str:
-  cleaned = _SAFE_FILENAME_PATTERN.sub("_", str(value or "").strip())
-  return cleaned[:120] or "subtask"
+  cleaned = _SAFE_FILENAME_PATTERN.sub("_", str(value or "").strip()).strip(" .")
+  cleaned = cleaned[:120].strip(" .") or "subtask"
+  stem = cleaned.split(".", 1)[0].upper()
+  if stem in _WINDOWS_RESERVED_FILENAMES:
+    cleaned = f"subtask_{cleaned}"
+  return cleaned[:120].strip(" .") or "subtask"
 
 
 def _compact_message(message: object) -> dict[str, object]:
@@ -111,6 +124,9 @@ def create_agent_workflow_run(
     "project_id": payload.project_id,
     "thread_id": payload.thread_id,
     "status": "RUNNING",
+    "interrupt_requested": False,
+    "interrupt_requested_at": "",
+    "interrupt_message": "",
     "created_at": now,
     "updated_at": now,
     "completed_at": "",
@@ -143,6 +159,54 @@ def _action_by_step(data: dict[str, object], step: int) -> dict[str, object] | N
     if isinstance(item, dict) and int(item.get("step") or 0) == int(step):
       return item
   return None
+
+
+def _append_status_history(target: dict[str, object], *, status: str, at: str, message: str) -> None:
+  history = target.setdefault("status_history", [])
+  if isinstance(history, list):
+    history.append({"status": status, "at": at, "message": message})
+    target["status_history"] = history[-80:]
+
+
+def request_agent_workflow_interrupt(
+  project_dir: Path,
+  task_id: str,
+  *,
+  message: str = "用户请求停止当前执行。",
+) -> dict[str, object]:
+  data = load_agent_workflow_run(project_dir, task_id)
+  if data is None:
+    return {"task_id": task_id, "status": "missing"}
+  if str(data.get("status") or "") in _TERMINAL_STATUSES:
+    return data
+  now = _now_iso()
+  interrupt_message = str(message or "").strip() or "用户请求停止当前执行。"
+  data["interrupt_requested"] = True
+  data["interrupt_requested_at"] = now
+  data["interrupt_message"] = interrupt_message
+  data["status"] = "CANCELLING"
+  _append_status_history(data, status="CANCELLING", at=now, message=interrupt_message)
+  actions = data.get("actions")
+  if isinstance(actions, list):
+    for action in actions:
+      if not isinstance(action, dict):
+        continue
+      if str(action.get("status") or "") in _OPEN_ACTION_STATUSES:
+        _append_status_history(action, status="CANCEL_REQUESTED", at=now, message=interrupt_message)
+        action["updated_at"] = now
+  return _save_workflow(project_dir, task_id, data)
+
+
+def agent_workflow_interrupt_message(project_dir: Path, task_id: str) -> str:
+  data = load_agent_workflow_run(project_dir, task_id)
+  if not isinstance(data, dict):
+    return ""
+  status = str(data.get("status") or "")
+  if status == "CANCELLED":
+    return str(data.get("message") or data.get("interrupt_message") or "执行已停止。")
+  if bool(data.get("interrupt_requested")) and status not in _TERMINAL_STATUSES:
+    return str(data.get("interrupt_message") or "用户请求停止当前执行。")
+  return ""
 
 
 def update_agent_workflow_preflight(project_dir: Path, task_id: str, preflight: dict[str, object]) -> dict[str, object]:
@@ -192,9 +256,9 @@ def update_agent_workflow_action(
   if isinstance(history, list):
     history.append({"status": normalized_status, "at": now, "message": message})
     action["status_history"] = history[-80:]
-  if normalized_status in {"FAILED", "BLOCKED", "TIMED_OUT", "STALLED"}:
+  if normalized_status in {"FAILED", "BLOCKED", "TIMED_OUT", "STALLED", "CANCELLED"}:
     data["status"] = normalized_status
-  elif data.get("status") not in _TERMINAL_STATUSES:
+  elif data.get("status") not in _TERMINAL_STATUSES and data.get("status") != "CANCELLING":
     data["status"] = "RUNNING"
   return _save_workflow(project_dir, task_id, data)
 
@@ -291,6 +355,19 @@ def complete_agent_workflow_run(
   if data is None:
     return {}
   normalized_status = str(status or "").strip().upper() or "SUCCEEDED"
+  if normalized_status == "CANCELLED":
+    now = _now_iso()
+    actions = data.get("actions")
+    if isinstance(actions, list):
+      for action in actions:
+        if not isinstance(action, dict):
+          continue
+        if str(action.get("status") or "") in _OPEN_ACTION_STATUSES:
+          action["status"] = "CANCELLED"
+          action["updated_at"] = now
+          action["completed_at"] = action.get("completed_at") or now
+          action["message"] = message or str(data.get("interrupt_message") or "执行已停止。")
+          _append_status_history(action, status="CANCELLED", at=now, message=str(action["message"]))
   data["status"] = normalized_status
   data["completed_at"] = _now_iso()
   data["message"] = message
@@ -376,9 +453,44 @@ def workflow_summary(project_dir: Path, task_id: str) -> dict[str, Any]:
     for item in actions
     if isinstance(item, dict)
   ] if isinstance(actions, list) else []
+  action_details = [
+    {
+      "step": item.get("step"),
+      "kind": item.get("kind"),
+      "label": item.get("label"),
+      "status": item.get("status"),
+      "message": item.get("message"),
+      "task_pack_kind": item.get("task_pack_kind"),
+      "chapter_id": item.get("chapter_id"),
+      "mode": item.get("mode"),
+      "updated_at": item.get("updated_at"),
+      "subtasks": [
+        {
+          "subtask_id": subtask.get("subtask_id"),
+          "role": subtask.get("role"),
+          "capability": subtask.get("capability"),
+          "parallel_group": subtask.get("parallel_group"),
+          "status": subtask.get("status"),
+          "summary": subtask.get("summary"),
+          "updated_at": subtask.get("updated_at"),
+        }
+        for subtask in item.get("subtasks", [])
+        if isinstance(subtask, dict)
+      ] if isinstance(item.get("subtasks"), list) else [],
+    }
+    for item in actions
+    if isinstance(item, dict)
+  ] if isinstance(actions, list) else []
   return {
     "task_id": task_id,
     "status": data.get("status", ""),
+    "message": data.get("message", ""),
+    "interrupt_requested": bool(data.get("interrupt_requested")),
+    "interrupt_requested_at": data.get("interrupt_requested_at", ""),
+    "interrupt_message": data.get("interrupt_message", ""),
+    "updated_at": data.get("updated_at", ""),
+    "completed_at": data.get("completed_at", ""),
     "path": str(workflow_path(project_dir, task_id)),
     "action_statuses": action_statuses,
+    "actions": action_details,
   }

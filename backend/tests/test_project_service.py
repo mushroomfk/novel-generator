@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import asyncio
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -28,12 +32,17 @@ from novel_backend.models import (
   ChapterUpdateRequest,
   CreateProjectRequest,
   EmbeddingConfig,
+  EXISTING_NOVEL_IMPORT_BASE64_MAX_LENGTH,
+  EXISTING_NOVEL_IMPORT_FILE_MAX_BYTES,
+  ExistingNovelImportRequest,
   KnowledgeImportItem,
   KnowledgeImportRequest,
   ModelConfig,
+  ObsidianVaultConfig,
   ProjectDreamPromoteRequest,
   ProjectDreamRunRequest,
   ProjectExportRequest,
+  ProjectMigrationImportRequest,
   ProjectMemoryEntryInput,
   ProjectMemoryUpdateRequest,
   ProjectRenameRequest,
@@ -46,7 +55,27 @@ from novel_backend.models import (
 )
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.file_service import write_project_file
-from novel_backend.services.project_distillation_service import build_distillation_review_text, resolve_task_pack_kind
+from novel_backend.services.context_builder import build_project_context_bundle
+from novel_backend.api.projects import (
+  _chapter_mutation_response,
+  _project_action_response,
+  router as project_api_router,
+  post_project_obsidian_sync,
+  post_existing_novel_import,
+  post_project_migration_import,
+  put_project_obsidian,
+)
+from novel_backend.services.chapter_auto_repair_service import (
+  auto_repair_chapter_after_review,
+  chapter_review_needs_auto_repair,
+)
+from novel_backend.services.chapter_review_service import _obsidian_dimension, _obsidian_evidence_paths
+from novel_backend.services.project_distillation_service import (
+  build_project_distillation_signature,
+  build_distillation_review_text,
+  build_task_distillation_prompt_block,
+  resolve_task_pack_kind,
+)
 from novel_backend.services.project_service import (
   _initialize_knowledge_db,
   apply_architecture_workspace,
@@ -54,9 +83,12 @@ from novel_backend.services.project_service import (
   create_project_snapshot,
   delete_project,
   export_project_book,
+  export_project_migration_package,
   get_project_agent_threads,
   get_project_detail,
   import_project_knowledge,
+  import_project_migration_package,
+  list_projects,
   open_project_directory,
   promote_project_dream,
   rename_project,
@@ -66,11 +98,19 @@ from novel_backend.services.project_service import (
   search_project_knowledge,
   refresh_chapter_review,
   refresh_project_model_story_overview,
+  summarize_chapter_review_status,
   update_project_memory,
   update_chapter_content,
   update_chapter_content_with_review_status,
+  update_project_obsidian_config,
   update_story_documents,
   update_story_document,
+)
+from novel_backend.services.project_takeover_service import (
+  get_existing_novel_takeover_state,
+  import_existing_novel,
+  resume_existing_novel_takeover,
+  split_existing_novel_chapters,
 )
 from novel_backend.services.style_service import save_style
 
@@ -529,6 +569,91 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertIn("任务包：persona", persona_review)
     self.assertEqual(resolve_task_pack_kind(rewrite_mode="humanize"), "imitation")
 
+  def test_task_distillation_prompt_filters_obsidian_summary_by_chapter_scope(self) -> None:
+    summary = self.create_demo_project("蒸馏 Obsidian 章节范围")
+    vault_dir = Path(self._temp_dir.name) / "distillation-vault"
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    (vault_dir / "00-终局真相.md").write_text(
+      """---
+status: canonical
+chapter_range: "3-3"
+reveal_after_chapter: 2
+---
+终局真相：沉船真相来自港务长自导自演。
+""",
+      encoding="utf-8",
+    )
+    (vault_dir / "10-当前线索.md").write_text(
+      """---
+status: canonical
+chapter_range: "1-1"
+source_url: "[旧码头灯塔记录](https://example.com/lighthouse-ledger)"
+foreshadows:
+  - 00-终局真相
+---
+当前线索：旧码头蓝灯只提示林追去仓库，不提前点名[[00-终局真相]]。
+""",
+      encoding="utf-8",
+    )
+
+    detail = update_project_obsidian_config(
+      self.settings,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+
+    early_block = build_task_distillation_prompt_block(
+      detail,
+      kind="continuation",
+      query="第一章旧码头蓝灯",
+      chapter_index=1,
+    )
+    future_block = build_task_distillation_prompt_block(
+      detail,
+      kind="continuation",
+      query="第三章沉船真相",
+      chapter_index=3,
+    )
+
+    self.assertIn("当前线索", early_block)
+    self.assertIn("旧码头蓝灯", early_block)
+    self.assertIn("考据来源", early_block)
+    self.assertIn("旧码头灯塔记录：https://example.com/lighthouse-ledger", early_block)
+    self.assertNotIn("终局真相", early_block)
+    self.assertNotIn("沉船真相", early_block)
+    self.assertIn("终局真相", future_block)
+    self.assertIn("沉船真相", future_block)
+
+  def test_distillation_signature_includes_obsidian_external_references(self) -> None:
+    note = SimpleNamespace(
+      title="旧码头灯塔记录",
+      relative_path="Clues/旧码头灯塔记录.md",
+      preview="旧码头蓝灯只提示林追去仓库。",
+      updated_at="",
+      graph_relations=[],
+      resolved_links=[],
+      backlinks=[],
+      unresolved_links=[],
+      ambiguous_links=[],
+      external_references=["旧码头灯塔记录：https://example.com/lighthouse-ledger"],
+      external_links=["https://example.com/lighthouse-ledger"],
+    )
+    detail = SimpleNamespace(
+      story_overview=SimpleNamespace(
+        documents=[],
+        materials=[],
+        obsidian=SimpleNamespace(notes=[note]),
+        memory_entries=[],
+      ),
+      chapters=[],
+    )
+
+    before = build_project_distillation_signature(detail)
+    note.external_references = ["更新后的灯塔记录：https://example.com/lighthouse-ledger-v2"]
+    note.external_links = ["https://example.com/lighthouse-ledger-v2"]
+
+    self.assertNotEqual(before, build_project_distillation_signature(detail))
+
   def test_story_overview_without_model_cache_does_not_backfill_main_character(self) -> None:
     summary = self.create_demo_project("无模型主角")
     self.write_chapter(
@@ -689,6 +814,203 @@ class ProjectServiceTestCase(unittest.TestCase):
     cleared_chapter = next(item for item in cleared.chapters if item.id == "chapter-001")
     self.assertFalse(cleared_chapter.exists)
 
+  def test_existing_novel_takeover_imports_chapters_and_report(self) -> None:
+    source = (
+      "第一章 雨夜靠港\n"
+      "林追回到旧码头，发现潮声里藏着旧船队的暗号。\n\n"
+      "第二章 铜钥匙\n"
+      "陈小雨把铜钥匙交给林追，两人决定去白石商会查旧账。\n"
+    )
+
+    result = import_existing_novel(
+      self.settings,
+      ExistingNovelImportRequest(
+        name="旧稿接管",
+        genre="悬疑",
+        target_chapters=5,
+        target_words=80000,
+        content=source,
+      ),
+    )
+
+    self.assertEqual(result.project.name, "旧稿接管")
+    self.assertEqual(result.project.target_chapters, 5)
+    self.assertEqual(result.report.applied_chapter_count, 2)
+    self.assertEqual(result.report.next_chapter_index, 3)
+    self.assertGreater(result.report.confidence, 0.5)
+
+    detail = get_project_detail(self.settings, result.project.id)
+    first_chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    second_chapter = next(item for item in detail.chapters if item.id == "chapter-002")
+    self.assertIn("林追回到旧码头", first_chapter.content)
+    self.assertIn("陈小雨把铜钥匙", second_chapter.content)
+    project_dir = Path(result.project.path)
+    self.assertIn("旧稿接续蓝图", (project_dir / "blueprint.txt").read_text(encoding="utf-8"))
+    self.assertIn("接续要求", (project_dir / "global_summary.txt").read_text(encoding="utf-8"))
+    self.assertIn("第 3 章", (project_dir / "character_state.txt").read_text(encoding="utf-8"))
+    self.assertIn("旧稿接管情节骨架", (project_dir / "plot_structure.txt").read_text(encoding="utf-8"))
+    self.assertIn("旧稿接管核心", (project_dir / "core_seed.txt").read_text(encoding="utf-8"))
+    self.assertTrue((project_dir / ".gaoxia" / "takeover" / "state.json").exists())
+    self.assertTrue((project_dir / ".gaoxia" / "takeover" / "report.md").exists())
+
+    state = get_existing_novel_takeover_state(self.settings, result.project.id)
+    self.assertEqual(state.state["status"], "completed")
+    self.assertEqual(state.state["stage"], "completed")
+
+    resumed = resume_existing_novel_takeover(self.settings, result.project.id)
+    self.assertEqual(resumed.report.applied_chapter_count, 2)
+
+    context_bundle = build_project_context_bundle(
+      self.settings,
+      result.project.id,
+      chapter_id="chapter-003",
+      task_instruction="续写第 3 章",
+    )
+    self.assertIn("旧稿接续简报", context_bundle.context_text)
+    self.assertIn("第 3 章", context_bundle.context_text)
+    self.assertIn("陈小雨把铜钥匙", context_bundle.context_text)
+
+  def test_existing_novel_takeover_api_route_imports_project(self) -> None:
+    matching_routes = [
+      route
+      for route in project_api_router.routes
+      if getattr(route, "path", "") == "/api/projects/takeover/import"
+      and "POST" in (getattr(route, "methods", set()) or set())
+    ]
+    self.assertTrue(matching_routes)
+    self.assertEqual(matching_routes[0].endpoint, post_existing_novel_import)
+
+    request = SimpleNamespace(
+      app=SimpleNamespace(state=SimpleNamespace(settings=self.settings, project_history_watcher=None))
+    )
+    payload = asyncio.run(
+      post_existing_novel_import(
+        request,
+        ExistingNovelImportRequest(
+          name="旧稿接口接管",
+          genre="悬疑",
+          target_chapters=4,
+          content=(
+            "第一章 雨夜靠港\n林追回到旧码头，发现潮声里藏着旧船队的暗号。\n\n"
+            "第二章 铜钥匙\n陈小雨把铜钥匙交给林追，两人决定去白石商会查旧账。\n"
+          ),
+        ),
+      )
+    )
+
+    self.assertTrue(payload["ok"])
+    imported_id = payload["data"]["project"]["id"]
+    self.assertEqual(payload["data"]["report"]["next_chapter_index"], 3)
+    imported_detail = get_project_detail(self.settings, imported_id)
+    second_chapter = next(item for item in imported_detail.chapters if item.id == "chapter-002")
+    self.assertIn("陈小雨把铜钥匙", second_chapter.content)
+
+  def test_existing_novel_split_reports_gaps_and_short_sections(self) -> None:
+    chapters, warnings, checks = split_existing_novel_chapters(
+      "第三章 中段\n太短。\n\n第五章 跳章\n继续。\n"
+    )
+
+    self.assertEqual(len(chapters), 2)
+    self.assertTrue(any("首个标题章号是 3" in item for item in warnings))
+    self.assertTrue(any("缺少：4" in item for item in warnings))
+    self.assertTrue(any("章节很短" in item for item in chapters[0]["warnings"]))
+    self.assertTrue(any("识别到 2 个章节标题" in item for item in checks))
+    self.assertEqual(chapters[0]["end_line"], 3)
+    self.assertEqual(chapters[1]["start_line"], 4)
+
+  def test_existing_novel_takeover_resume_repairs_missing_handoff_docs(self) -> None:
+    result = import_existing_novel(
+      self.settings,
+      ExistingNovelImportRequest(
+        name="恢复接续文档",
+        genre="悬疑",
+        target_chapters=4,
+        content=(
+          "第一章 雨夜靠港\n林追回到旧码头，发现潮声里藏着旧船队的暗号。\n\n"
+          "第二章 铜钥匙\n陈小雨把铜钥匙交给林追，两人决定去白石商会查旧账。\n"
+        ),
+      ),
+    )
+    project_dir = Path(result.project.path)
+    report_path = project_dir / ".gaoxia" / "takeover" / "report.md"
+    report_path.unlink()
+    (project_dir / "blueprint.txt").write_text("", encoding="utf-8")
+    (project_dir / "global_summary.txt").write_text("", encoding="utf-8")
+    (project_dir / "character_state.txt").write_text("作者整理的人物状态\n", encoding="utf-8")
+    (project_dir / "checkpoint.json").write_text(
+      json.dumps({"step": "idle", "chapter_index": 0, "status": "ready"}, ensure_ascii=False),
+      encoding="utf-8",
+    )
+
+    resumed = resume_existing_novel_takeover(self.settings, result.project.id)
+
+    self.assertEqual(resumed.report.status, "completed")
+    self.assertTrue(report_path.exists())
+    self.assertIn("旧稿接续蓝图", (project_dir / "blueprint.txt").read_text(encoding="utf-8"))
+    self.assertIn("接续要求", (project_dir / "global_summary.txt").read_text(encoding="utf-8"))
+    self.assertEqual((project_dir / "character_state.txt").read_text(encoding="utf-8"), "作者整理的人物状态\n")
+    checkpoint = json.loads((project_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    self.assertEqual(checkpoint["step"], "takeover_completed")
+
+  def test_existing_novel_takeover_resume_preserves_existing_chapter_edits(self) -> None:
+    result = import_existing_novel(
+      self.settings,
+      ExistingNovelImportRequest(
+        name="恢复保护章节",
+        genre="悬疑",
+        target_chapters=4,
+        content=(
+          "第一章 雨夜靠港\n林追回到旧码头，发现潮声里藏着旧船队的暗号。\n\n"
+          "第二章 铜钥匙\n陈小雨把铜钥匙交给林追，两人决定去白石商会查旧账。\n"
+        ),
+      ),
+    )
+    project_dir = Path(result.project.path)
+    state_path = project_dir / ".gaoxia" / "takeover" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["status"] = "running"
+    state["stage"] = "writing_chapters"
+    state["applied_chapter_indexes"] = [1]
+    state.pop("report", None)
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    edited_text = "# 第二章 铜钥匙\n作者已经改过第二章，必须保留。\n"
+    (project_dir / "chapters" / "002.md").write_text(edited_text, encoding="utf-8")
+
+    resumed = resume_existing_novel_takeover(self.settings, result.project.id)
+
+    self.assertEqual((project_dir / "chapters" / "002.md").read_text(encoding="utf-8"), edited_text)
+    self.assertTrue(any("第 2 章已有正文" in item for item in resumed.report.warnings))
+
+  def test_existing_novel_takeover_rejects_more_than_project_chapter_limit(self) -> None:
+    source = "\n".join(
+      f"第{index}章 标题\n这一章用于测试章节数量上限。"
+      for index in range(1, 1002)
+    )
+
+    with self.assertRaises(HTTPException) as context:
+      import_existing_novel(
+        self.settings,
+        ExistingNovelImportRequest(
+          name="章节过多",
+          genre="悬疑",
+          content=source,
+        ),
+      )
+
+    self.assertEqual(context.exception.status_code, 400)
+    self.assertEqual(context.exception.detail["code"], "existing_novel_too_many_chapters")
+
+  def test_existing_novel_file_base64_limit_matches_frontend_file_limit(self) -> None:
+    expected_base64_length = ((EXISTING_NOVEL_IMPORT_FILE_MAX_BYTES + 2) // 3) * 4
+    self.assertEqual(EXISTING_NOVEL_IMPORT_BASE64_MAX_LENGTH, expected_base64_length)
+
+    field = ExistingNovelImportRequest.model_fields["content_base64"]
+    max_lengths = [
+      getattr(item, "max_length", None)
+      for item in field.metadata
+    ]
+    self.assertIn(expected_base64_length, max_lengths)
+
   def test_update_chapter_content_generates_chapter_review_report(self) -> None:
     summary = self.create_demo_project("章节核验")
     update_story_documents(
@@ -738,6 +1060,501 @@ class ProjectServiceTestCase(unittest.TestCase):
     continuity_dimension = next(item for item in review.dimensions if item.id == "continuity")
     self.assertIn("共享连续性证据", continuity_dimension.summary)
     self.assertTrue(any("手动记忆" in item for item in continuity_dimension.highlights))
+
+  def test_chapter_review_checks_obsidian_forbidden_phrases_and_staleness(self) -> None:
+    summary = self.create_demo_project("Obsidian 章节核验")
+    vault_dir = Path(self._temp_dir.name) / "review-vault"
+    vault_dir.mkdir()
+    note_path = vault_dir / "白石会馆.md"
+    note_path.write_text(
+      """---
+type: location
+status: canonical
+forbidden_phrases: [白石会馆被烧毁]
+required_phrases: [保留地下档案室]
+---
+# 白石会馆
+
+白石会馆是旧船队暗账的保存地点。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追赶到白石会馆，却发现白石会馆被烧毁。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    obsidian_dimension = next(item for item in review.dimensions if item.id == "obsidian")
+    self.assertEqual(obsidian_dimension.status, "risk")
+    self.assertTrue(any("触犯 Obsidian 禁用设定" in item.title for item in obsidian_dimension.issues))
+    self.assertTrue(any("缺少 Obsidian 必需设定" in item.title for item in obsidian_dimension.issues))
+
+    note_path.write_text(
+      """---
+type: location
+status: canonical
+forbidden_phrases: [白石会馆被改名]
+---
+# 白石会馆
+
+白石会馆仍保存旧船队暗账。
+""",
+      encoding="utf-8",
+    )
+
+    refreshed = get_project_detail(self.settings, summary.id)
+    stale_review = next(item for item in refreshed.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertTrue(stale_review.is_stale)
+
+  def test_chapter_review_staleness_ignores_future_scoped_obsidian_note(self) -> None:
+    summary = self.create_demo_project("Obsidian 章节签名")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-scoped-signature"
+    vault_dir.mkdir()
+    current_note_path = vault_dir / "白石会馆.md"
+    future_note_path = vault_dir / "终局真相.md"
+    current_note_path.write_text(
+      """---
+type: location
+status: canonical
+chapter_range: 1-1
+required_phrases: [地下档案室]
+---
+# 白石会馆
+
+白石会馆地下有旧船队档案室。
+""",
+      encoding="utf-8",
+    )
+    future_note_path.write_text(
+      """---
+type: secret
+status: canonical
+chapter_range: 3-3
+reveal_after_chapter: 2
+forbidden_phrases: [港务长身份曝光]
+---
+# 终局真相
+
+终局真相只在第三章以后可用，并反向引用[[白石会馆]]。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追赶到白石会馆，确认地下档案室还在。\n"),
+    )
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertFalse(review.is_stale)
+
+    future_note_path.write_text(
+      """---
+type: secret
+status: canonical
+chapter_range: 3-3
+reveal_after_chapter: 2
+forbidden_phrases: [港务长另有身份]
+---
+# 终局真相
+
+终局真相改成第三章以后才揭示的新版本，并继续反向引用[[白石会馆]]。
+""",
+      encoding="utf-8",
+    )
+    future_changed = get_project_detail(self.settings, summary.id)
+    current_review = next(item for item in future_changed.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertFalse(current_review.is_stale)
+
+    current_note_path.write_text(
+      """---
+type: location
+status: canonical
+chapter_range: 1-1
+required_phrases: [地下档案室, 旧账册]
+---
+# 白石会馆
+
+白石会馆地下有旧船队档案室，旧账册不能丢。
+""",
+      encoding="utf-8",
+    )
+    current_changed = get_project_detail(self.settings, summary.id)
+    stale_review = next(item for item in current_changed.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertTrue(stale_review.is_stale)
+
+  def test_chapter_review_catches_obsidian_forbidden_phrase_without_note_label(self) -> None:
+    summary = self.create_demo_project("Obsidian 禁用短语")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-global"
+    vault_dir.mkdir()
+    (vault_dir / "白石会馆.md").write_text(
+      """---
+type: location
+status: canonical
+forbidden_phrases: [旧档案室被公开焚毁]
+---
+# 白石会馆
+
+白石会馆地下保存旧船队暗账。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追在暗巷里听见传闻：旧档案室被公开焚毁。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    obsidian_dimension = next(item for item in review.dimensions if item.id == "obsidian")
+    self.assertEqual(obsidian_dimension.status, "risk")
+    self.assertTrue(any("触犯 Obsidian 禁用设定：白石会馆" in item.title for item in obsidian_dimension.issues))
+    self.assertTrue(any("旧档案室被公开焚毁" in item.detail for item in obsidian_dimension.issues))
+
+  def test_chapter_review_respects_obsidian_chapter_scope(self) -> None:
+    summary = self.create_demo_project("Obsidian 章节边界")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-chapter-scope"
+    vault_dir.mkdir()
+    (vault_dir / "终局真相.md").write_text(
+      """---
+type: secret
+status: canonical
+chapter_range: 3-3
+reveal_after_chapter: 2
+forbidden_phrases: [港务长身份曝光]
+---
+# 终局真相
+
+港务长身份曝光只能在第三章以后处理。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    early_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n码头谣言里第一次出现港务长身份曝光这句话。\n"),
+    )
+    early_review = next(item for item in early_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    early_obsidian = next(item for item in early_review.dimensions if item.id == "obsidian")
+    self.assertEqual(early_obsidian.status, "na")
+    self.assertFalse(any("港务长身份曝光" in item.detail for item in early_obsidian.issues))
+
+    active_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-003",
+      ChapterUpdateRequest(content="# 第三章 红灯塔\n林追终于确认港务长身份曝光。\n"),
+    )
+    active_review = next(item for item in active_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-003")
+    active_obsidian = next(item for item in active_review.dimensions if item.id == "obsidian")
+    self.assertEqual(active_obsidian.status, "risk")
+    self.assertTrue(any("港务长身份曝光" in item.detail for item in active_obsidian.issues))
+
+  def test_chapter_review_checks_required_phrase_for_obsidian_evidence_hit(self) -> None:
+    summary = self.create_demo_project("Obsidian 证据必需项")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-required"
+    vault_dir.mkdir()
+    (vault_dir / "港口暗线.md").write_text(
+      """---
+type: rule
+status: canonical
+required_phrases: [潮汐密码]
+---
+# 港口暗线
+
+这份笔记只在 frontmatter 标出本章必须保留的词。
+""",
+      encoding="utf-8",
+    )
+    update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追在章末第一次听见潮汐密码。\n"),
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追翻开旧账册，避开所有能指向暗号的字眼。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-002")
+    obsidian_dimension = next(item for item in review.dimensions if item.id == "obsidian")
+    self.assertEqual(obsidian_dimension.status, "watch")
+    self.assertTrue(any("缺少 Obsidian 必需设定：港口暗线" in item.title for item in obsidian_dimension.issues))
+    self.assertTrue(any("本章证据命中了该笔记" in item.detail for item in obsidian_dimension.issues))
+
+  def test_chapter_review_checks_required_phrase_for_chapter_scoped_obsidian_note(self) -> None:
+    summary = self.create_demo_project("Obsidian 当前章必写项")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-scoped-required"
+    vault_dir.mkdir()
+    for index in range(9):
+      (vault_dir / f"00无关-{index}.md").write_text(
+        f"""---
+type: note
+status: canonical
+---
+# 无关笔记 {index}
+
+这份笔记记录另一个城市的天气。
+""",
+        encoding="utf-8",
+      )
+    (vault_dir / "99第二章任务.md").write_text(
+      """---
+type: clue
+status: canonical
+chapter_range: 2-2
+required_phrases: [银潮灯]
+---
+# 第二章任务
+
+第二章必须让银潮灯进入主线。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追推开仓门，只看见一排没有点亮的油灯。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-002")
+    obsidian_dimension = next(item for item in review.dimensions if item.id == "obsidian")
+    self.assertEqual(obsidian_dimension.status, "watch")
+    self.assertTrue(any("缺少 Obsidian 必需设定：第二章任务" in item.title for item in obsidian_dimension.issues))
+    self.assertTrue(any("银潮灯" in item.detail for item in obsidian_dimension.issues))
+
+    chapter = next(item for item in detail.chapters if item.id == "chapter-002")
+    direct_dimension = _obsidian_dimension(detail, chapter, None)
+    self.assertTrue(any("Vault 将该笔记绑定到当前章节" in item.detail for item in direct_dimension.issues))
+
+  def test_chapter_review_checks_obsidian_chapter_archive_handoff(self) -> None:
+    summary = self.create_demo_project("Obsidian 章节档案交接核验")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-chapter-handoff"
+    (vault_dir / "Archive").mkdir(parents=True)
+    (vault_dir / "Archive" / "第一章回顾.md").write_text(
+      """---
+type: chapter_note
+status: canonical
+source_ids:
+  - chapter-001
+chapter_title: 第一章回顾
+chapter_summary: 林追发现宋闻隐瞒旧船队账本。
+handoff_to_next:
+  - 下一章必须追问账本缺页。
+---
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    missing_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追只沿着旧码头追查宋闻，没有提到那页线索。\n"),
+    )
+    missing_review = next(item for item in missing_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-002")
+    missing_obsidian = next(item for item in missing_review.dimensions if item.id == "obsidian")
+    self.assertEqual(missing_obsidian.status, "watch")
+    self.assertTrue(any("缺少 Obsidian 必需设定：第一章回顾" in item.title for item in missing_obsidian.issues))
+    self.assertTrue(any("账本缺页" in item.detail for item in missing_obsidian.issues))
+    review_status = summarize_chapter_review_status(missing_detail, "chapter-002")
+    self.assertEqual(review_status["obsidian_required_issue_count"], 1)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    satisfied_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追追问宋闻账本缺页，确认那一页被人提前撕走。\n"),
+    )
+    satisfied_review = next(item for item in satisfied_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-002")
+    satisfied_obsidian = next(item for item in satisfied_review.dimensions if item.id == "obsidian")
+    self.assertFalse(any("账本缺页" in item.detail for item in satisfied_obsidian.issues))
+
+    later_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-003",
+      ChapterUpdateRequest(content="# 第三章 红灯塔\n林追继续追查旧船队账本的来历。\n"),
+    )
+    later_review = next(item for item in later_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-003")
+    later_obsidian = next(item for item in later_review.dimensions if item.id == "obsidian")
+    self.assertFalse(any("账本缺页" in item.detail for item in later_obsidian.issues))
+
+  def test_chapter_review_ignores_soft_obsidian_chapter_archive_handoff(self) -> None:
+    summary = self.create_demo_project("Obsidian 章节档案关注提示")
+    vault_dir = Path(self._temp_dir.name) / "review-vault-soft-chapter-handoff"
+    (vault_dir / "Archive").mkdir(parents=True)
+    (vault_dir / "Archive" / "第一章回顾.md").write_text(
+      """---
+type: chapter_note
+status: canonical
+source_ids:
+  - chapter-001
+chapter_title: 第一章回顾
+chapter_summary: 林追发现宋闻隐瞒旧船队账本。
+handoff_to_next:
+  - 下一章关注本章后果：银潮灯、宋闻。
+---
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追沿着旧码头追查账本来源。\n"),
+    )
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-002")
+    obsidian_dimension = next(item for item in review.dimensions if item.id == "obsidian")
+    self.assertFalse(any("缺少 Obsidian 必需设定：第一章回顾" in item.title for item in obsidian_dimension.issues))
+    review_status = summarize_chapter_review_status(detail, "chapter-002")
+    self.assertEqual(review_status["obsidian_required_issue_count"], 0)
+
+  def test_auto_repair_uses_chapter_scoped_obsidian_required_phrase(self) -> None:
+    summary = self.create_demo_project("Obsidian 必写项自动修订")
+    vault_dir = Path(self._temp_dir.name) / "repair-vault-scoped-required"
+    vault_dir.mkdir()
+    (vault_dir / "第二章任务.md").write_text(
+      """---
+type: clue
+status: canonical
+chapter_range: 2-2
+required_phrases: [银潮灯]
+---
+# 第二章任务
+
+第二章必须让银潮灯进入主线。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追推开仓门，只看见一排没有点亮的油灯。\n"),
+    )
+    review_status = summarize_chapter_review_status(detail, "chapter-002")
+    self.assertGreaterEqual(int(review_status["score"]), 65)
+    self.assertEqual(review_status["obsidian_required_issue_count"], 1)
+    self.assertEqual(review_status["must_repair_issue_count"], 1)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    with patch(
+      "novel_backend.services.chapter_auto_repair_service._invoke_model",
+      return_value=json.dumps(
+        {
+          "summary": "加入 Obsidian 必写设定。",
+          "changes": ["让银潮灯进入当前章"],
+          "revised_content": "# 第二章 旧码头\n林追推开仓门，看见一排没有点亮的油灯。最深处的银潮灯忽然亮起，照出旧船队留下的潮痕。\n",
+        },
+        ensure_ascii=False,
+      ),
+    ):
+      repaired_detail, review_error, repair_result = auto_repair_chapter_after_review(
+        self.settings,
+        summary.id,
+        "chapter-002",
+        detail,
+      )
+
+    self.assertEqual(review_error, "")
+    self.assertTrue(repair_result.attempted)
+    self.assertTrue(repair_result.applied)
+    repaired_chapter = next(item for item in repaired_detail.chapters if item.id == "chapter-002")
+    self.assertIn("银潮灯", repaired_chapter.content)
+    repaired_status = summarize_chapter_review_status(repaired_detail, "chapter-002")
+    self.assertEqual(repaired_status["obsidian_required_issue_count"], 0)
+    self.assertEqual(repaired_status["must_repair_issue_count"], 0)
+
+  def test_chapter_review_obsidian_evidence_prefers_source_key(self) -> None:
+    guard_context = SimpleNamespace(
+      knowledge_evidence=[
+        {
+          "source": "Obsidian",
+          "source_key": "obsidian:Clues/港口暗线.md",
+          "section": "没有路径分隔符的标题",
+        },
+        {
+          "source": "资料库",
+          "source_key": "reference:Clues/误入.md",
+          "section": "Clues/误入.md",
+        },
+      ]
+    )
+
+    self.assertEqual(_obsidian_evidence_paths(guard_context), {"Clues/港口暗线.md"})
 
   def test_chapter_review_becomes_stale_after_blueprint_changes(self) -> None:
     summary = self.create_demo_project("核验过期")
@@ -864,6 +1681,177 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertTrue(chapter.exists)
     self.assertEqual(detail.story_overview.chapter_reviews, [])
 
+  def test_chapter_mutation_response_includes_self_evolution_state(self) -> None:
+    summary = self.create_demo_project("保存响应携带自学习")
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(
+        content=(
+          "# 第一章 雨夜靠港\n"
+          "林追在旧码头仓库拿到铜钥匙，却没有说出宋闻的旧船队背叛线索。\n"
+        ),
+        xp_preset="悬疑推进",
+      ),
+    )
+
+    payload = _chapter_mutation_response(self.settings, detail)
+    meta = payload.get("meta") or {}
+    self_evolution = meta.get("self_evolution") or {}
+    narrative_state = self_evolution.get("narrative_state") or {}
+
+    self.assertTrue(payload["ok"])
+    self.assertEqual(payload["data"]["id"], summary.id)
+    self.assertNotIn("self_evolution_error", meta)
+    self.assertIn("style_xp_evolution", self_evolution)
+    self.assertTrue(narrative_state.get("chapter_cards"))
+    self.assertEqual(narrative_state["chapter_cards"][-1]["chapter_id"], "chapter-001")
+
+  def test_project_action_response_includes_self_evolution_state(self) -> None:
+    summary = self.create_demo_project("维护响应携带自学习")
+    update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(
+        content=(
+          "# 第一章 雨夜靠港\n"
+          "林追在旧码头仓库拿到铜钥匙，却没有说出宋闻的旧船队背叛线索。\n"
+        ),
+        xp_preset="悬疑推进",
+      ),
+    )
+
+    payload = _project_action_response(
+      self.settings,
+      summary.id,
+      {"status": "staged", "suggestion_id": "obsidian-maintenance-demo"},
+      "Obsidian 维护动作",
+    )
+    meta = payload.get("meta") or {}
+    self_evolution = meta.get("self_evolution") or {}
+    narrative_state = self_evolution.get("narrative_state") or {}
+
+    self.assertTrue(payload["ok"])
+    self.assertEqual(payload["data"]["status"], "staged")
+    self.assertNotIn("self_evolution_error", meta)
+    self.assertIn("style_xp_evolution", self_evolution)
+    self.assertTrue(narrative_state.get("chapter_cards"))
+    self.assertEqual(narrative_state["chapter_cards"][-1]["chapter_id"], "chapter-001")
+
+  def test_obsidian_config_response_includes_self_evolution_state(self) -> None:
+    summary = self.create_demo_project("配置响应携带自学习")
+    vault_dir = Path(self._temp_dir.name) / "vault-config-response"
+    vault_dir.mkdir()
+    (vault_dir / "线索甲.md").write_text(
+      "\n".join(
+        [
+          "---",
+          "status: canonical",
+          "type: clue",
+          "---",
+          "# 线索甲",
+          "林追先在旧账册里看见 [[潮汐账本]]。",
+        ]
+      ),
+      encoding="utf-8",
+    )
+    (vault_dir / "线索乙.md").write_text(
+      "\n".join(
+        [
+          "---",
+          "status: canonical",
+          "type: clue",
+          "---",
+          "# 线索乙",
+          "宋闻也把 [[潮汐账本]] 当成旧船队背叛线索的一部分。",
+        ]
+      ),
+      encoding="utf-8",
+    )
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=self.settings)))
+    payload = put_project_obsidian(
+      request,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    meta = payload.get("meta") or {}
+    self_evolution = meta.get("self_evolution") or {}
+    narrative_state = self_evolution.get("narrative_state") or {}
+    suggestions = narrative_state.get("obsidian_maintenance_suggestions") or []
+    graph_suggestion = next(
+      item
+      for item in suggestions
+      if item.get("kind") == "create_graph_note" and "潮汐账本" in str(item.get("title") or "")
+    )
+
+    self.assertTrue(payload["ok"])
+    self.assertEqual(payload["data"]["id"], summary.id)
+    self.assertTrue(payload["data"]["story_overview"]["obsidian"]["enabled"])
+    self.assertNotIn("self_evolution_error", meta)
+    self.assertIn("style_xp_evolution", self_evolution)
+    self.assertEqual(graph_suggestion["status"], "staged")
+    self.assertTrue(graph_suggestion["auto_staged"])
+    self.assertIn("Graph/", graph_suggestion["suggested_path"])
+
+  def test_obsidian_sync_response_includes_self_evolution_state(self) -> None:
+    summary = self.create_demo_project("同步响应携带自学习")
+    vault_dir = Path(self._temp_dir.name) / "vault-sync-response"
+    vault_dir.mkdir()
+    (vault_dir / "线索甲.md").write_text(
+      "\n".join(
+        [
+          "---",
+          "status: canonical",
+          "type: clue",
+          "---",
+          "# 线索甲",
+          "林追先在旧账册里看见 [[潮汐账本]]。",
+        ]
+      ),
+      encoding="utf-8",
+    )
+    update_project_obsidian_config(
+      self.settings,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    (vault_dir / "线索乙.md").write_text(
+      "\n".join(
+        [
+          "---",
+          "status: canonical",
+          "type: clue",
+          "---",
+          "# 线索乙",
+          "宋闻也把 [[潮汐账本]] 当成旧船队背叛线索的一部分。",
+        ]
+      ),
+      encoding="utf-8",
+    )
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=self.settings)))
+    payload = post_project_obsidian_sync(request, summary.id)
+    meta = payload.get("meta") or {}
+    self_evolution = meta.get("self_evolution") or {}
+    narrative_state = self_evolution.get("narrative_state") or {}
+    suggestions = narrative_state.get("obsidian_maintenance_suggestions") or []
+    graph_suggestion = next(
+      item
+      for item in suggestions
+      if item.get("kind") == "create_graph_note" and "潮汐账本" in str(item.get("title") or "")
+    )
+
+    self.assertTrue(payload["ok"])
+    self.assertEqual(payload["data"]["id"], summary.id)
+    self.assertNotIn("self_evolution_error", meta)
+    self.assertIn("style_xp_evolution", self_evolution)
+    self.assertEqual(graph_suggestion["status"], "staged")
+    self.assertTrue(graph_suggestion["auto_staged"])
+    self.assertIn("Graph/", graph_suggestion["suggested_path"])
+
   def test_refresh_chapter_review_only_refreshes_saved_content(self) -> None:
     summary = self.create_demo_project("单独刷新核验")
     saved = update_chapter_content(
@@ -924,6 +1912,732 @@ class ProjectServiceTestCase(unittest.TestCase):
       )
 
     self.assertEqual(context.exception.status_code, 409)
+
+  def test_export_project_migration_package_includes_complete_project_directory(self) -> None:
+    summary = self.create_demo_project("迁移导出")
+    project_dir = Path(summary.path)
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 雨夜靠港\n林追在旧码头仓库找到一把铜钥匙。\n",
+    )
+    (project_dir / ".gaoxia" / "custom_state.json").parent.mkdir(parents=True, exist_ok=True)
+    (project_dir / ".gaoxia" / "custom_state.json").write_text('{"ok": true}', encoding="utf-8")
+
+    result = export_project_migration_package(self.settings, summary.id)
+
+    package_path = Path(result.path)
+    self.assertTrue(package_path.exists())
+    self.assertTrue(package_path.name.endswith(".gaoxia-project.zip"))
+    with zipfile.ZipFile(package_path) as archive:
+      names = set(archive.namelist())
+      manifest = json.loads(archive.read(".gaoxia-project.json").decode("utf-8"))
+
+    self.assertEqual(manifest["project"]["id"], summary.id)
+    self.assertIn("project/project.json", names)
+    self.assertIn("project/chapters/001.md", names)
+    self.assertIn("project/knowledge.db", names)
+    self.assertIn("project/.novel-history/index.json", names)
+    self.assertIn("project/.gaoxia/custom_state.json", names)
+    self.assertNotIn(f"project/exports/{package_path.name}", names)
+
+  def test_migration_package_scrubs_external_obsidian_index_but_keeps_project_state(self) -> None:
+    summary = self.create_demo_project("外部 Obsidian 迁移")
+    project_dir = Path(summary.path)
+    vault_dir = Path(self._temp_dir.name) / "external-vault"
+    vault_dir.mkdir()
+    (vault_dir / "Secrets.md").write_text(
+      """---
+type: note
+status: canonical
+---
+# 外部 Vault 密档
+
+迁移包不应携带的外部 Obsidian 正文。
+""",
+      encoding="utf-8",
+    )
+    update_project_obsidian_config(
+      self.settings,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    learning_dir = project_dir / ".gaoxia" / "learning"
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    draft_dir = project_dir / ".gaoxia" / "obsidian_drafts" / "Graph"
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    external_draft_path = draft_dir / "Secrets.md"
+    external_draft_path.write_text(
+      "# 外部 Vault 密档\n\n迁移包不应携带的外部 Obsidian 正文。\n",
+      encoding="utf-8",
+    )
+    (learning_dir / "narrative_state.json").write_text(
+      json.dumps(
+        {
+          "debts": [
+            {
+              "id": "debt-project-owned",
+              "title": "项目内剧情债务",
+              "content": "项目章节留下的铜钥匙承诺。",
+            }
+          ],
+          "obsidian_maintenance_summary": {"total": 1, "needs_action": 1},
+          "obsidian_maintenance_suggestions": [
+            {
+              "id": "obsidian-maintenance-migration",
+              "kind": "create_graph_note",
+              "title": "外部 Vault 密档维护",
+              "status": "staged",
+              "reason": "迁移包不应携带的外部 Obsidian 正文。",
+              "suggested_path": "Graph/Secrets.md",
+              "draft_markdown": "# 外部 Vault 密档\n\n迁移包不应携带的外部 Obsidian 正文。",
+            }
+          ],
+          "obsidian_maintenance_actions": [
+            {
+              "id": "obsidian-maintenance-action-migration",
+              "suggestion_id": "obsidian-maintenance-migration",
+              "status": "staged",
+              "title": "外部 Vault 密档维护",
+              "draft_path": str(external_draft_path),
+              "relative_path": "Graph/Secrets.md",
+              "vault_path": str(vault_dir / "Secrets.md"),
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    (project_dir / "project_distillation.json").write_text(
+      json.dumps(
+        {
+          "generated_at": "2026-06-03T00:00:00+00:00",
+          "source_signature": "external-obsidian-signature",
+          "is_stale": False,
+          "source_profile": {
+            "summary": "Obsidian:外部 Vault 密档｜迁移包不应携带的外部 Obsidian 正文。",
+            "narrative_rules": [],
+            "style_traits": [],
+            "core_conflicts": [],
+            "character_notes": [],
+            "event_notes": [],
+            "location_notes": [],
+            "prop_notes": [],
+            "skill_notes": [],
+            "material_notes": [
+              "Obsidian:外部 Vault 密档｜迁移包不应携带的外部 Obsidian 正文。",
+              "项目内资料｜铜钥匙仍需要保留。",
+            ],
+          },
+          "packs": [
+            {
+              "kind": "architecture",
+              "summary": "用于整书架构。",
+              "must_keep": [
+                "Obsidian:外部 Vault 密档｜迁移包不应携带的外部 Obsidian 正文。",
+                "项目内架构约束：铜钥匙不能丢。",
+              ],
+              "execution_focus": [],
+              "voice_rules": [],
+              "blocked_changes": [],
+              "prepared_from": ["source_profile", "materials"],
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    (learning_dir / "self_evolution_candidates.json").write_text(
+      json.dumps(
+        {
+          "candidates": [
+            {
+              "id": "candidate-external-vault",
+              "kind": "memory",
+              "title": "外部 Vault 密档候选",
+              "content": "迁移包不应携带的外部 Obsidian 正文。",
+              "rationale": "来自外部 Vault 密档。",
+              "metadata": {"latest_user": "请分析外部 Vault 密档。"},
+            }
+          ]
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    (learning_dir / "self_evolution_reviews.jsonl").write_text(
+      json.dumps(
+        {
+          "id": "review-external-vault",
+          "latest_user_message": "请分析外部 Vault 密档。",
+          "candidates": [
+            {
+              "kind": "memory",
+              "title": "外部 Vault 密档候选",
+              "content": "迁移包不应携带的外部 Obsidian 正文。",
+              "rationale": "来自外部 Vault 密档。",
+            }
+          ],
+        },
+        ensure_ascii=False,
+      )
+      + "\n",
+      encoding="utf-8",
+    )
+    (learning_dir / "failure_cases.jsonl").write_text(
+      json.dumps(
+        {
+          "id": "failure-external-vault",
+          "action_kind": "review_knowledge",
+          "summary": "外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+          "latest_user_message": "请分析外部 Vault 密档。",
+          "prevention": "下次读取外部 Vault 密档前需要重新同步。",
+        },
+        ensure_ascii=False,
+      )
+      + "\n",
+      encoding="utf-8",
+    )
+    (project_dir / ".gaoxia" / "model_review_history.json").write_text(
+      json.dumps(
+        {
+          "id": "model-review-external-vault",
+          "title": "外部 Vault 密档模型复盘",
+          "content": "迁移包不应携带的外部 Obsidian 正文。",
+        },
+        ensure_ascii=False,
+      )
+      + "\n"
+      + json.dumps(
+        {
+          "id": "model-review-external-vault-2",
+          "summary": "外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+        },
+        ensure_ascii=False,
+      )
+      + "\n",
+      encoding="utf-8",
+    )
+    save_project_agent_threads(
+      self.settings,
+      summary.id,
+      AgentThreadStoreUpdateRequest(
+        active_thread_id="thread-external",
+        threads=[
+          AgentThreadRecord(
+            id="thread-external",
+            title="资料分析线程",
+            preview="迁移包线程清理验证",
+            updated_at="2026-06-03T00:00:00+00:00",
+            messages=[
+              AgentThreadMessage(role="user", content="先分析资料。"),
+              AgentThreadMessage(
+                role="assistant",
+                content="资料分析已经完成。",
+                mode="execution",
+                task_pack_kind="architecture",
+                execution_trace=[
+                  AgentExecutionTrace(
+                    step=1,
+                    action_kind="review_knowledge",
+                    label="分析资料",
+                    status="completed",
+                    task_pack_kind="architecture",
+                    summary="Obsidian:外部 Vault 密档｜迁移包不应携带的外部 Obsidian 正文。",
+                    changes=["已分析外部 Vault 密档。"],
+                    material_count=1,
+                  )
+                ],
+                event_blocks=[
+                  AgentEventBlock(
+                    event_type="action_result",
+                    title="资料分析",
+                    status="completed",
+                    summary="外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+                    step=1,
+                    action_kind="review_knowledge",
+                  )
+                ],
+                artifacts=[
+                  AgentArtifact(
+                    kind="knowledge_summary",
+                    title="资料库分析",
+                    summary="Obsidian:外部 Vault 密档",
+                    content_preview="迁移包不应携带的外部 Obsidian 正文。",
+                    metadata={"material_count": 1},
+                  ),
+                  AgentArtifact(
+                    kind="chapter_review",
+                    title="章节核验",
+                    summary="缺少 Obsidian 必需设定：外部 Vault 密档",
+                    content_preview="迁移包不应携带的外部 Obsidian 正文。",
+                    metadata={"chapter_id": "chapter-001"},
+                  ),
+                ],
+                changes=["已分析外部 Vault 密档。"],
+              ),
+            ],
+          )
+        ],
+      ),
+    )
+    workflow_dir = project_dir / ".gaoxia" / "runs" / "run-external"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    (workflow_dir / "workflow.json").write_text(
+      json.dumps(
+        {
+          "schema_version": "1",
+          "task_id": "run-external",
+          "project_id": summary.id,
+          "thread_id": "thread-external",
+          "status": "SUCCEEDED",
+          "plan": {
+            "id": "plan-external",
+            "title": "外部 Vault 密档资料分析",
+            "summary": "分析迁移包不应携带的外部 Obsidian 正文。",
+            "actions": [
+              {
+                "kind": "review_knowledge",
+                "label": "分析外部 Vault 密档",
+                "instruction": "读取外部 Vault 密档。",
+                "chapter_id": "chapter-001",
+              }
+            ],
+          },
+          "payload": {
+            "messages": [{"role": "user", "content_preview": "先分析资料。", "content_length": 6}]
+          },
+          "actions": [
+            {
+              "step": 1,
+              "kind": "review_knowledge",
+              "label": "分析外部 Vault 密档",
+              "status": "SUCCEEDED",
+              "instruction_preview": "迁移包不应携带的外部 Obsidian 正文。",
+              "message": "外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+              "contract": {"checks": [{"message": "Obsidian:外部 Vault 密档"}]},
+              "output_validation": {"summary": "知识 artifact 包含外部 Vault 密档。"},
+              "status_history": [
+                {"status": "SUCCEEDED", "message": "已分析外部 Vault 密档。"}
+              ],
+              "subtasks": [
+                {
+                  "subtask_id": "review_knowledge:knowledge",
+                  "role": "资料分析 agent",
+                  "status": "SUCCEEDED",
+                  "summary": "外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+                }
+              ],
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    subtask_dir = workflow_dir / "subtasks"
+    subtask_dir.mkdir(parents=True, exist_ok=True)
+    (subtask_dir / "review_knowledge_knowledge.json").write_text(
+      json.dumps(
+        {
+          "task_id": "run-external",
+          "step": 1,
+          "subtask_id": "review_knowledge:knowledge",
+          "role": "资料分析 agent",
+          "status": "SUCCEEDED",
+          "summary": "外部 Vault 密档：迁移包不应携带的外部 Obsidian 正文。",
+          "history": [
+            {"status": "SUCCEEDED", "summary": "迁移包不应携带的外部 Obsidian 正文。"}
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+    self.assertTrue((project_dir / ".gaoxia" / "threads" / "thread-external.json").exists())
+    self.assertTrue((project_dir / ".gaoxia" / "thread_context" / "thread-external.json").exists())
+    self.assertTrue((project_dir / ".gaoxia" / "runs" / "run-external" / "workflow.json").exists())
+    self.assertTrue((
+      project_dir / ".gaoxia" / "runs" / "run-external" / "subtasks" / "review_knowledge_knowledge.json"
+    ).exists())
+
+    original_connection = sqlite3.connect(project_dir / "knowledge.db")
+    try:
+      original_count = original_connection.execute(
+        "SELECT COUNT(*) FROM knowledge_chunks WHERE kind = 'obsidian' AND content LIKE ?",
+        ("%迁移包不应携带的外部 Obsidian 正文%",),
+      ).fetchone()[0]
+    finally:
+      original_connection.close()
+    self.assertGreater(original_count, 0)
+
+    export_result = export_project_migration_package(self.settings, summary.id)
+    self.assertTrue(any("Obsidian Vault 位于项目目录外" in item for item in export_result.warnings))
+
+    with zipfile.ZipFile(export_result.path) as archive:
+      names = set(archive.namelist())
+      manifest = json.loads(archive.read(".gaoxia-project.json").decode("utf-8"))
+      sanitized_db_bytes = archive.read("project/knowledge.db")
+      sanitized_sync_text = archive.read("project/.gaoxia/obsidian_sync.json").decode("utf-8")
+      sanitized_sync_payload = json.loads(sanitized_sync_text)
+      sanitized_state_text = archive.read("project/.gaoxia/learning/narrative_state.json").decode("utf-8")
+      sanitized_state_payload = json.loads(sanitized_state_text)
+      sanitized_distillation_text = archive.read("project/project_distillation.json").decode("utf-8")
+      sanitized_distillation_payload = json.loads(sanitized_distillation_text)
+      sanitized_candidates_text = archive.read("project/.gaoxia/learning/self_evolution_candidates.json").decode("utf-8")
+      sanitized_reviews_text = archive.read("project/.gaoxia/learning/self_evolution_reviews.jsonl").decode("utf-8")
+      sanitized_failure_cases_text = archive.read("project/.gaoxia/learning/failure_cases.jsonl").decode("utf-8")
+      sanitized_model_review_text = archive.read("project/.gaoxia/model_review_history.json").decode("utf-8")
+      sanitized_thread_text = archive.read("project/.gaoxia/threads/thread-external.json").decode("utf-8")
+      sanitized_thread_payload = json.loads(sanitized_thread_text)
+      sanitized_workflow_text = archive.read("project/.gaoxia/runs/run-external/workflow.json").decode("utf-8")
+      sanitized_workflow_payload = json.loads(sanitized_workflow_text)
+      sanitized_subtask_text = archive.read(
+        "project/.gaoxia/runs/run-external/subtasks/review_knowledge_knowledge.json"
+      ).decode("utf-8")
+      sanitized_subtask_payload = json.loads(sanitized_subtask_text)
+
+    self.assertIn("project/.gaoxia/obsidian.json", names)
+    self.assertIn("project/.gaoxia/obsidian_sync.json", names)
+    self.assertIn("project/.gaoxia/learning/narrative_state.json", names)
+    self.assertIn("project/.gaoxia/learning/self_evolution_candidates.json", names)
+    self.assertIn("project/.gaoxia/learning/self_evolution_reviews.jsonl", names)
+    self.assertIn("project/.gaoxia/learning/failure_cases.jsonl", names)
+    self.assertIn("project/.gaoxia/model_review_history.json", names)
+    self.assertIn("project/project_distillation.json", names)
+    self.assertIn("project/.gaoxia/threads/thread-external.json", names)
+    self.assertIn("project/.gaoxia/runs/run-external/workflow.json", names)
+    self.assertIn("project/.gaoxia/runs/run-external/subtasks/review_knowledge_knowledge.json", names)
+    self.assertNotIn("project/.gaoxia/thread_context/thread-external.json", names)
+    self.assertNotIn("project/.gaoxia/obsidian_drafts/Graph/Secrets.md", names)
+    self.assertNotIn("project/Secrets.md", names)
+    self.assertTrue(any("Obsidian Vault 位于项目目录外" in item for item in manifest["warnings"]))
+    self.assertEqual(sanitized_sync_payload["vault_path"], str(vault_dir))
+    self.assertEqual(sanitized_sync_payload["notes"], [])
+    self.assertEqual(sanitized_sync_payload["note_count"], 0)
+    self.assertEqual(sanitized_sync_payload["included_count"], 0)
+    self.assertEqual(sanitized_sync_payload["link_count"], 0)
+    self.assertEqual(sanitized_sync_payload["external_link_count"], 0)
+    self.assertEqual(sanitized_sync_payload["source_signature"], "")
+    self.assertTrue(any("笔记摘要已从迁移包移除" in item for item in sanitized_sync_payload["warnings"]))
+    self.assertNotIn("外部 Vault 密档", sanitized_sync_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_sync_text)
+    self.assertEqual(sanitized_state_payload["obsidian_maintenance_suggestions"], [])
+    self.assertEqual(sanitized_state_payload["obsidian_maintenance_actions"], [])
+    self.assertEqual(sanitized_state_payload["obsidian_maintenance_summary"]["total"], 0)
+    self.assertTrue(
+      "维护队列已从迁移包移除" in sanitized_state_payload["obsidian_maintenance_summary"]["migration_notice"]
+    )
+    self.assertIn("项目内剧情债务", sanitized_state_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_state_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_state_text)
+    self.assertNotIn(str(vault_dir), sanitized_state_text)
+    self.assertEqual(sanitized_distillation_payload["source_signature"], "")
+    self.assertTrue(sanitized_distillation_payload["is_stale"])
+    self.assertEqual(sanitized_distillation_payload["source_profile"]["summary"], "")
+    self.assertEqual(
+      sanitized_distillation_payload["source_profile"]["material_notes"],
+      ["项目内资料｜铜钥匙仍需要保留。"],
+    )
+    self.assertEqual(
+      sanitized_distillation_payload["packs"][0]["must_keep"],
+      ["项目内架构约束：铜钥匙不能丢。"],
+    )
+    self.assertTrue("蒸馏摘要已从迁移包移除" in sanitized_distillation_payload["migration_notice"])
+    self.assertNotIn("外部 Vault 密档", sanitized_distillation_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_distillation_text)
+    self.assertIn("资料分析记录已从迁移包移除", sanitized_candidates_text)
+    self.assertIn("资料分析记录已从迁移包移除", sanitized_reviews_text)
+    self.assertIn("资料分析记录已从迁移包移除", sanitized_failure_cases_text)
+    self.assertIn("资料分析记录已从迁移包移除", sanitized_model_review_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_candidates_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_reviews_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_failure_cases_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_model_review_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_candidates_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_reviews_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_failure_cases_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_model_review_text)
+    thread_message = sanitized_thread_payload["messages"][1]
+    self.assertIn("资料分析记录已从迁移包移除", thread_message["content"])
+    self.assertIn("资料分析记录已从迁移包移除", thread_message["execution_trace"][0]["summary"])
+    self.assertEqual(thread_message["artifacts"][0]["content_preview"], "")
+    self.assertEqual(thread_message["artifacts"][1]["content_preview"], "")
+    self.assertNotIn("外部 Vault 密档", sanitized_thread_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_thread_text)
+    self.assertIn("资料分析记录已从迁移包移除", sanitized_workflow_text)
+    self.assertEqual(sanitized_workflow_payload["actions"][0]["message"], "外部 Obsidian Vault 的资料分析记录已从迁移包移除，导入后需要重新同步 Vault 并重新分析资料。")
+    self.assertEqual(sanitized_workflow_payload["actions"][0]["contract"]["migration_notice"], "外部 Obsidian Vault 的资料分析记录已从迁移包移除，导入后需要重新同步 Vault 并重新分析资料。")
+    self.assertEqual(sanitized_subtask_payload["summary"], "外部 Obsidian Vault 的资料分析记录已从迁移包移除，导入后需要重新同步 Vault 并重新分析资料。")
+    self.assertNotIn("外部 Vault 密档", sanitized_workflow_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_workflow_text)
+    self.assertNotIn("外部 Vault 密档", sanitized_subtask_text)
+    self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", sanitized_subtask_text)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as db_temp_dir:
+      sanitized_db_path = Path(db_temp_dir) / "knowledge.db"
+      sanitized_db_path.write_bytes(sanitized_db_bytes)
+      connection = sqlite3.connect(sanitized_db_path)
+      try:
+        obsidian_source_count = connection.execute(
+          "SELECT COUNT(*) FROM knowledge_sources WHERE kind = 'obsidian' OR source = 'Obsidian' OR source_key LIKE 'obsidian:%'"
+        ).fetchone()[0]
+        obsidian_chunk_count = connection.execute(
+          "SELECT COUNT(*) FROM knowledge_chunks WHERE kind = 'obsidian' OR source = 'Obsidian' OR source_key LIKE 'obsidian:%'"
+        ).fetchone()[0]
+        leaked_count = connection.execute(
+          "SELECT COUNT(*) FROM knowledge_chunks WHERE content LIKE ?",
+          ("%迁移包不应携带的外部 Obsidian 正文%",),
+        ).fetchone()[0]
+        source_signature = connection.execute(
+          "SELECT state_value FROM knowledge_index_state WHERE state_key = 'source_signature'"
+        ).fetchone()[0]
+      finally:
+        connection.close()
+
+    self.assertEqual(obsidian_source_count, 0)
+    self.assertEqual(obsidian_chunk_count, 0)
+    self.assertEqual(leaked_count, 0)
+    self.assertEqual(source_signature, "")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as target_data_dir:
+      target_settings = Settings(data_dir=Path(target_data_dir))
+      initialize_app_storage(target_settings)
+      import_result = import_project_migration_package(
+        target_settings,
+        ProjectMigrationImportRequest(
+          filename=Path(export_result.path).name,
+          content_base64=base64.b64encode(Path(export_result.path).read_bytes()).decode("utf-8"),
+        ),
+      )
+      imported_project_dir = Path(import_result.path)
+
+      self.assertTrue(any("Obsidian Vault 位于项目目录外" in item for item in import_result.warnings))
+      self.assertTrue((imported_project_dir / ".gaoxia" / "obsidian.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "obsidian_sync.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "learning" / "narrative_state.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "learning" / "self_evolution_candidates.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "learning" / "self_evolution_reviews.jsonl").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "learning" / "failure_cases.jsonl").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "model_review_history.json").exists())
+      self.assertTrue((imported_project_dir / "project_distillation.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "threads" / "thread-external.json").exists())
+      self.assertTrue((imported_project_dir / ".gaoxia" / "runs" / "run-external" / "workflow.json").exists())
+      self.assertTrue((
+        imported_project_dir / ".gaoxia" / "runs" / "run-external" / "subtasks" / "review_knowledge_knowledge.json"
+      ).exists())
+      self.assertFalse((imported_project_dir / ".gaoxia" / "thread_context" / "thread-external.json").exists())
+      self.assertFalse((imported_project_dir / ".gaoxia" / "obsidian_drafts" / "Graph" / "Secrets.md").exists())
+      imported_distillation_text = (imported_project_dir / "project_distillation.json").read_text(encoding="utf-8")
+      self.assertIn("项目内资料", imported_distillation_text)
+      self.assertNotIn("外部 Vault 密档", imported_distillation_text)
+      imported_candidates_text = (
+        imported_project_dir / ".gaoxia" / "learning" / "self_evolution_candidates.json"
+      ).read_text(encoding="utf-8")
+      imported_reviews_text = (
+        imported_project_dir / ".gaoxia" / "learning" / "self_evolution_reviews.jsonl"
+      ).read_text(encoding="utf-8")
+      imported_failure_cases_text = (
+        imported_project_dir / ".gaoxia" / "learning" / "failure_cases.jsonl"
+      ).read_text(encoding="utf-8")
+      imported_model_review_text = (
+        imported_project_dir / ".gaoxia" / "model_review_history.json"
+      ).read_text(encoding="utf-8")
+      self.assertIn("资料分析记录已从迁移包移除", imported_candidates_text)
+      self.assertIn("资料分析记录已从迁移包移除", imported_reviews_text)
+      self.assertIn("资料分析记录已从迁移包移除", imported_failure_cases_text)
+      self.assertIn("资料分析记录已从迁移包移除", imported_model_review_text)
+      self.assertNotIn("外部 Vault 密档", imported_candidates_text)
+      self.assertNotIn("外部 Vault 密档", imported_reviews_text)
+      self.assertNotIn("外部 Vault 密档", imported_failure_cases_text)
+      self.assertNotIn("外部 Vault 密档", imported_model_review_text)
+      imported_thread_text = (imported_project_dir / ".gaoxia" / "threads" / "thread-external.json").read_text(encoding="utf-8")
+      self.assertIn("资料分析记录已从迁移包移除", imported_thread_text)
+      self.assertNotIn("外部 Vault 密档", imported_thread_text)
+      imported_workflow_text = (
+        imported_project_dir / ".gaoxia" / "runs" / "run-external" / "workflow.json"
+      ).read_text(encoding="utf-8")
+      imported_subtask_text = (
+        imported_project_dir / ".gaoxia" / "runs" / "run-external" / "subtasks" / "review_knowledge_knowledge.json"
+      ).read_text(encoding="utf-8")
+      self.assertIn("资料分析记录已从迁移包移除", imported_workflow_text)
+      self.assertNotIn("外部 Vault 密档", imported_workflow_text)
+      self.assertNotIn("迁移包不应携带的外部 Obsidian 正文", imported_subtask_text)
+
+  def test_migration_package_keeps_project_internal_obsidian_vault_index(self) -> None:
+    summary = self.create_demo_project("项目内 Obsidian 迁移")
+    project_dir = Path(summary.path)
+    vault_dir = project_dir / "vault"
+    vault_dir.mkdir()
+    (vault_dir / "Clue.md").write_text(
+      """---
+type: note
+status: canonical
+---
+# 项目内 Vault 线索
+
+迁移包应该保留的项目内 Obsidian 正文。
+""",
+      encoding="utf-8",
+    )
+    update_project_obsidian_config(
+      self.settings,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path="vault", allowed_statuses=["canonical"]),
+    )
+
+    export_result = export_project_migration_package(self.settings, summary.id)
+    self.assertFalse(any("Obsidian Vault 位于项目目录外" in item for item in export_result.warnings))
+
+    with zipfile.ZipFile(export_result.path) as archive:
+      names = set(archive.namelist())
+      db_bytes = archive.read("project/knowledge.db")
+      sync_payload = json.loads(archive.read("project/.gaoxia/obsidian_sync.json").decode("utf-8"))
+
+    self.assertIn("project/vault/Clue.md", names)
+    self.assertIn("project/.gaoxia/obsidian.json", names)
+    self.assertTrue(any("项目内 Vault 线索" in item.get("title", "") for item in sync_payload.get("notes", [])))
+    self.assertTrue(any("迁移包应该保留的项目内 Obsidian 正文" in item.get("preview", "") for item in sync_payload.get("notes", [])))
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as db_temp_dir:
+      db_path = Path(db_temp_dir) / "knowledge.db"
+      db_path.write_bytes(db_bytes)
+      connection = sqlite3.connect(db_path)
+      try:
+        obsidian_source_count = connection.execute(
+          "SELECT COUNT(*) FROM knowledge_sources WHERE kind = 'obsidian' OR source = 'Obsidian' OR source_key LIKE 'obsidian:%'"
+        ).fetchone()[0]
+        obsidian_chunk_count = connection.execute(
+          "SELECT COUNT(*) FROM knowledge_chunks WHERE kind = 'obsidian' AND content LIKE ?",
+          ("%迁移包应该保留的项目内 Obsidian 正文%",),
+        ).fetchone()[0]
+      finally:
+        connection.close()
+
+    self.assertGreater(obsidian_source_count, 0)
+    self.assertGreater(obsidian_chunk_count, 0)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as target_data_dir:
+      target_settings = Settings(data_dir=Path(target_data_dir))
+      initialize_app_storage(target_settings)
+      import_result = import_project_migration_package(
+        target_settings,
+        ProjectMigrationImportRequest(
+          filename=Path(export_result.path).name,
+          content_base64=base64.b64encode(Path(export_result.path).read_bytes()).decode("utf-8"),
+        ),
+      )
+      imported_project_dir = Path(import_result.path)
+      self.assertTrue((imported_project_dir / "vault" / "Clue.md").exists())
+      imported_detail = get_project_detail(target_settings, import_result.project.id)
+      self.assertEqual(imported_detail.story_overview.obsidian.included_count, 1)
+      self.assertFalse(imported_detail.story_overview.obsidian.warnings)
+
+  def test_import_project_migration_package_registers_project_on_new_workspace(self) -> None:
+    summary = self.create_demo_project("跨机导入")
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 雨夜靠港\n迁移包应该保留章节正文。\n",
+    )
+    update_story_document(
+      self.settings,
+      summary.id,
+      "core_seed",
+      StoryDocumentUpdateRequest(content="核心种子也要一起迁移。"),
+    )
+    export_result = export_project_migration_package(self.settings, summary.id)
+    package_bytes = Path(export_result.path).read_bytes()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as target_data_dir:
+      target_settings = Settings(data_dir=Path(target_data_dir))
+      initialize_app_storage(target_settings)
+      import_result = import_project_migration_package(
+        target_settings,
+        ProjectMigrationImportRequest(
+          filename=Path(export_result.path).name,
+          content_base64=base64.b64encode(package_bytes).decode("utf-8"),
+        ),
+      )
+
+      self.assertFalse(import_result.id_changed)
+      self.assertEqual(import_result.project.id, summary.id)
+      self.assertTrue(Path(import_result.path).exists())
+      imported_meta = json.loads((Path(import_result.path) / "project.json").read_text(encoding="utf-8"))
+      self.assertEqual(imported_meta["id"], summary.id)
+      self.assertEqual(imported_meta["path"], import_result.path)
+
+      imported_detail = get_project_detail(target_settings, import_result.project.id)
+      imported_chapter = next(item for item in imported_detail.chapters if item.id == "chapter-001")
+      self.assertIn("迁移包应该保留章节正文", imported_chapter.content)
+      documents = {item.key: item.content for item in imported_detail.story_overview.documents}
+      self.assertEqual(documents["core_seed"], "核心种子也要一起迁移。")
+      self.assertTrue((Path(import_result.path) / "knowledge.db").exists())
+
+  def test_project_migration_import_api_route_registers_project(self) -> None:
+    summary = self.create_demo_project("接口导入")
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 雨夜靠港\n接口导入应该保留章节正文。\n",
+    )
+    export_result = export_project_migration_package(self.settings, summary.id)
+    package_bytes = Path(export_result.path).read_bytes()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=os.name == "nt") as target_data_dir:
+      target_settings = Settings(data_dir=Path(target_data_dir))
+      initialize_app_storage(target_settings)
+      matching_routes = [
+        route
+        for route in project_api_router.routes
+        if getattr(route, "path", "") == "/api/projects/migration/import"
+        and "POST" in (getattr(route, "methods", set()) or set())
+      ]
+      self.assertTrue(matching_routes)
+      self.assertEqual(matching_routes[0].endpoint, post_project_migration_import)
+
+      request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=target_settings, project_history_watcher=None))
+      )
+      payload = asyncio.run(
+        post_project_migration_import(
+          request,
+          ProjectMigrationImportRequest(
+            filename=Path(export_result.path).name,
+            content_base64=base64.b64encode(package_bytes).decode("utf-8"),
+          ),
+        )
+      )
+
+      self.assertTrue(payload["ok"])
+      imported_id = payload["data"]["project"]["id"]
+      imported_detail = get_project_detail(target_settings, imported_id)
+      imported_chapter = next(item for item in imported_detail.chapters if item.id == "chapter-001")
+      self.assertIn("接口导入应该保留章节正文", imported_chapter.content)
+
+  def test_import_project_migration_package_changes_id_when_conflicting(self) -> None:
+    summary = self.create_demo_project("同机导入")
+    self.write_chapter(
+      summary.path,
+      1,
+      "# 第一章 雨夜靠港\n同一台机器重复导入时不能覆盖原项目。\n",
+    )
+    export_result = export_project_migration_package(self.settings, summary.id)
+
+    import_result = import_project_migration_package(
+      self.settings,
+      ProjectMigrationImportRequest(
+        filename=Path(export_result.path).name,
+        content_base64=base64.b64encode(Path(export_result.path).read_bytes()).decode("utf-8"),
+      ),
+    )
+
+    self.assertTrue(import_result.id_changed)
+    self.assertNotEqual(import_result.project.id, summary.id)
+    self.assertTrue(Path(import_result.path).exists())
+    self.assertTrue(Path(summary.path).exists())
+    self.assertEqual(len(list_projects(self.settings)), 2)
 
   def test_import_project_knowledge_updates_library_and_search(self) -> None:
     summary = self.create_demo_project("资料导入")
@@ -1261,6 +2975,9 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertTrue(any("不要太早揭开铜钥匙" in item.content for item in system_memory))
     self.assertTrue(any("白石商会仍处在外围施压阶段" in item.content for item in system_memory))
     self.assertTrue(all(item.promoted_at for item in detail.story_overview.dream_report.memory_candidates))
+    auxiliary_state = json.loads((Path(summary.path) / ".gaoxia" / "auxiliary_tasks.json").read_text(encoding="utf-8"))
+    self.assertEqual(auxiliary_state["tasks"]["humanize_review"]["status"], "pending")
+    self.assertEqual(auxiliary_state["tasks"]["humanize_review"]["reason"], "dream")
 
   def test_story_change_refreshes_dream_report_automatically(self) -> None:
     summary = self.create_demo_project("梦境自动刷新")

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_PYTHON="$ROOT_DIR/.venv/bin/python"
 VENV_PYINSTALLER="$ROOT_DIR/.venv/bin/pyinstaller"
 
 if [[ ! -x "$VENV_PYINSTALLER" ]]; then
@@ -57,15 +58,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$VENV_PYINSTALLER" \
-  --noconfirm \
-  --clean \
-  --onefile \
-  --name novel-backend \
-  "$ROOT_DIR/backend/novel_backend/main.py" \
-  --distpath "$DIST_DIR" \
-  --workpath "$WORK_DIR" \
+PYINSTALLER_ARGS=(
+  --noconfirm
+  --clean
+  --onefile
+  --name novel-backend
+  --distpath "$DIST_DIR"
+  --workpath "$WORK_DIR"
   --specpath "$SPEC_DIR"
+)
+
+if [[ -x "$VENV_PYTHON" ]] && "$VENV_PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('liteparse') else 1)" >/dev/null 2>&1; then
+  PYINSTALLER_ARGS+=(--collect-binaries liteparse --collect-datas liteparse)
+fi
+
+"$VENV_PYINSTALLER" "${PYINSTALLER_ARGS[@]}" "$ROOT_DIR/backend/novel_backend/main.py"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 mv "$DIST_DIR/novel-backend" "$OUTPUT_PATH"

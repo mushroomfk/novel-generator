@@ -9,9 +9,12 @@ from pathlib import Path
 from novel_backend.models import AgentChatRequest, AgentMessage, AgentPlan, AgentPlanAction
 from novel_backend.services.agent_workflow_service import (
   create_agent_workflow_run,
+  agent_workflow_interrupt_message,
   load_agent_workflow_run,
   mark_stale_agent_workflows,
   record_agent_workflow_subtask,
+  request_agent_workflow_interrupt,
+  workflow_summary,
   workflow_path,
 )
 
@@ -89,6 +92,41 @@ class AgentWorkflowServiceTestCase(unittest.TestCase):
     self.assertEqual(len(subtask_files), 1)
     self.assertNotIn(":", subtask_files[0].name)
     self.assertEqual(subtask_files[0].name, "chapter_generate_writer.json")
+
+  def test_subtask_filename_avoids_windows_reserved_names(self) -> None:
+    self._create_stale_run("task-windows-reserved", action_status="RUNNING", age_seconds=1)
+
+    record_agent_workflow_subtask(
+      self.project_dir,
+      "task-windows-reserved",
+      step=1,
+      subtask_id="CON",
+      role="写作 agent",
+      capability="生成候选正文。",
+      status="RUNNING",
+    )
+
+    subtask_files = list((workflow_path(self.project_dir, "task-windows-reserved").parent / "subtasks").glob("*.json"))
+    self.assertEqual(len(subtask_files), 1)
+    self.assertEqual(subtask_files[0].name, "subtask_CON.json")
+
+  def test_interrupt_request_marks_run_cancelling_and_summary_is_recoverable(self) -> None:
+    self._create_stale_run("task-interrupt", action_status="RUNNING", age_seconds=1)
+
+    request_agent_workflow_interrupt(self.project_dir, "task-interrupt", message="作者停止长任务。")
+
+    payload = load_agent_workflow_run(self.project_dir, "task-interrupt")
+    assert payload is not None
+    self.assertEqual(payload["status"], "CANCELLING")
+    self.assertTrue(payload["interrupt_requested"])
+    self.assertEqual(agent_workflow_interrupt_message(self.project_dir, "task-interrupt"), "作者停止长任务。")
+    summary = workflow_summary(self.project_dir, "task-interrupt")
+    self.assertEqual(summary["status"], "CANCELLING")
+    self.assertTrue(summary["interrupt_requested"])
+    self.assertEqual(summary["actions"][0]["status"], "RUNNING")
+    self.assertEqual(summary["actions"][0]["label"], "讨论方向")
+    history_statuses = [item["status"] for item in payload["actions"][0]["status_history"]]
+    self.assertIn("CANCEL_REQUESTED", history_statuses)
 
 
 if __name__ == "__main__":

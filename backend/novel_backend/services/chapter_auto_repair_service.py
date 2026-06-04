@@ -36,9 +36,31 @@ def chapter_review_needs_auto_repair(review_status: dict[str, object], score_thr
     return False
   score = review_status.get("score")
   status = str(review_status.get("status") or "").strip()
+  if _review_status_count(review_status, "must_repair_issue_count") > 0:
+    return True
+  if _review_status_count(review_status, "critical_issue_count") > 0:
+    return True
+  if _review_status_count(review_status, "obsidian_required_issue_count") > 0:
+    return True
+  if _review_status_count(review_status, "obsidian_forbidden_issue_count") > 0:
+    return True
+  if _review_status_count(review_status, "continuity_contract_issue_count") > 0:
+    return True
   if status == "risk":
     return True
   return isinstance(score, int) and score < score_threshold
+
+
+def _review_status_count(review_status: dict[str, object], key: str) -> int:
+  value = review_status.get(key)
+  if isinstance(value, bool):
+    return int(value)
+  if isinstance(value, (int, float)):
+    return int(value)
+  try:
+    return int(str(value or "").strip() or "0")
+  except ValueError:
+    return 0
 
 
 def auto_repair_chapter_after_review(
@@ -217,6 +239,8 @@ def _build_auto_repair_messages(
       f"文风方案：{style_name or '未指定'}",
       f"体验预设：{xp_preset or '未指定'}",
       f"用户要求：{instruction or '按章节核验报告修订。'}",
+      "章节连续性合同：",
+      _auto_repair_continuity_contract(detail, review, instruction=instruction),
       "章节核验报告：",
       _format_review_for_prompt(review),
       "需要修订的正文：",
@@ -227,6 +251,18 @@ def _build_auto_repair_messages(
     {"role": "system", "content": system_prompt},
     {"role": "user", "content": user_prompt},
   ]
+
+
+def _auto_repair_continuity_contract(detail: ProjectDetail, review: ChapterReviewReport, *, instruction: str) -> str:
+  chapter = next((item for item in detail.chapters if item.id == review.chapter_id), None)
+  if chapter is None:
+    return "无"
+  try:
+    from novel_backend.services.continuity_guard_service import build_chapter_continuity_contract
+
+    return build_chapter_continuity_contract(detail, chapter, instruction=instruction or "按章节核验报告修订。")
+  except Exception:
+    return "无"
 
 
 def _format_review_for_prompt(review: ChapterReviewReport) -> str:

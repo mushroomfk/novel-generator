@@ -20,7 +20,7 @@ from novel_backend.models import (
   ModelConfig,
 )
 from novel_backend.services.config_service import initialize_app_storage, save_config
-from novel_backend.services.import_service import extract_import_text, imported_files_to_knowledge_items
+from novel_backend.services.import_service import _format_liteparse_text, extract_import_text, imported_files_to_knowledge_items
 
 
 def _docx_bytes(*paragraphs: str) -> bytes:
@@ -58,6 +58,18 @@ def _pdf_bytes(text: str) -> bytes:
     content += f"{offset:010d} 00000 n \n"
   content += f"trailer\n<< /Root 1 0 R /Size 6 >>\nstartxref\n{xref_offset}\n%%EOF\n"
   return content.encode("latin1")
+
+
+class _LiteParsePageStub:
+  def __init__(self, page_num: int, text: str):
+    self.page_num = page_num
+    self.text = text
+
+
+class _LiteParseResultStub:
+  def __init__(self, *pages: _LiteParsePageStub):
+    self.pages = list(pages)
+    self.text = "\n".join(page.text for page in pages)
 
 
 class ImportServiceTestCase(unittest.TestCase):
@@ -115,6 +127,57 @@ class ImportServiceTestCase(unittest.TestCase):
       content = extract_import_text("档案.pdf", _pdf_bytes("harbor archive"), settings=self.settings)
 
     self.assertIn("harbor archive", content)
+
+  def test_extract_import_text_uses_liteparse_before_pypdf_for_pdf(self) -> None:
+    data = _pdf_bytes("pypdf text")
+    with (
+      patch("novel_backend.services.import_service._extract_pdf_text_with_liteparse", return_value="【第 1 页】\nliteparse text") as liteparse_mock,
+      patch("novel_backend.services.import_service._extract_pdf_text", return_value="pypdf text") as pypdf_mock,
+    ):
+      content = extract_import_text("档案.pdf", data)
+
+    self.assertEqual(content, "【第 1 页】\nliteparse text")
+    liteparse_mock.assert_called_once_with(data, ocr_enabled=False)
+    pypdf_mock.assert_not_called()
+
+  def test_extract_import_text_falls_back_to_pypdf_when_liteparse_fails(self) -> None:
+    data = _pdf_bytes("pypdf text")
+    with (
+      patch("novel_backend.services.import_service._extract_pdf_text_with_liteparse", side_effect=RuntimeError("liteparse unavailable")) as liteparse_mock,
+      patch("novel_backend.services.import_service._extract_pdf_text", return_value="pypdf text") as pypdf_mock,
+    ):
+      content = extract_import_text("档案.pdf", data)
+
+    self.assertEqual(content, "pypdf text")
+    liteparse_mock.assert_called_once_with(data, ocr_enabled=False)
+    pypdf_mock.assert_called_once_with(data)
+
+  def test_extract_import_text_tries_liteparse_ocr_when_pdf_text_is_empty(self) -> None:
+    data = _pdf_bytes("empty")
+    with (
+      patch(
+        "novel_backend.services.import_service._extract_pdf_text_with_liteparse",
+        side_effect=["", "【第 1 页】\nocr text"],
+      ) as liteparse_mock,
+      patch("novel_backend.services.import_service._extract_pdf_text", return_value="") as pypdf_mock,
+    ):
+      content = extract_import_text("扫描档案.pdf", data)
+
+    self.assertEqual(content, "【第 1 页】\nocr text")
+    self.assertEqual(liteparse_mock.call_count, 2)
+    liteparse_mock.assert_any_call(data, ocr_enabled=False)
+    liteparse_mock.assert_any_call(data, ocr_enabled=True)
+    pypdf_mock.assert_called_once_with(data)
+
+  def test_format_liteparse_text_adds_page_markers(self) -> None:
+    content = _format_liteparse_text(
+      _LiteParseResultStub(
+        _LiteParsePageStub(3, "第一行\n\n第二行"),
+        _LiteParsePageStub(4, "第三行"),
+      )
+    )
+
+    self.assertEqual(content, "【第 3 页】\n第一行\n第二行\n\n【第 4 页】\n第三行")
 
   def test_imported_files_to_knowledge_items_rejects_unsupported_suffix(self) -> None:
     payload = ImportedFileBatchRequest(

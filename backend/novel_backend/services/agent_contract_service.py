@@ -8,6 +8,7 @@ from typing import Any
 from novel_backend.config import Settings
 from novel_backend.models import AgentPlan, AgentPlanAction
 from novel_backend.services.config_service import load_config
+from novel_backend.services.obsidian_service import obsidian_note_available_for_chapter
 
 _MODEL_ACTIONS = {
   "brainstorm",
@@ -51,6 +52,14 @@ def _project_dir(runtime: object) -> Path:
 def _chapter_by_id(runtime: object, chapter_id: str):
   detail = getattr(runtime, "detail", None)
   return next((item for item in getattr(detail, "chapters", []) or [] if getattr(item, "id", "") == chapter_id), None)
+
+
+def _chapter_index_for_action(runtime: object, action: AgentPlanAction) -> int:
+  chapter = _chapter_by_id(runtime, action.chapter_id)
+  try:
+    return int(getattr(chapter, "index", 0) or 0)
+  except (TypeError, ValueError):
+    return 0
 
 
 def _project_documents(runtime: object) -> dict[str, str]:
@@ -240,12 +249,26 @@ def evaluate_agent_action_contract(
       )
     )
   if action.kind == "review_knowledge":
-    material_count = len(getattr(getattr(getattr(runtime, "detail", None), "story_overview", None), "materials", []) or [])
+    overview = getattr(getattr(runtime, "detail", None), "story_overview", None)
+    material_count = len(getattr(overview, "materials", []) or [])
+    obsidian = getattr(overview, "obsidian", None)
+    chapter_index = _chapter_index_for_action(runtime, action)
+    if chapter_index > 0:
+      obsidian_count = sum(
+        1
+        for note in list(getattr(obsidian, "notes", []) or [])
+        if obsidian_note_available_for_chapter(note, chapter_index)
+      )
+      source_message = f"第 {chapter_index} 章可用资料数量：{material_count + obsidian_count}"
+    else:
+      obsidian_count = int(getattr(obsidian, "included_count", 0) or 0)
+      source_message = f"资料数量：{material_count + obsidian_count}"
+    source_count = material_count + obsidian_count
     checks.append(
       _check(
         "knowledge_materials",
-        "pass" if material_count else "warning",
-        f"资料数量：{material_count}",
+        "pass" if source_count else "warning",
+        source_message,
         severity="warning",
       )
     )

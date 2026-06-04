@@ -54,6 +54,11 @@ _QWEN_DOC_READY_STATUS = {"processed"}
 _QWEN_DOC_FAILED_STATUS = {"failed", "error", "deleted"}
 _QWEN_DOC_WAIT_SECONDS = 45.0
 _QWEN_DOC_POLL_INTERVAL_SECONDS = 1.0
+_LITEPARSE_OCR_LANGUAGE_ENV = "NOVEL_LITEPARSE_OCR_LANGUAGE"
+
+
+class _LiteParseUnavailable(RuntimeError):
+  pass
 
 
 def _decode_text_bytes(data: bytes) -> str:
@@ -462,6 +467,75 @@ def _extract_pdf_text(data: bytes) -> str:
   return _compact_lines("\n".join(parts).splitlines())
 
 
+def _format_liteparse_text(result: object) -> str:
+  pages = getattr(result, "pages", None)
+  page_sections: list[str] = []
+  if isinstance(pages, list):
+    for fallback_index, page in enumerate(pages, start=1):
+      text = str(getattr(page, "text", "") or "").strip()
+      if not text:
+        continue
+      page_num = getattr(page, "page_num", fallback_index)
+      try:
+        clean_page_num = int(page_num)
+      except (TypeError, ValueError):
+        clean_page_num = fallback_index
+      page_sections.append(f"【第 {clean_page_num} 页】\n{_compact_lines(text.splitlines())}")
+  if page_sections:
+    return "\n\n".join(page_sections).strip()
+
+  text = str(getattr(result, "text", "") or "").strip()
+  return _compact_lines(text.splitlines())
+
+
+def _extract_pdf_text_with_liteparse(data: bytes, *, ocr_enabled: bool = False) -> str:
+  try:
+    from liteparse import LiteParse
+  except ImportError as error:
+    raise _LiteParseUnavailable("LiteParse 未安装") from error
+
+  parser = LiteParse(
+    ocr_enabled=ocr_enabled,
+    ocr_language=os.getenv(_LITEPARSE_OCR_LANGUAGE_ENV, "eng").strip() or "eng",
+    quiet=True,
+  )
+  return _format_liteparse_text(parser.parse(data))
+
+
+def _append_import_log(settings: Settings | None, message: str, *, level: str = "INFO") -> None:
+  if settings is None:
+    return
+  append_app_log(settings, message, level=level)
+
+
+def _extract_pdf_text_local(filename: str, data: bytes, settings: Settings | None = None) -> str:
+  liteparse_available = True
+  try:
+    content = _extract_pdf_text_with_liteparse(data, ocr_enabled=False).strip()
+    if content:
+      _append_import_log(settings, f"liteparse_extract completed for {filename}")
+      return content
+  except _LiteParseUnavailable:
+    liteparse_available = False
+  except Exception as error:
+    _append_import_log(settings, f"liteparse_extract fallback for {filename}: {error}", level="WARNING")
+
+  pypdf_content = _extract_pdf_text(data).strip()
+  if pypdf_content:
+    return pypdf_content
+
+  if liteparse_available:
+    try:
+      content = _extract_pdf_text_with_liteparse(data, ocr_enabled=True).strip()
+      if content:
+        _append_import_log(settings, f"liteparse_ocr_extract completed for {filename}")
+        return content
+    except Exception as error:
+      _append_import_log(settings, f"liteparse_ocr_extract fallback for {filename}: {error}", level="WARNING")
+
+  return pypdf_content
+
+
 def extract_import_text(filename: str, data: bytes, settings: Settings | None = None) -> str:
   suffix = Path(filename).suffix.lower()
   if suffix not in _SUPPORTED_IMPORT_EXTENSIONS:
@@ -478,7 +552,7 @@ def extract_import_text(filename: str, data: bytes, settings: Settings | None = 
   if suffix == ".docx":
     return _extract_docx_text(data)
   if suffix == ".pdf":
-    return _extract_pdf_text(data)
+    return _extract_pdf_text_local(filename, data, settings=settings)
   return _extract_plain_text(filename, data)
 
 

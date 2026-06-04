@@ -14,6 +14,7 @@ import {
   deleteStyle,
   deleteXpPreset,
   getCharacterReplicaProfile,
+  getProjectObsidian,
   getProjectDetail,
   getProjectFileContent,
   getProjectSelfEvolution,
@@ -39,6 +40,17 @@ import {
   saveStyle,
   searchStyleReferences,
   searchProjectKnowledge,
+  confirmProjectObsidianMaintenanceMerge,
+  confirmProjectObsidianMaintenanceMergeBatch,
+  ignoreProjectObsidianMaintenance,
+  ignoreProjectObsidianMaintenanceBatch,
+  publishProjectObsidianMaintenance,
+  publishProjectObsidianMaintenanceBatch,
+  reopenProjectObsidianMaintenance,
+  reopenProjectObsidianMaintenanceBatch,
+  stageProjectObsidianMaintenance,
+  stageProjectObsidianMaintenanceBatch,
+  syncProjectObsidian,
   curateProjectSelfEvolution,
   runProjectSelfEvolutionModelReview,
   runProjectSelfEvolutionRegression,
@@ -64,6 +76,7 @@ import {
   updateProjectChapter,
   updateProjectFileContent,
   updateProjectMemory,
+  updateProjectObsidian,
   updateProjectSelfEvolutionSchedule,
   updateProjectSelfEvolutionDraft,
   updateProjectSelfEvolutionCandidate,
@@ -108,7 +121,7 @@ const skillCatalogSections = ref([...fallbackSkillSections]);
 const selfEvolutionSkill = Object.freeze({
   id: 'self-evolution',
   name: 'Agent 自学习',
-  description: '查看 Agent 任务后的经验候选、调用规则、写作评价和技能统计。',
+  description: '查看 Agent 任务后的经验候选、调用规则、系统学习版文风 / XP、写作评价和技能统计。',
   category: '系统',
   scenes: ['复盘', '技能', '调用规则'],
   badge: '学',
@@ -127,10 +140,51 @@ const selfEvolutionStatusLabels = {
   rejected: '已拒绝',
   archived: '已归档',
 };
+const obsidianMaintenanceStatusOptions = [
+  '全部',
+  '待处理',
+  '自动草稿',
+  '已保存草稿',
+  '人工改动草稿',
+  '保留人工草稿',
+  '草稿缺失',
+  'Vault 笔记缺失',
+  'Vault 笔记已移动',
+  'Vault 笔记待更新',
+  '已发布',
+  '已忽略',
+];
 const selfEvolutionKindLabels = {
   memory: '记忆',
   skill: '技能',
   capability: '调用能力',
+};
+const styleXpRuleKindLabels = {
+  style: '文风',
+  xp: 'XP',
+};
+const styleXpRuleStatusLabels = {
+  observed: '观察中',
+  active: '已生效',
+};
+const narrativeDebtKindLabels = {
+  foreshadow: '伏笔',
+  promise: '承诺',
+  relationship: '关系',
+  world_rule: '规则',
+};
+const narrativeDebtStatusLabels = {
+  open: '待处理',
+  touched: '已推进',
+  paid: '已兑现',
+  conflict: '有冲突',
+  deferred: '延后',
+};
+const narrativeRiskLabels = {
+  critical: '严重',
+  high: '高',
+  medium: '中',
+  low: '低',
 };
 const selfEvolutionDraftKindLabels = {
   memory: '项目记忆',
@@ -273,6 +327,22 @@ const knowledgeForm = reactive({
 
 const knowledgeHits = ref([]);
 
+const obsidianForm = reactive({
+  enabled: false,
+  vaultPath: '',
+  includePatterns: '**/*.md\n**/*.canvas',
+  excludePatterns: '.obsidian/**\n.trash/**\ntemplates/**',
+  allowedStatuses: 'canonical\n正式\n已确认\nactive\npublished\nusable',
+  excludedStatuses: 'draft\n草稿\nprivate\n私密\ndeprecated\n废案\n弃用',
+  includeWithoutStatus: true,
+  requireUsableByAi: false,
+  maxNotes: 2000,
+});
+const obsidianState = ref(null);
+const isObsidianSaving = ref(false);
+const isObsidianFormDirty = ref(false);
+const obsidianStateRequestId = ref(0);
+
 const webResearchForm = reactive({
   query: '',
   limit: 8,
@@ -349,6 +419,20 @@ const selfEvolutionState = reactive({
   isReviewing: false,
   updatingCandidateId: '',
   updatingDraftId: '',
+  obsidianMaintenanceStatusFilter: '全部',
+  obsidianMaintenanceSourceChapter: '',
+  obsidianMaintenanceSuggestionIds: [],
+  obsidianMaintenanceQuery: '',
+  stagingObsidianMaintenanceId: '',
+  stagingAllObsidianMaintenance: false,
+  publishingObsidianMaintenanceId: '',
+  publishingAllObsidianMaintenance: false,
+  confirmingObsidianMaintenanceMergeId: '',
+  confirmingAllObsidianMaintenanceMerges: false,
+  ignoringObsidianMaintenanceId: '',
+  ignoringAllObsidianMaintenance: false,
+  reopeningObsidianMaintenanceId: '',
+  reopeningAllObsidianMaintenance: false,
 });
 
 const selfEvolutionScheduleForm = reactive({
@@ -394,6 +478,225 @@ const selfEvolutionRules = computed(() => {
   return Array.isArray(rules) ? rules : [];
 });
 
+const selfEvolutionStyleXpState = computed(() => selfEvolutionState.data?.style_xp_evolution ?? {});
+const selfEvolutionStyleXpRules = computed(() => {
+  const rules = selfEvolutionStyleXpState.value?.rules;
+  return Array.isArray(rules) ? rules : [];
+});
+const activeSelfEvolutionStyleXpRules = computed(() => (
+  selfEvolutionStyleXpRules.value.filter((item) => item.status === 'active')
+));
+
+const selfEvolutionNarrativeState = computed(() => selfEvolutionState.data?.narrative_state ?? {});
+const selfEvolutionNarrativeDebts = computed(() => {
+  const debts = selfEvolutionNarrativeState.value?.debts;
+  return Array.isArray(debts) ? debts : [];
+});
+const selfEvolutionObsidianMaintenance = computed(() => {
+  const suggestions = selfEvolutionNarrativeState.value?.obsidian_maintenance_suggestions;
+  return Array.isArray(suggestions) ? suggestions : [];
+});
+const filteredSelfEvolutionObsidianMaintenance = computed(() => {
+  const statusFilter = selfEvolutionState.obsidianMaintenanceStatusFilter;
+  const sourceChapter = Number(selfEvolutionState.obsidianMaintenanceSourceChapter || 0);
+  const suggestionIds = new Set(
+    Array.isArray(selfEvolutionState.obsidianMaintenanceSuggestionIds)
+      ? selfEvolutionState.obsidianMaintenanceSuggestionIds.map((item) => String(item ?? '').trim()).filter(Boolean)
+      : [],
+  );
+  const query = selfEvolutionState.obsidianMaintenanceQuery.trim().toLowerCase();
+  return selfEvolutionObsidianMaintenance.value.filter((item) => {
+    if (statusFilter !== '全部' && obsidianMaintenanceStatusLabel(item) !== statusFilter) {
+      return false;
+    }
+    if (sourceChapter > 0 && !obsidianMaintenanceSourceChapters(item).includes(sourceChapter)) {
+      return false;
+    }
+    if (suggestionIds.size > 0 && !suggestionIds.has(String(item.id ?? '').trim())) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    const haystack = [
+      item.title,
+      item.reason,
+      item.action,
+      item.kind,
+      item.priority,
+      item.id,
+      item.suggested_path,
+      item.draft_path,
+      item.vault_relative_path,
+      Array.isArray(item.source_chapters) ? item.source_chapters.join(' ') : '',
+    ].join(' ').toLowerCase();
+    return haystack.includes(query);
+  });
+});
+const filteredSelfEvolutionObsidianPublishable = computed(() => (
+  filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canPublishObsidianMaintenanceInBatch(item))
+));
+const filteredSelfEvolutionObsidianMergeConfirmable = computed(() => (
+  filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canConfirmObsidianMaintenanceMergeInBatch(item))
+));
+const filteredSelfEvolutionObsidianIgnorable = computed(() => (
+  filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canIgnoreObsidianMaintenanceInBatch(item))
+));
+const filteredSelfEvolutionObsidianReopenable = computed(() => (
+  filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canReopenObsidianMaintenanceInBatch(item))
+));
+const hasSelfEvolutionObsidianMaintenanceFilters = computed(() => {
+  const statusFilter = selfEvolutionState.obsidianMaintenanceStatusFilter;
+  const sourceChapter = Number(selfEvolutionState.obsidianMaintenanceSourceChapter || 0);
+  const suggestionIds = Array.isArray(selfEvolutionState.obsidianMaintenanceSuggestionIds)
+    ? selfEvolutionState.obsidianMaintenanceSuggestionIds.filter((item) => String(item ?? '').trim())
+    : [];
+  const query = selfEvolutionState.obsidianMaintenanceQuery.trim();
+  return statusFilter !== '全部' || sourceChapter > 0 || suggestionIds.length > 0 || Boolean(query);
+});
+const obsidianMaintenanceArtifactFilterCount = computed(() => (
+  Array.isArray(selfEvolutionState.obsidianMaintenanceSuggestionIds)
+    ? selfEvolutionState.obsidianMaintenanceSuggestionIds.filter((item) => String(item ?? '').trim()).length
+    : 0
+));
+const selfEvolutionObsidianMaintenanceSummary = computed(() => {
+  if (!hasSelfEvolutionObsidianMaintenanceFilters.value) {
+    const summary = selfEvolutionNarrativeState.value?.obsidian_maintenance_summary;
+    if (summary && typeof summary === 'object') {
+      return summary;
+    }
+  }
+  return buildSelfEvolutionObsidianMaintenanceSummary(filteredSelfEvolutionObsidianMaintenance.value);
+});
+
+function obsidianMaintenanceStatusKey(item) {
+  return item?.draft_missing
+    ? 'draft_missing'
+    : item?.published_missing
+      ? 'published_missing'
+      : item?.published_outdated
+        ? 'published_outdated'
+        : item?.status || 'open';
+}
+
+function buildSelfEvolutionObsidianMaintenanceSummary(items) {
+  const byStatus = {
+    open: 0,
+    staged: 0,
+    published: 0,
+    draft_missing: 0,
+    published_missing: 0,
+    published_outdated: 0,
+    vault_moved: 0,
+    ignored: 0,
+  };
+  let highPriority = 0;
+  let autoStaged = 0;
+  items.forEach((item) => {
+    const status = obsidianMaintenanceStatusKey(item);
+    if (Object.prototype.hasOwnProperty.call(byStatus, status)) {
+      byStatus[status] += 1;
+    }
+    if (item.vault_moved) {
+      byStatus.vault_moved += 1;
+    }
+    if (item.priority === 'high') {
+      highPriority += 1;
+    }
+    if (item.auto_staged) {
+      autoStaged += 1;
+    }
+  });
+  return {
+    total: items.length,
+    needs_action: byStatus.open + byStatus.staged + byStatus.draft_missing + byStatus.published_missing + byStatus.published_outdated,
+    high_priority: highPriority,
+    auto_staged: autoStaged,
+    by_status: byStatus,
+  };
+}
+const highRiskNarrativeDebts = computed(() => (
+  selfEvolutionNarrativeDebts.value.filter((item) => ['critical', 'high'].includes(item.risk_level))
+));
+const selfEvolutionCharacterArcs = computed(() => {
+  const arcs = selfEvolutionNarrativeState.value?.character_arcs;
+  return Array.isArray(arcs) ? arcs : [];
+});
+const selfEvolutionChapterCards = computed(() => {
+  const cards = selfEvolutionNarrativeState.value?.chapter_cards;
+  return Array.isArray(cards) ? cards : [];
+});
+const latestChapterCard = computed(() => (
+  selfEvolutionChapterCards.value[selfEvolutionChapterCards.value.length - 1] ?? null
+));
+const latestChapterCardObsidianSources = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_sources)
+));
+const latestChapterCardObsidianExternalReferences = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_external_references)
+));
+const latestChapterCardObsidianRequired = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_required)
+));
+const latestChapterCardObsidianForbidden = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_forbidden)
+));
+const latestChapterCardObsidianRisks = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_risks)
+));
+const latestChapterCardObsidianSatisfied = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_required_satisfied)
+));
+const latestChapterCardObsidianMissing = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_required_missing)
+));
+const latestChapterCardObsidianViolations = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_forbidden_violations)
+));
+const latestChapterCardObsidianNarrativeDebts = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_narrative_debts)
+    .map(formatObsidianNarrativeDebt)
+    .filter(Boolean)
+));
+const latestChapterCardObsidianCharacterArcs = computed(() => (
+  previewListItems(latestChapterCard.value?.obsidian_character_arcs)
+    .map(formatObsidianCharacterArc)
+    .filter(Boolean)
+));
+const latestChapterCardHasObsidian = computed(() => (
+  latestChapterCardObsidianSources.value.length > 0
+    || latestChapterCardObsidianExternalReferences.value.length > 0
+    || latestChapterCardObsidianRequired.value.length > 0
+    || latestChapterCardObsidianForbidden.value.length > 0
+    || latestChapterCardObsidianRisks.value.length > 0
+    || latestChapterCardObsidianSatisfied.value.length > 0
+    || latestChapterCardObsidianMissing.value.length > 0
+    || latestChapterCardObsidianViolations.value.length > 0
+    || latestChapterCardObsidianNarrativeDebts.value.length > 0
+    || latestChapterCardObsidianCharacterArcs.value.length > 0
+));
+const selfEvolutionNarrativeModelReviews = computed(() => {
+  const reviews = selfEvolutionNarrativeState.value?.model_reviews;
+  return Array.isArray(reviews) ? reviews : [];
+});
+const selfEvolutionChapterContracts = computed(() => {
+  const contracts = selfEvolutionNarrativeState.value?.chapter_contracts;
+  return Array.isArray(contracts) ? contracts : [];
+});
+const selfEvolutionContractReviews = computed(() => {
+  const reviews = selfEvolutionNarrativeState.value?.contract_reviews;
+  return Array.isArray(reviews) ? reviews : [];
+});
+const latestNarrativeModelReview = computed(() => (
+  selfEvolutionNarrativeModelReviews.value[selfEvolutionNarrativeModelReviews.value.length - 1] ?? null
+));
+const latestChapterContract = computed(() => (
+  selfEvolutionChapterContracts.value[selfEvolutionChapterContracts.value.length - 1] ?? null
+));
+const latestContractReview = computed(() => (
+  selfEvolutionContractReviews.value[selfEvolutionContractReviews.value.length - 1] ?? null
+));
+
 const selfEvolutionEvaluations = computed(() => {
   const evaluations = selfEvolutionState.data?.writing_evaluations;
   return Array.isArray(evaluations) ? evaluations : [];
@@ -425,6 +728,7 @@ const selfEvolutionModelReviews = computed(() => {
 
 const selfEvolutionDashboard = computed(() => selfEvolutionState.data?.dashboard ?? {});
 const selfEvolutionSchedule = computed(() => selfEvolutionState.data?.schedule ?? {});
+const selfEvolutionHumanizePatrol = computed(() => selfEvolutionState.data?.humanize_review_patrol ?? {});
 const selfEvolutionFailureCases = computed(() => {
   const cases = selfEvolutionState.data?.failure_cases;
   return Array.isArray(cases) ? cases : [];
@@ -432,6 +736,8 @@ const selfEvolutionFailureCases = computed(() => {
 const selfEvolutionQualityDimensions = computed(() => selfEvolutionDashboard.value.quality_dimensions ?? {});
 const selfEvolutionWritingTrend = computed(() => selfEvolutionDashboard.value.trends?.writing_scores ?? []);
 const selfEvolutionRegressionTrend = computed(() => selfEvolutionDashboard.value.trends?.regression_scores ?? []);
+const selfEvolutionHumanizeAbTrend = computed(() => selfEvolutionDashboard.value.trends?.humanize_ab_scores ?? []);
+const selfEvolutionHumanizeJudgeTrend = computed(() => selfEvolutionDashboard.value.trends?.humanize_judge_scores ?? []);
 const selfEvolutionFailureGroups = computed(() => {
   const groups = selfEvolutionDashboard.value.failure_case_groups;
   return Array.isArray(groups) ? groups : [];
@@ -440,6 +746,9 @@ const selfEvolutionFailureGroups = computed(() => {
 const selfEvolutionMetrics = computed(() => [
   { label: '候选', value: selfEvolutionCandidates.value.length },
   { label: '调用规则', value: selfEvolutionRules.value.length },
+  { label: '文风 / XP', value: activeSelfEvolutionStyleXpRules.value.length },
+  { label: '剧情债务', value: highRiskNarrativeDebts.value.length },
+  { label: '章节合同', value: selfEvolutionChapterContracts.value.length },
   { label: '写作评价', value: selfEvolutionEvaluations.value.length },
   { label: '待确认草案', value: pendingSelfEvolutionDrafts.value.length },
 ]);
@@ -483,41 +792,89 @@ const currentProjectLine = computed(() => {
 });
 
 const defaultSkillBehaviorById = {
+  brainstorm: {
+    panel: 'brainstorm',
+    agent_action_kind: 'brainstorm',
+    agent_requires_confirmation: false,
+  },
+  blueprint: {
+    panel: 'blueprint',
+    agent_action_kind: 'generate_architecture',
+    agent_requires_confirmation: true,
+  },
+  'continue-project': {
+    panel: 'continue-project',
+    agent_action_kind: 'continue_project',
+    agent_requires_confirmation: true,
+  },
+  consistency: {
+    panel: 'consistency',
+    agent_action_kind: 'consistency_check',
+    agent_requires_confirmation: false,
+  },
+  'knowledge-search': {
+    panel: 'knowledge-search',
+    agent_action_kind: 'review_knowledge',
+    agent_requires_confirmation: false,
+  },
   'chapter-scenes': {
     panel: 'chapter-workflow',
     mode: 'scenes',
     input_label: '拆场要求',
     submit_label: '开始拆场',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'scenes',
+    agent_requires_confirmation: false,
   },
   'chapter-diagnose': {
     panel: 'chapter-workflow',
     mode: 'diagnose',
     input_label: '诊断要求',
     submit_label: '开始诊断',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'diagnose',
+    agent_requires_confirmation: false,
+  },
+  'chapter-generate': {
+    panel: 'chapter-generate',
+    agent_action_kind: 'chapter_generate',
+    agent_requires_confirmation: true,
   },
   'chapter-draft': {
     panel: 'chapter-workflow',
     mode: 'draft',
     input_label: '续写要求',
     submit_label: '开始续写',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'draft',
+    agent_requires_confirmation: true,
   },
   'chapter-finalize': {
     panel: 'chapter-rewrite',
     mode: 'finalize',
     input_label: '改稿要求',
     submit_label: '开始定稿',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'finalize',
+    agent_requires_confirmation: true,
   },
   'chapter-polish': {
     panel: 'chapter-rewrite',
     mode: 'polish',
     input_label: '改稿要求',
     submit_label: '开始润色',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'polish',
+    agent_requires_confirmation: true,
   },
   'chapter-humanize': {
     panel: 'chapter-rewrite',
     mode: 'humanize',
     input_label: '改稿要求',
     submit_label: '开始去 AI',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'humanize',
+    agent_requires_confirmation: true,
   },
 };
 
@@ -552,6 +909,9 @@ function normalizeSkillBehavior(skill) {
       mode: '',
       input_label: '',
       submit_label: '',
+      agent_action_kind: '',
+      agent_action_mode: '',
+      agent_requires_confirmation: false,
     };
   }
 
@@ -562,6 +922,11 @@ function normalizeSkillBehavior(skill) {
     mode: behavior.mode || fallback.mode || '',
     input_label: behavior.input_label || fallback.input_label || '',
     submit_label: behavior.submit_label || fallback.submit_label || '',
+    agent_action_kind: behavior.agent_action_kind || fallback.agent_action_kind || '',
+    agent_action_mode: behavior.agent_action_mode || fallback.agent_action_mode || '',
+    agent_requires_confirmation: Boolean(
+      behavior.agent_requires_confirmation ?? fallback.agent_requires_confirmation ?? false,
+    ),
   };
 }
 
@@ -755,6 +1120,26 @@ function prefillToolFromLaunch(tool, prompt) {
   }
 }
 
+function applySelfEvolutionLaunchFilters(request) {
+  if (request?.skillId !== 'self-evolution') {
+    return;
+  }
+  const statusFilter = String(request.obsidianMaintenanceStatusFilter ?? '').trim();
+  if (obsidianMaintenanceStatusOptions.includes(statusFilter)) {
+    selfEvolutionState.obsidianMaintenanceStatusFilter = statusFilter;
+  }
+  const sourceChapter = Number(request.obsidianMaintenanceSourceChapter ?? 0);
+  selfEvolutionState.obsidianMaintenanceSourceChapter = sourceChapter > 0 ? String(sourceChapter) : '';
+  selfEvolutionState.obsidianMaintenanceSuggestionIds = Array.isArray(request.obsidianMaintenanceSuggestionIds)
+    ? request.obsidianMaintenanceSuggestionIds.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : [];
+  selfEvolutionState.obsidianMaintenanceQuery = String(request.obsidianMaintenanceQuery ?? '').trim();
+}
+
+function clearObsidianMaintenanceArtifactFilter() {
+  selfEvolutionState.obsidianMaintenanceSuggestionIds = [];
+}
+
 function handleLaunchRequest(request) {
   if (!request?.skillId) {
     return;
@@ -766,8 +1151,13 @@ function handleLaunchRequest(request) {
   activeFilter.value = '全部';
   keyword.value = '';
   prefillToolFromLaunch(tool, request.prompt);
+  applySelfEvolutionLaunchFilters(request);
   activateTool(tool);
-  setToolMessage(request.prompt?.trim() ? '已从主对话带入本轮要求' : '已切到技能工作区');
+  setToolMessage(
+    request.source === 'obsidian-maintenance-artifact'
+      ? '已打开 Obsidian 维护队列'
+      : request.prompt?.trim() ? '已从主对话带入当前要求' : '已打开技能工作区',
+  );
 }
 
 const currentProgress = computed(() => (
@@ -783,6 +1173,47 @@ const currentReaderChapter = computed(() => (
 
 const availableStyles = computed(() => styleState.list);
 const availableXpPresets = computed(() => xpPresetState.list);
+const activeObsidianState = computed(() => (
+  obsidianState.value
+  ?? props.project?.story_overview?.obsidian
+  ?? null
+));
+const obsidianNotesPreview = computed(() => (
+  (activeObsidianState.value?.notes ?? []).slice(0, 8)
+));
+
+function obsidianChapterScope(item) {
+  const start = Number(item?.chapter_start ?? 0);
+  const end = Number(item?.chapter_end ?? 0);
+  const revealAfter = Number(item?.reveal_after_chapter ?? 0);
+  const parts = [];
+  if (start && end) {
+    parts.push(start === end ? `适用章节：第 ${start} 章` : `适用章节：第 ${start}-${end} 章`);
+  } else if (start) {
+    parts.push(`适用章节：第 ${start} 章起`);
+  } else if (end) {
+    parts.push(`适用章节：第 ${end} 章前`);
+  }
+  if (revealAfter) {
+    parts.push(`剧透边界：第 ${revealAfter} 章后可用`);
+  }
+  return parts.join('；');
+}
+
+function obsidianNoteSourceChapterText(item) {
+  const values = Array.isArray(item?.source_chapters) ? item.source_chapters : [];
+  const indexes = [];
+  for (const value of values) {
+    const chapterIndex = Number(value || 0);
+    if (Number.isInteger(chapterIndex) && chapterIndex > 0 && !indexes.includes(chapterIndex)) {
+      indexes.push(chapterIndex);
+    }
+  }
+  if (!indexes.length) {
+    return '';
+  }
+  return `来源章节：${indexes.map((index) => `第 ${index} 章`).join('、')}`;
+}
 
 function resetToolRunState() {
   isToolRunning.value = false;
@@ -895,6 +1326,112 @@ function selfEvolutionKindLabel(kind) {
   return selfEvolutionKindLabels[kind] ?? kind ?? '候选';
 }
 
+function styleXpRuleKindLabel(kind) {
+  return styleXpRuleKindLabels[kind] ?? kind ?? '规则';
+}
+
+function styleXpRuleStatusLabel(status) {
+  return styleXpRuleStatusLabels[status] ?? status ?? '未知';
+}
+
+function narrativeDebtKindLabel(kind) {
+  return narrativeDebtKindLabels[kind] ?? kind ?? '线索';
+}
+
+function narrativeDebtStatusLabel(status) {
+  return narrativeDebtStatusLabels[status] ?? status ?? '未知';
+}
+
+function narrativeRiskLabel(risk) {
+  return narrativeRiskLabels[risk] ?? risk ?? '未知';
+}
+
+function obsidianMaintenanceStatusLabel(item) {
+  const status = item?.status ?? 'open';
+  if (status === 'draft_missing' || item?.draft_missing) {
+    return '草稿缺失';
+  }
+  if (status === 'published_missing' || item?.published_missing) {
+    return 'Vault 笔记缺失';
+  }
+  if (status === 'published_outdated' || item?.published_outdated) {
+    return 'Vault 笔记待更新';
+  }
+  if (item?.vault_moved) {
+    return 'Vault 笔记已移动';
+  }
+  if (status === 'published') {
+    return '已发布';
+  }
+  if (status === 'ignored') {
+    return '已忽略';
+  }
+  if (status === 'staged' && item?.preserved_existing_draft) {
+    return '保留人工草稿';
+  }
+  if (status === 'staged' && item?.manual_draft_edits) {
+    return '人工改动草稿';
+  }
+  if (status === 'staged' && item?.auto_staged) {
+    return '自动草稿';
+  }
+  if (status === 'staged') {
+    return '已保存草稿';
+  }
+  if (status === 'open') {
+    return '待处理';
+  }
+  return status || '待处理';
+}
+
+function obsidianMaintenanceSourceChapters(item) {
+  const values = Array.isArray(item?.source_chapters) ? item.source_chapters : [];
+  const indexes = [];
+  for (const value of values) {
+    const chapterIndex = Number(value || 0);
+    if (Number.isInteger(chapterIndex) && chapterIndex > 0 && !indexes.includes(chapterIndex)) {
+      indexes.push(chapterIndex);
+    }
+  }
+  return indexes;
+}
+
+function obsidianMaintenanceSourceChapterText(item) {
+  const indexes = obsidianMaintenanceSourceChapters(item);
+  if (!indexes.length) {
+    return '';
+  }
+  return `来源章节：${indexes.map((index) => `第 ${index} 章`).join('、')}`;
+}
+
+function canPublishObsidianMaintenanceInBatch(item) {
+  if (!item?.draft_path) {
+    return false;
+  }
+  if (item?.merge_draft_path) {
+    return false;
+  }
+  return [
+    '自动草稿',
+    '已保存草稿',
+    '人工改动草稿',
+    '保留人工草稿',
+    'Vault 笔记缺失',
+  ].includes(obsidianMaintenanceStatusLabel(item));
+}
+
+function canConfirmObsidianMaintenanceMergeInBatch(item) {
+  return Boolean(item?.merge_draft_path);
+}
+
+function canIgnoreObsidianMaintenanceInBatch(item) {
+  return !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item));
+}
+
+function canReopenObsidianMaintenanceInBatch(item) {
+  return obsidianMaintenanceStatusLabel(item) === '已忽略';
+}
+
 function selfEvolutionDraftKindLabel(kind) {
   return selfEvolutionDraftKindLabels[kind] ?? kind ?? '草案';
 }
@@ -914,12 +1451,52 @@ function previewListItems(value) {
   return Array.isArray(value) ? value.filter((item) => String(item ?? '').trim()) : [];
 }
 
+function formatObsidianNarrativeDebt(item) {
+  if (!item || typeof item !== 'object') {
+    return String(item ?? '').trim();
+  }
+  const title = String(item.title || '剧情债务').trim();
+  const content = String(item.content || '').trim();
+  const range = Array.isArray(item.expected_payoff_range) ? item.expected_payoff_range : [];
+  const rangeText = range.length >= 2 ? `（预计第 ${range[0]}-${range[1]} 章处理）` : '';
+  return `${title}${content ? `：${content}` : ''}${rangeText}`.trim();
+}
+
+function formatObsidianCharacterArc(item) {
+  if (!item || typeof item !== 'object') {
+    return String(item ?? '').trim();
+  }
+  const name = String(item.name || item.title || '人物弧线').trim();
+  const state = String(item.current_state || '').trim();
+  const check = String(item.required_next_check || '').trim();
+  const detail = [state, check].filter(Boolean).join('；');
+  return `${name}${detail ? `：${detail}` : ''}`.trim();
+}
+
 function percentLabel(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
     return '0%';
   }
   return `${Math.round(Math.max(0, Math.min(numeric, 1)) * 100)}%`;
+}
+
+function humanizeSampleIssueText(sample) {
+  const issues = Array.isArray(sample?.top_issues) ? sample.top_issues : [];
+  const labels = issues
+    .map((item) => String(item?.label || '').trim())
+    .filter(Boolean)
+    .slice(0, 2);
+  return labels.length ? labels.join('、') : '未标注';
+}
+
+function humanizeJudgeIssueText(issue) {
+  if (!issue || typeof issue !== 'object') {
+    return String(issue ?? '').trim();
+  }
+  const title = String(issue.title || issue.label || '去 AI 问题').trim();
+  const detail = String(issue.detail || issue.evidence || '').trim();
+  return `${title}${detail ? `：${detail}` : ''}`.trim();
 }
 
 function syncSelfEvolutionScheduleForm(schedule) {
@@ -931,24 +1508,375 @@ function syncSelfEvolutionScheduleForm(schedule) {
   selfEvolutionScheduleForm.tasks.model_review = tasks.includes('model_review');
 }
 
-async function refreshSelfEvolutionState({ silent = false } = {}) {
+function applySelfEvolutionState(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return false;
+  }
+  selfEvolutionState.data = payload;
+  syncSelfEvolutionScheduleForm(payload?.schedule);
+  return true;
+}
+
+async function refreshSelfEvolutionState({ silent = false, exposeError = true } = {}) {
   if (!props.project?.id) {
     selfEvolutionState.data = null;
-    toolError.value = '先在左侧打开一部作品';
-    return;
+    const message = '先在左侧打开一部作品';
+    if (exposeError) {
+      toolError.value = message;
+    }
+    return message;
   }
 
   selfEvolutionState.isLoading = true;
   try {
-    selfEvolutionState.data = await getProjectSelfEvolution(props.project.id);
-    syncSelfEvolutionScheduleForm(selfEvolutionState.data?.schedule);
+    applySelfEvolutionState(await getProjectSelfEvolution(props.project.id));
     if (!silent) {
       setToolMessage('自学习状态已刷新');
     }
+    return '';
   } catch (error) {
-    toolError.value = error instanceof Error ? error.message : '读取自学习状态失败';
+    const message = error instanceof Error ? error.message : '读取自学习状态失败';
+    if (exposeError) {
+      toolError.value = message;
+    }
+    return message;
   } finally {
     selfEvolutionState.isLoading = false;
+  }
+}
+
+async function refreshAfterObsidianMaintenance({
+  obsidian = false,
+  projectDetail = true,
+  selfEvolution = null,
+  selfEvolutionError = '',
+} = {}) {
+  const refreshErrors = [];
+  if (selfEvolution) {
+    applySelfEvolutionState(selfEvolution);
+  } else {
+    const stateError = await refreshSelfEvolutionState({ silent: true, exposeError: false });
+    if (stateError) {
+      refreshErrors.push(`自学习状态刷新失败：${stateError}`);
+    }
+  }
+  if (selfEvolutionError) {
+    refreshErrors.push(`自学习状态刷新失败：${selfEvolutionError}`);
+  }
+  if (obsidian) {
+    await refreshObsidianState();
+  }
+  if (projectDetail) {
+    try {
+      await refreshProjectDetail();
+    } catch (error) {
+      refreshErrors.push(`作品详情刷新失败：${error instanceof Error ? error.message : '作品详情刷新失败'}`);
+    }
+  }
+  return refreshErrors.join('；');
+}
+
+function obsidianMaintenanceRefreshPayload(response, options = {}) {
+  return stateChangingActionRefreshPayload(response, options);
+}
+
+function stateChangingActionRefreshPayload(response, options = {}) {
+  return {
+    ...options,
+    selfEvolution: response?.selfEvolution ?? null,
+    selfEvolutionError: response?.selfEvolutionError ?? '',
+  };
+}
+
+async function refreshAfterSelfEvolutionAction(response) {
+  return refreshAfterObsidianMaintenance(stateChangingActionRefreshPayload(response, { projectDetail: false }));
+}
+
+function refreshFailureText(refreshError) {
+  return refreshError ? `；${refreshError}` : '';
+}
+
+async function stageObsidianMaintenanceSuggestion(item) {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    toolError.value = '维护建议缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.stagingObsidianMaintenanceId = suggestionId;
+  try {
+    const response = await stageProjectObsidianMaintenance(props.project.id, suggestionId);
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const draftPath = result?.relative_path || '项目草稿目录';
+    const refreshText = refreshFailureText(refreshError);
+    if (result?.preserved_existing_draft) {
+      setToolMessage(`Obsidian 已保留原有草稿：${draftPath}${refreshText}`);
+    } else if (result?.merge_draft_relative_path) {
+      setToolMessage(`Obsidian 草稿已保存：${draftPath}；Vault 合并草稿：${result.merge_draft_relative_path}${refreshText}`);
+    } else {
+      setToolMessage(`Obsidian 草稿已保存：${draftPath}${refreshText}`);
+    }
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 草稿保存失败';
+  } finally {
+    selfEvolutionState.stagingObsidianMaintenanceId = '';
+  }
+}
+
+async function stageVisibleObsidianMaintenanceSuggestions() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionIds = filteredSelfEvolutionObsidianMaintenance.value
+    .filter((item) => item?.draft_markdown)
+    .filter((item) => !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item)))
+    .map((item) => String(item?.id ?? '').trim())
+    .filter(Boolean);
+  if (!suggestionIds.length) {
+    toolError.value = '当前筛选结果没有可保存的 Obsidian 草稿';
+    return;
+  }
+
+  selfEvolutionState.stagingAllObsidianMaintenance = true;
+  try {
+    const response = await stageProjectObsidianMaintenanceBatch(props.project.id, {
+      suggestion_ids: suggestionIds,
+      limit: suggestionIds.length,
+    });
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const mergeCount = Number(result?.merge_draft_count ?? 0);
+    const mergeText = mergeCount > 0 ? `，生成 Vault 合并草稿 ${mergeCount} 份` : '';
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 草稿已批量保存 ${result?.staged_count ?? 0} 条，跳过 ${result?.skipped_count ?? 0} 条${mergeText}${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 草稿批量保存失败';
+  } finally {
+    selfEvolutionState.stagingAllObsidianMaintenance = false;
+  }
+}
+
+async function publishObsidianMaintenanceSuggestion(item) {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    toolError.value = '维护建议缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.publishingObsidianMaintenanceId = suggestionId;
+  try {
+    const response = await publishProjectObsidianMaintenance(props.project.id, suggestionId);
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { obsidian: true }));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 笔记已发布：${result?.vault_relative_path || result?.relative_path || 'Vault'}${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 笔记发布失败';
+  } finally {
+    selfEvolutionState.publishingObsidianMaintenanceId = '';
+  }
+}
+
+async function confirmObsidianMaintenanceMerge(item) {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    toolError.value = '维护建议缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.confirmingObsidianMaintenanceMergeId = suggestionId;
+  try {
+    const response = await confirmProjectObsidianMaintenanceMerge(props.project.id, suggestionId);
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { obsidian: true }));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 合并状态已确认：${result?.vault_relative_path || 'Vault'}${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 合并确认失败';
+  } finally {
+    selfEvolutionState.confirmingObsidianMaintenanceMergeId = '';
+  }
+}
+
+async function confirmVisibleObsidianMaintenanceMerges() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionIds = filteredSelfEvolutionObsidianMergeConfirmable.value
+    .map((item) => String(item?.id ?? '').trim())
+    .filter(Boolean);
+  if (!suggestionIds.length) {
+    toolError.value = '当前筛选结果没有可确认的 Vault 合并项';
+    return;
+  }
+
+  selfEvolutionState.confirmingAllObsidianMaintenanceMerges = true;
+  try {
+    const response = await confirmProjectObsidianMaintenanceMergeBatch(props.project.id, {
+      suggestion_ids: suggestionIds,
+      limit: suggestionIds.length,
+    });
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { obsidian: true }));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 合并状态已批量确认 ${result?.confirmed_count ?? 0} 条，跳过 ${result?.skipped_count ?? 0} 条${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 合并批量确认失败';
+  } finally {
+    selfEvolutionState.confirmingAllObsidianMaintenanceMerges = false;
+  }
+}
+
+async function publishVisibleObsidianMaintenanceSuggestions() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionIds = filteredSelfEvolutionObsidianPublishable.value
+    .map((item) => String(item?.id ?? '').trim())
+    .filter(Boolean);
+  if (!suggestionIds.length) {
+    toolError.value = '当前筛选结果没有可发布的已保存 Obsidian 草稿';
+    return;
+  }
+
+  selfEvolutionState.publishingAllObsidianMaintenance = true;
+  try {
+    const response = await publishProjectObsidianMaintenanceBatch(props.project.id, {
+      suggestion_ids: suggestionIds,
+      limit: suggestionIds.length,
+    });
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { obsidian: true }));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 笔记已批量发布 ${result?.published_count ?? 0} 条，跳过 ${result?.skipped_count ?? 0} 条${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 笔记批量发布失败';
+  } finally {
+    selfEvolutionState.publishingAllObsidianMaintenance = false;
+  }
+}
+
+async function ignoreObsidianMaintenanceSuggestion(item) {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    toolError.value = '维护建议缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.ignoringObsidianMaintenanceId = suggestionId;
+  try {
+    const response = await ignoreProjectObsidianMaintenance(props.project.id, suggestionId);
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 维护建议已忽略${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 维护建议忽略失败';
+  } finally {
+    selfEvolutionState.ignoringObsidianMaintenanceId = '';
+  }
+}
+
+async function ignoreVisibleObsidianMaintenanceSuggestions() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionIds = filteredSelfEvolutionObsidianIgnorable.value
+    .map((item) => String(item?.id ?? '').trim())
+    .filter(Boolean);
+  if (!suggestionIds.length) {
+    toolError.value = '当前筛选结果没有可忽略的 Obsidian 维护建议';
+    return;
+  }
+
+  selfEvolutionState.ignoringAllObsidianMaintenance = true;
+  try {
+    const response = await ignoreProjectObsidianMaintenanceBatch(props.project.id, {
+      suggestion_ids: suggestionIds,
+      limit: suggestionIds.length,
+    });
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 维护建议已批量忽略 ${result?.ignored_count ?? 0} 条，跳过 ${result?.skipped_count ?? 0} 条${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 维护建议批量忽略失败';
+  } finally {
+    selfEvolutionState.ignoringAllObsidianMaintenance = false;
+  }
+}
+
+async function reopenObsidianMaintenanceSuggestion(item) {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    toolError.value = '维护建议缺少 ID';
+    return;
+  }
+
+  selfEvolutionState.reopeningObsidianMaintenanceId = suggestionId;
+  try {
+    const response = await reopenProjectObsidianMaintenance(props.project.id, suggestionId);
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 维护建议已恢复处理${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 维护建议恢复失败';
+  } finally {
+    selfEvolutionState.reopeningObsidianMaintenanceId = '';
+  }
+}
+
+async function reopenVisibleObsidianMaintenanceSuggestions() {
+  if (!props.project?.id) {
+    toolError.value = '先在左侧打开一部作品';
+    return;
+  }
+  const suggestionIds = filteredSelfEvolutionObsidianReopenable.value
+    .map((item) => String(item?.id ?? '').trim())
+    .filter(Boolean);
+  if (!suggestionIds.length) {
+    toolError.value = '当前筛选结果没有可恢复的 Obsidian 维护建议';
+    return;
+  }
+
+  selfEvolutionState.reopeningAllObsidianMaintenance = true;
+  try {
+    const response = await reopenProjectObsidianMaintenanceBatch(props.project.id, {
+      suggestion_ids: suggestionIds,
+      limit: suggestionIds.length,
+    });
+    const result = response?.data ?? {};
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response));
+    const refreshText = refreshFailureText(refreshError);
+    setToolMessage(`Obsidian 维护建议已批量恢复 ${result?.reopened_count ?? 0} 条，跳过 ${result?.skipped_count ?? 0} 条${refreshText}`);
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : 'Obsidian 维护建议批量恢复失败';
+  } finally {
+    selfEvolutionState.reopeningAllObsidianMaintenance = false;
   }
 }
 
@@ -970,9 +1898,9 @@ async function updateSelfEvolutionCandidateStatus(candidate, status) {
 
   selfEvolutionState.updatingCandidateId = candidateId;
   try {
-    await updateProjectSelfEvolutionCandidate(props.project.id, candidateId, { status });
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage(`候选状态已改为${selfEvolutionStatusLabel(status)}`);
+    const response = await updateProjectSelfEvolutionCandidate(props.project.id, candidateId, { status });
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`候选状态已改为${selfEvolutionStatusLabel(status)}${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '更新候选状态失败';
   } finally {
@@ -987,11 +1915,12 @@ async function runSelfEvolutionCurator() {
 
   selfEvolutionState.isCurating = true;
   try {
-    const report = await curateProjectSelfEvolution(props.project.id);
-    await refreshSelfEvolutionState({ silent: true });
+    const response = await curateProjectSelfEvolution(props.project.id);
+    const report = response?.data ?? {};
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
     const checkedCount = Number(report?.checked_count ?? 0);
     const changeCount = Number(report?.change_count ?? 0);
-    setToolMessage(`技能维护已完成：检查 ${checkedCount} 项，状态变化 ${changeCount} 项`);
+    setToolMessage(`技能维护已完成：检查 ${checkedCount} 项，状态变化 ${changeCount} 项${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '技能维护失败';
   } finally {
@@ -1006,9 +1935,10 @@ async function runSelfEvolutionRegression() {
 
   selfEvolutionState.isRegressing = true;
   try {
-    const report = await runProjectSelfEvolutionRegression(props.project.id);
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage(`写作回归已完成：平均评分 ${percentLabel(report?.average_score)}`);
+    const response = await runProjectSelfEvolutionRegression(props.project.id);
+    const report = response?.data ?? {};
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`写作回归已完成：平均评分 ${percentLabel(report?.average_score)}${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '写作回归失败';
   } finally {
@@ -1023,9 +1953,9 @@ async function runSelfEvolutionModelReview() {
 
   selfEvolutionState.isReviewing = true;
   try {
-    await runProjectSelfEvolutionModelReview(props.project.id);
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage('模型审查已完成');
+    const response = await runProjectSelfEvolutionModelReview(props.project.id);
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`模型审查已完成${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '模型审查失败';
   } finally {
@@ -1039,13 +1969,13 @@ async function saveSelfEvolutionSchedule() {
   }
   selfEvolutionScheduleForm.isSaving = true;
   try {
-    await updateProjectSelfEvolutionSchedule(props.project.id, {
+    const response = await updateProjectSelfEvolutionSchedule(props.project.id, {
       enabled: selfEvolutionScheduleForm.enabled,
       interval_hours: selfEvolutionScheduleForm.intervalHours,
       tasks: selectedScheduleTasks(),
     });
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage('自学习排程设置已保存');
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`自学习排程设置已保存${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '保存排程失败';
   } finally {
@@ -1059,9 +1989,9 @@ async function runSelfEvolutionScheduleNow() {
   }
   selfEvolutionScheduleForm.isRunning = true;
   try {
-    await runProjectSelfEvolutionSchedule(props.project.id);
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage('自学习排程任务已执行');
+    const response = await runProjectSelfEvolutionSchedule(props.project.id);
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`自学习排程任务已执行${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '执行排程任务失败';
   } finally {
@@ -1181,9 +2111,9 @@ async function applySelfEvolutionDraft(draft) {
 
   selfEvolutionState.updatingDraftId = draftId;
   try {
-    await applyProjectSelfEvolutionDraft(props.project.id, draftId);
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage('草案已应用');
+    const response = await applyProjectSelfEvolutionDraft(props.project.id, draftId);
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`草案已应用${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '应用草案失败';
   } finally {
@@ -1203,9 +2133,9 @@ async function discardSelfEvolutionDraft(draft) {
 
   selfEvolutionState.updatingDraftId = draftId;
   try {
-    await updateProjectSelfEvolutionDraft(props.project.id, draftId, { status: 'discarded' });
-    await refreshSelfEvolutionState({ silent: true });
-    setToolMessage('草案已废弃');
+    const response = await updateProjectSelfEvolutionDraft(props.project.id, draftId, { status: 'discarded' });
+    const refreshError = await refreshAfterSelfEvolutionAction(response);
+    setToolMessage(`草案已废弃${refreshFailureText(refreshError)}`);
   } catch (error) {
     toolError.value = error instanceof Error ? error.message : '更新草案状态失败';
   } finally {
@@ -1273,6 +2203,13 @@ async function loadToolData(tool) {
   }
   if (panel === 'knowledge-search') {
     knowledgeHits.value = [];
+    return;
+  }
+  if (panel === 'obsidian-vault') {
+    obsidianState.value = props.project?.story_overview?.obsidian ?? null;
+    isObsidianFormDirty.value = false;
+    syncObsidianFormFromState(obsidianState.value, { force: true });
+    await refreshObsidianState();
     return;
   }
   if (panel === 'web-research') {
@@ -1431,6 +2368,7 @@ async function handleBrainstormRun() {
       include_plot: true,
       include_blueprint: true,
       include_character_state: true,
+      chapter_id: props.selectedChapter?.id ?? '',
       extra_context: props.selectedChapter
         ? `当前章节：第 ${props.selectedChapter.index} 章《${props.selectedChapter.title}》`
         : '',
@@ -1802,13 +2740,27 @@ async function saveGeneratedChapter(content = toolResult.value?.content ?? toolR
   const styleName = toolResult.value?.revised
     ? rewriteForm.styleName.trim()
     : chapterGenerateForm.styleName.trim();
+  const xpPreset = toolResult.value?.revised
+    ? rewriteForm.xpPreset.trim()
+    : chapterGenerateForm.xpPreset.trim();
   try {
-    const { detail, reviewError } = await updateProjectChapter(props.project.id, props.selectedChapter.id, {
+    const {
+      detail,
+      reviewError,
+      selfEvolution,
+      selfEvolutionError,
+    } = await updateProjectChapter(props.project.id, props.selectedChapter.id, {
       content,
       style_name: styleName,
+      xp_preset: xpPreset,
     });
     emit('project-detail-updated', detail);
-    setToolMessage(reviewError || '正文已保存到当前章节');
+    applySelfEvolutionState(selfEvolution);
+    const messages = [reviewError || '正文已保存到当前章节'];
+    if (selfEvolutionError) {
+      messages.push(`自学习状态刷新失败：${selfEvolutionError}`);
+    }
+    setToolMessage(messages.join('；'));
   } catch (error) {
     setToolMessage(error instanceof Error ? error.message : '正文保存失败', 'error');
   }
@@ -1918,9 +2870,134 @@ async function runKnowledgeSearch() {
       props.project.id,
       knowledgeForm.query.trim(),
       Number(knowledgeForm.limit),
+      { chapterIndex: props.selectedChapter?.index ?? 0 },
     );
   } catch (error) {
     setToolMessage(error instanceof Error ? error.message : '知识检索失败', 'error');
+  }
+}
+
+function linesToArray(value) {
+  return String(value ?? '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function arrayToLines(value, fallback = '') {
+  if (!Array.isArray(value) || value.length === 0) {
+    return fallback;
+  }
+  return value.join('\n');
+}
+
+function markObsidianFormTouched() {
+  isObsidianFormDirty.value = true;
+}
+
+function syncObsidianFormFromState(state, options = {}) {
+  if (isObsidianFormDirty.value && !options.force) {
+    return;
+  }
+  const config = state?.config ?? {};
+  obsidianForm.enabled = Boolean(config.enabled);
+  obsidianForm.vaultPath = config.vault_path ?? '';
+  obsidianForm.includePatterns = arrayToLines(config.include_patterns, '**/*.md\n**/*.canvas');
+  obsidianForm.excludePatterns = arrayToLines(config.exclude_patterns, '.obsidian/**\n.trash/**\ntemplates/**');
+  obsidianForm.allowedStatuses = arrayToLines(config.allowed_statuses, 'canonical\n正式\n已确认\nactive\npublished\nusable');
+  obsidianForm.excludedStatuses = arrayToLines(config.excluded_statuses, 'draft\n草稿\nprivate\n私密\ndeprecated\n废案\n弃用');
+  obsidianForm.includeWithoutStatus = config.include_without_status ?? true;
+  obsidianForm.requireUsableByAi = Boolean(config.require_usable_by_ai);
+  obsidianForm.maxNotes = Number(config.max_notes ?? 2000);
+}
+
+function obsidianPayloadFromForm() {
+  return {
+    enabled: obsidianForm.enabled,
+    vault_path: obsidianForm.vaultPath.trim(),
+    include_patterns: linesToArray(obsidianForm.includePatterns),
+    exclude_patterns: linesToArray(obsidianForm.excludePatterns),
+    allowed_statuses: linesToArray(obsidianForm.allowedStatuses),
+    excluded_statuses: linesToArray(obsidianForm.excludedStatuses),
+    include_without_status: obsidianForm.includeWithoutStatus,
+    require_usable_by_ai: obsidianForm.requireUsableByAi,
+    max_notes: Number(obsidianForm.maxNotes || 2000),
+  };
+}
+
+async function refreshObsidianState() {
+  if (!props.project?.id) {
+    return;
+  }
+  const requestId = ++obsidianStateRequestId.value;
+  try {
+    const state = await getProjectObsidian(props.project.id);
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    obsidianState.value = state;
+    syncObsidianFormFromState(state);
+  } catch (error) {
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    setToolMessage(error instanceof Error ? error.message : 'Obsidian 状态读取失败', 'error');
+  }
+}
+
+async function saveObsidianConfig() {
+  if (!ensureProjectAndChapter({ chapter: false })) {
+    return;
+  }
+  const requestId = ++obsidianStateRequestId.value;
+  isObsidianSaving.value = true;
+  try {
+    const response = await updateProjectObsidian(props.project.id, obsidianPayloadFromForm());
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    const detail = response?.data ?? {};
+    emit('project-detail-updated', detail);
+    obsidianState.value = detail.story_overview?.obsidian ?? null;
+    isObsidianFormDirty.value = false;
+    syncObsidianFormFromState(obsidianState.value, { force: true });
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { projectDetail: false }));
+    setToolMessage(`Obsidian 配置已保存，知识索引已更新${refreshFailureText(refreshError)}`);
+  } catch (error) {
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    setToolMessage(error instanceof Error ? error.message : 'Obsidian 配置保存失败', 'error');
+  } finally {
+    isObsidianSaving.value = false;
+  }
+}
+
+async function runObsidianSync() {
+  if (!ensureProjectAndChapter({ chapter: false })) {
+    return;
+  }
+  const requestId = ++obsidianStateRequestId.value;
+  isObsidianSaving.value = true;
+  try {
+    const response = await syncProjectObsidian(props.project.id);
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    const detail = response?.data ?? {};
+    emit('project-detail-updated', detail);
+    obsidianState.value = detail.story_overview?.obsidian ?? null;
+    isObsidianFormDirty.value = false;
+    syncObsidianFormFromState(obsidianState.value, { force: true });
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { projectDetail: false }));
+    setToolMessage(`Obsidian 笔记已同步到知识索引${refreshFailureText(refreshError)}`);
+  } catch (error) {
+    if (requestId !== obsidianStateRequestId.value) {
+      return;
+    }
+    setToolMessage(error instanceof Error ? error.message : 'Obsidian 同步失败', 'error');
+  } finally {
+    isObsidianSaving.value = false;
   }
 }
 
@@ -1965,6 +3042,7 @@ async function runWebResearch() {
       props.project.id,
       webResearchForm.query.trim(),
       Number(webResearchForm.limit),
+      { chapterIndex: props.selectedChapter?.index ?? 0 },
     );
     if (webResearchResult.value?.warning) {
       setToolMessage(webResearchResult.value.warning, 'error');
@@ -3499,6 +4577,107 @@ async function handleStyleReferenceFilesSelected(event) {
             </div>
           </template>
 
+          <template v-else-if="activeToolPanelKey === 'obsidian-vault'">
+            <div
+              class="field-stack"
+              data-testid="obsidian-vault-form"
+              @change.capture="markObsidianFormTouched"
+              @input.capture="markObsidianFormTouched"
+            >
+              <label class="toggle-row">
+                <input
+                  v-model="obsidianForm.enabled"
+                  data-testid="obsidian-enabled-checkbox"
+                  type="checkbox"
+                >
+                <span>启用 Obsidian</span>
+              </label>
+              <label class="form-field">
+                <span>Vault 路径</span>
+                <input
+                  v-model="obsidianForm.vaultPath"
+                  data-testid="obsidian-vault-path-input"
+                  placeholder="/Users/name/Documents/My Vault"
+                >
+              </label>
+              <label class="form-field">
+                <span>纳入路径</span>
+                <textarea
+                  v-model="obsidianForm.includePatterns"
+                  rows="3"
+                />
+              </label>
+              <label class="form-field">
+                <span>排除路径</span>
+                <textarea
+                  v-model="obsidianForm.excludePatterns"
+                  rows="4"
+                />
+              </label>
+              <div class="two-column-fields">
+                <label class="form-field">
+                  <span>允许状态</span>
+                  <textarea
+                    v-model="obsidianForm.allowedStatuses"
+                    rows="5"
+                  />
+                </label>
+                <label class="form-field">
+                  <span>排除状态</span>
+                  <textarea
+                    v-model="obsidianForm.excludedStatuses"
+                    rows="5"
+                  />
+                </label>
+              </div>
+              <div class="inline-toggle-group">
+                <label class="toggle-row">
+                  <input
+                    v-model="obsidianForm.includeWithoutStatus"
+                    type="checkbox"
+                  >
+                  <span>收录未标状态笔记</span>
+                </label>
+                <label class="toggle-row">
+                  <input
+                    v-model="obsidianForm.requireUsableByAi"
+                    type="checkbox"
+                  >
+                  <span>只收录显式允许 AI 的笔记</span>
+                </label>
+              </div>
+              <label class="form-field compact-field">
+                <span>笔记上限</span>
+                <input
+                  v-model.number="obsidianForm.maxNotes"
+                  max="10000"
+                  min="1"
+                  type="number"
+                >
+              </label>
+              <div class="button-row">
+                <button
+                  class="primary-button"
+                  data-testid="obsidian-save-button"
+                  :disabled="isObsidianSaving"
+                  type="button"
+                  @click="saveObsidianConfig"
+                >
+                  保存并索引
+                </button>
+                <button
+                  class="secondary-button"
+                  data-testid="obsidian-sync-button"
+                  :disabled="isObsidianSaving"
+                  type="button"
+                  @click="runObsidianSync"
+                >
+                  重新同步
+                </button>
+              </div>
+            </div>
+          </template>
+
           <template v-else-if="activeToolPanelKey === 'web-research'">
             <div class="field-stack">
               <label class="form-field">
@@ -4637,6 +5816,112 @@ async function handleStyleReferenceFilesSelected(event) {
             </div>
           </template>
 
+          <template v-else-if="activeToolPanelKey === 'obsidian-vault'">
+            <div
+              class="result-shell"
+              data-testid="obsidian-vault-results"
+            >
+              <div class="metric-grid">
+                <article class="metric-card">
+                  <span>状态</span>
+                  <strong>{{ activeObsidianState?.enabled ? '已启用' : '未启用' }}</strong>
+                </article>
+                <article class="metric-card">
+                  <span>笔记</span>
+                  <strong>{{ activeObsidianState?.included_count ?? 0 }} 份</strong>
+                </article>
+	                <article class="metric-card">
+	                  <span>双链</span>
+	                  <strong>{{ activeObsidianState?.link_count ?? 0 }} 条</strong>
+	                </article>
+	                <article class="metric-card">
+	                  <span>考据链接</span>
+	                  <strong data-testid="obsidian-external-link-count">{{ activeObsidianState?.external_link_count ?? 0 }} 条</strong>
+	                </article>
+	                <article class="metric-card">
+	                  <span>已解析</span>
+	                  <strong>{{ activeObsidianState?.resolved_link_count ?? 0 }} 条</strong>
+                </article>
+                <article class="metric-card">
+                  <span>未解析</span>
+                  <strong>{{ activeObsidianState?.unresolved_link_count ?? 0 }} 条</strong>
+                </article>
+                <article class="metric-card">
+                  <span>歧义</span>
+                  <strong>{{ activeObsidianState?.ambiguous_link_count ?? 0 }} 条</strong>
+                </article>
+                <article class="metric-card">
+                  <span>重复命名</span>
+                  <strong>{{ activeObsidianState?.duplicate_label_count ?? 0 }} 处</strong>
+                </article>
+                <article class="metric-card">
+                  <span>孤立笔记</span>
+                  <strong>{{ activeObsidianState?.orphan_count ?? 0 }} 份</strong>
+                </article>
+              </div>
+              <div
+                v-if="activeObsidianState?.warnings?.length"
+                class="issue-list"
+              >
+                <article
+                  v-for="item in activeObsidianState.warnings"
+                  :key="item"
+                  class="issue-card"
+                >
+                  <strong>提示</strong>
+                  <p>{{ item }}</p>
+                </article>
+              </div>
+              <div
+                v-if="activeObsidianState?.issues?.length"
+                class="issue-list"
+              >
+                <article
+                  v-for="item in activeObsidianState.issues.slice(0, 8)"
+                  :key="`${item.kind}-${item.title}`"
+                  class="issue-card"
+                >
+                  <strong>{{ item.title }}</strong>
+                  <p>{{ item.message }}</p>
+                  <p v-if="item.notes?.length">涉及：{{ item.notes.slice(0, 5).join(' / ') }}</p>
+                  <p v-if="item.links?.length">链接：{{ item.links.slice(0, 5).join(' / ') }}</p>
+                </article>
+              </div>
+              <div
+                v-if="obsidianNotesPreview.length"
+                class="issue-list"
+              >
+                <article
+                  v-for="item in obsidianNotesPreview"
+                  :key="item.relative_path"
+                  class="issue-card"
+                >
+                  <strong>{{ item.title }}</strong>
+                  <p>{{ item.relative_path }}</p>
+                  <p>{{ item.preview || '暂无摘要' }}</p>
+                  <p v-if="obsidianChapterScope(item)">{{ obsidianChapterScope(item) }}</p>
+                  <p v-if="obsidianNoteSourceChapterText(item)">{{ obsidianNoteSourceChapterText(item) }}</p>
+	                  <p v-if="item.required_phrases?.length">必须包含：{{ item.required_phrases.slice(0, 4).join(' / ') }}</p>
+	                  <p v-if="item.forbidden_phrases?.length">禁止出现：{{ item.forbidden_phrases.slice(0, 4).join(' / ') }}</p>
+	                  <p v-if="item.external_references?.length">考据来源：{{ item.external_references.slice(0, 3).join(' / ') }}</p>
+	                  <p v-else-if="item.external_links?.length">考据链接：{{ item.external_links.slice(0, 3).join(' / ') }}</p>
+	                  <p v-if="item.links?.length">双链：{{ item.links.slice(0, 4).join(' / ') }}</p>
+                  <p v-if="item.graph_relations?.length">关系：{{ item.graph_relations.slice(0, 4).join(' / ') }}</p>
+                  <p v-if="item.resolved_links?.length">关联笔记：{{ item.resolved_links.slice(0, 4).join(' / ') }}</p>
+                  <p v-if="item.backlinks?.length">被引用：{{ item.backlinks.slice(0, 4).join(' / ') }}</p>
+                  <p v-if="item.unresolved_links?.length">未解析：{{ item.unresolved_links.slice(0, 4).join(' / ') }}</p>
+                  <p v-if="item.ambiguous_links?.length">歧义：{{ item.ambiguous_links.slice(0, 4).join(' / ') }}</p>
+                </article>
+              </div>
+              <p
+                v-else
+                class="empty-result-copy"
+              >
+                保存配置后，符合过滤条件的笔记会显示在这里。
+              </p>
+            </div>
+          </template>
+
           <template v-else-if="activeToolPanelKey === 'web-research'">
             <div class="result-shell">
               <template v-if="webResearchResult">
@@ -4742,6 +6027,18 @@ async function handleStyleReferenceFilesSelected(event) {
                     <span>最近回归评分</span>
                   </div>
                   <div class="self-evolution-metric">
+                    <strong>{{ percentLabel(selfEvolutionDashboard.latest_humanize_ab_score) }}</strong>
+                    <span>去 AI A/B</span>
+                  </div>
+                  <div class="self-evolution-metric">
+                    <strong>{{ percentLabel(selfEvolutionDashboard.latest_humanize_judge_score) }}</strong>
+                    <span>去 AI 裁判</span>
+                  </div>
+                  <div class="self-evolution-metric">
+                    <strong>{{ selfEvolutionDashboard.latest_humanize_patrol_status || selfEvolutionHumanizePatrol.last_status || '未巡检' }}</strong>
+                    <span>去 AI 巡检</span>
+                  </div>
+                  <div class="self-evolution-metric">
                     <strong>{{ selfEvolutionDashboard.pending_draft_count || 0 }}</strong>
                     <span>待确认草案</span>
                   </div>
@@ -4768,7 +6065,7 @@ async function handleStyleReferenceFilesSelected(event) {
                   </article>
                 </div>
                 <div
-                  v-if="selfEvolutionWritingTrend.length || selfEvolutionRegressionTrend.length"
+                  v-if="selfEvolutionWritingTrend.length || selfEvolutionRegressionTrend.length || selfEvolutionHumanizeAbTrend.length || selfEvolutionHumanizeJudgeTrend.length"
                   class="issue-list"
                   data-testid="self-evolution-trends"
                 >
@@ -4792,6 +6089,29 @@ async function handleStyleReferenceFilesSelected(event) {
                       />
                     </div>
                   </article>
+                  <article class="issue-card">
+                    <strong>去 AI A/B 趋势</strong>
+                    <div class="trend-row">
+                      <span
+                        v-for="(item, index) in selfEvolutionHumanizeAbTrend.slice(0, 12).reverse()"
+                        :key="`humanize-ab-${index}-${item.generated_at}`"
+                        :style="{ height: percentLabel(item.score) }"
+                      />
+                    </div>
+                  </article>
+                  <article
+                    v-if="selfEvolutionHumanizeJudgeTrend.length"
+                    class="issue-card"
+                  >
+                    <strong>去 AI 裁判趋势</strong>
+                    <div class="trend-row">
+                      <span
+                        v-for="(item, index) in selfEvolutionHumanizeJudgeTrend.slice(0, 12).reverse()"
+                        :key="`humanize-judge-${index}-${item.generated_at}`"
+                        :style="{ height: percentLabel(item.score) }"
+                      />
+                    </div>
+                  </article>
                 </div>
                 <div
                   v-if="selfEvolutionDashboard.failing_actions?.length"
@@ -4806,6 +6126,434 @@ async function handleStyleReferenceFilesSelected(event) {
                     <p>失败记录 {{ item.count }} 次</p>
                   </article>
                 </div>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-style-xp"
+              >
+                <div class="subpanel-head">
+                  <h4>系统学习版文风 / XP</h4>
+                  <p>{{ activeSelfEvolutionStyleXpRules.length }} / {{ selfEvolutionStyleXpRules.length }} 条生效</p>
+                </div>
+                <div
+                  v-if="selfEvolutionStyleXpRules.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="rule in selfEvolutionStyleXpRules.slice(0, 8)"
+                    :key="rule.id"
+                    class="issue-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ styleXpRuleKindLabel(rule.kind) }}</strong>
+                      <span class="skill-tag">{{ styleXpRuleStatusLabel(rule.status) }} · 证据 {{ rule.evidence_count || 1 }} 章</span>
+                    </div>
+                    <p>{{ rule.content }}</p>
+                    <p v-if="rule.rationale">{{ rule.rationale }}</p>
+                    <div class="detail-pills">
+                      <span class="scene-pill">可信度 {{ percentLabel(rule.confidence) }}</span>
+                      <span
+                        v-if="rule.signal"
+                        class="scene-pill"
+                      >
+                        {{ rule.signal }}
+                      </span>
+                    </div>
+                  </article>
+                </div>
+                <p
+                  v-else
+                  class="empty-result-copy"
+                >
+                  保存两章出现相同信号后，这里会显示生效规则。
+                </p>
+              </section>
+
+              <section
+                class="result-section"
+                data-testid="self-evolution-narrative-state"
+              >
+                <div class="subpanel-head">
+                  <h4>剧情债务与人物弧线</h4>
+                  <p>{{ highRiskNarrativeDebts.length }} / {{ selfEvolutionNarrativeDebts.length }} 条高风险 · {{ selfEvolutionChapterContracts.length }} 份合同</p>
+                </div>
+                <article
+                  v-if="latestNarrativeModelReview"
+                  class="issue-card"
+                >
+                  <div class="candidate-title-row">
+                    <strong>模型叙事审查</strong>
+                    <span class="skill-tag">{{ latestNarrativeModelReview.status }} · {{ latestNarrativeModelReview.model_source || '本地规则' }}</span>
+                  </div>
+                  <p>{{ latestNarrativeModelReview.summary }}</p>
+                  <ul
+                    v-if="latestNarrativeModelReview.risk_notes?.length"
+                    class="plain-list"
+                  >
+                    <li
+                      v-for="item in latestNarrativeModelReview.risk_notes.slice(0, 4)"
+                      :key="item"
+                    >
+                      {{ item }}
+                    </li>
+                  </ul>
+                </article>
+                <div
+                  data-testid="self-evolution-narrative-contracts"
+                >
+                  <article
+                    v-if="latestChapterContract"
+                    class="issue-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>章节合同 · 第 {{ latestChapterContract.target_chapter_index }} 章</strong>
+                      <span class="skill-tag">{{ latestChapterContract.generated_by || '规则' }}</span>
+                    </div>
+                    <p>{{ latestChapterContract.objective }}</p>
+                    <ul
+                      v-if="latestChapterContract.required_beats?.length"
+                      class="plain-list"
+                    >
+                      <li
+                        v-for="item in latestChapterContract.required_beats.slice(0, 4)"
+                        :key="item"
+                      >
+                        {{ item }}
+                      </li>
+                    </ul>
+                  </article>
+                  <p
+                    v-else
+                    class="empty-result-copy"
+                  >
+                    章节合同会在模型叙事审查后显示。
+                  </p>
+                </div>
+                <article
+                  v-if="latestContractReview"
+                  class="issue-card"
+                >
+                  <div class="candidate-title-row">
+                    <strong>合同执行回看 · 第 {{ latestContractReview.target_chapter_index }} 章</strong>
+                    <span class="skill-tag">{{ latestContractReview.status }} · {{ latestContractReview.score || 0 }} 分</span>
+                  </div>
+                  <p v-if="latestContractReview.missed?.length">未满足：{{ latestContractReview.missed.slice(0, 3).join('；') }}</p>
+                  <p v-else>合同执行没有记录未满足项。</p>
+                </article>
+                <div
+                  v-if="selfEvolutionNarrativeDebts.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="debt in selfEvolutionNarrativeDebts.slice(0, 8)"
+                    :key="debt.id"
+                    class="issue-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ debt.title || narrativeDebtKindLabel(debt.kind) }}</strong>
+                      <span class="skill-tag">
+                        {{ narrativeDebtKindLabel(debt.kind) }} · {{ narrativeDebtStatusLabel(debt.status) }} · 风险 {{ narrativeRiskLabel(debt.risk_level) }}
+                      </span>
+                    </div>
+                    <p>{{ debt.content }}</p>
+                    <p v-if="debt.next_required_action">{{ debt.next_required_action }}</p>
+                    <div class="detail-pills">
+                      <span
+                        v-if="debt.last_seen_chapter_index"
+                        class="scene-pill"
+                      >
+                        最近第 {{ debt.last_seen_chapter_index }} 章
+                      </span>
+                      <span
+                        v-if="debt.expected_payoff_range?.length === 2"
+                        class="scene-pill"
+                      >
+                        预计第 {{ debt.expected_payoff_range[0] }}-{{ debt.expected_payoff_range[1] }} 章
+                      </span>
+                    </div>
+                  </article>
+                </div>
+                <div
+                  v-if="selfEvolutionCharacterArcs.length"
+                  class="issue-list"
+                >
+                  <article
+                    v-for="arc in selfEvolutionCharacterArcs.slice(0, 6)"
+                    :key="arc.id"
+                    class="issue-card"
+                  >
+                    <strong>{{ arc.name }} · {{ arc.phase || '人物弧线' }}</strong>
+                    <p>{{ arc.unresolved_pressure || arc.current_state }}</p>
+                    <p v-if="arc.required_next_check">{{ arc.required_next_check }}</p>
+                  </article>
+                </div>
+                <article
+                  v-if="latestChapterCard"
+                  class="issue-card"
+                  data-testid="self-evolution-narrative-chapter-card"
+                >
+                  <strong>最新章节任务卡</strong>
+                  <p>
+                    第 {{ latestChapterCard.chapter_index }} 章 ·
+                    {{ latestChapterCard.stage }}
+                  </p>
+                  <ul class="plain-list">
+                    <li
+                      v-for="item in (latestChapterCard.required_outcomes || []).slice(0, 4)"
+                      :key="item"
+                    >
+                      {{ item }}
+                    </li>
+                  </ul>
+                  <div
+                    v-if="latestChapterCardHasObsidian"
+                    class="obsidian-task-constraints"
+                    data-testid="self-evolution-narrative-obsidian-card"
+                  >
+                    <strong>Obsidian 任务约束</strong>
+                    <p v-if="latestChapterCardObsidianSources.length">
+                      来源：{{ latestChapterCardObsidianSources.slice(0, 3).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianExternalReferences.length">
+                      考据来源：{{ latestChapterCardObsidianExternalReferences.slice(0, 3).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianRequired.length">
+                      必写：{{ latestChapterCardObsidianRequired.slice(0, 4).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianForbidden.length">
+                      禁写：{{ latestChapterCardObsidianForbidden.slice(0, 4).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianNarrativeDebts.length">
+                      剧情债务：{{ latestChapterCardObsidianNarrativeDebts.slice(0, 3).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianCharacterArcs.length">
+                      人物弧线：{{ latestChapterCardObsidianCharacterArcs.slice(0, 3).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianSatisfied.length">
+                      已满足：{{ latestChapterCardObsidianSatisfied.slice(0, 4).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianMissing.length">
+                      未完成：{{ latestChapterCardObsidianMissing.slice(0, 4).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianViolations.length">
+                      已触犯：{{ latestChapterCardObsidianViolations.slice(0, 4).join('；') }}
+                    </p>
+                    <p v-if="latestChapterCardObsidianRisks.length">
+                      图谱风险：{{ latestChapterCardObsidianRisks.slice(0, 3).join('；') }}
+                    </p>
+                  </div>
+                </article>
+                <div
+                  v-if="selfEvolutionObsidianMaintenance.length"
+                  class="issue-list"
+                  data-testid="self-evolution-obsidian-maintenance"
+                >
+                  <article
+                    class="issue-card"
+                    data-testid="self-evolution-obsidian-maintenance-summary"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>Obsidian 维护摘要</strong>
+                      <span
+                        v-if="hasSelfEvolutionObsidianMaintenanceFilters"
+                        class="skill-tag"
+                      >
+                        当前筛选
+                      </span>
+                      <button
+                        v-if="obsidianMaintenanceArtifactFilterCount > 0"
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-obsidian-maintenance-artifact-filter"
+                        type="button"
+                        @click="clearObsidianMaintenanceArtifactFilter"
+                      >
+                        清除产物筛选（{{ obsidianMaintenanceArtifactFilterCount }}）
+                      </button>
+                      <span class="skill-tag">待处理 {{ selfEvolutionObsidianMaintenanceSummary.needs_action || 0 }} / {{ selfEvolutionObsidianMaintenanceSummary.total || 0 }}</span>
+                    </div>
+                    <p>
+                      高优先级 {{ selfEvolutionObsidianMaintenanceSummary.high_priority || 0 }} 条 ·
+                      自动草稿 {{ selfEvolutionObsidianMaintenanceSummary.auto_staged || 0 }} 条 ·
+                      草稿缺失 {{ selfEvolutionObsidianMaintenanceSummary.by_status?.draft_missing || 0 }} 条 ·
+                      Vault 笔记缺失 {{ selfEvolutionObsidianMaintenanceSummary.by_status?.published_missing || 0 }} 条
+                      · Vault 已移动 {{ selfEvolutionObsidianMaintenanceSummary.by_status?.vault_moved || 0 }} 条
+                      · Vault 待更新 {{ selfEvolutionObsidianMaintenanceSummary.by_status?.published_outdated || 0 }} 条
+                      · 已忽略 {{ selfEvolutionObsidianMaintenanceSummary.by_status?.ignored || 0 }} 条
+                    </p>
+                    <div class="two-column-grid">
+	                      <label class="form-field">
+	                        <span>维护状态</span>
+	                        <select
+                          v-model="selfEvolutionState.obsidianMaintenanceStatusFilter"
+                          data-testid="self-evolution-obsidian-maintenance-filter"
+                        >
+                          <option
+                            v-for="status in obsidianMaintenanceStatusOptions"
+                            :key="status"
+                            :value="status"
+                          >
+                            {{ status }}
+	                          </option>
+	                        </select>
+	                      </label>
+	                      <label class="form-field">
+	                        <span>来源章节</span>
+	                        <input
+	                          v-model="selfEvolutionState.obsidianMaintenanceSourceChapter"
+	                          data-testid="self-evolution-obsidian-maintenance-source-chapter"
+	                          min="1"
+	                          type="number"
+	                          placeholder="例如 58"
+	                        >
+	                      </label>
+	                      <label class="form-field">
+	                        <span>搜索维护项</span>
+	                        <input
+                          v-model="selfEvolutionState.obsidianMaintenanceQuery"
+                          data-testid="self-evolution-obsidian-maintenance-search"
+                          type="text"
+                          placeholder="标题、路径、章节或动作"
+                        >
+                      </label>
+                    </div>
+                    <p data-testid="self-evolution-obsidian-maintenance-count">
+                      显示 {{ filteredSelfEvolutionObsidianMaintenance.length }} / {{ selfEvolutionObsidianMaintenance.length }} 条
+                    </p>
+                    <div class="action-row">
+                      <button
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-obsidian-stage-visible-button"
+                        type="button"
+                        :disabled="selfEvolutionState.stagingAllObsidianMaintenance || !filteredSelfEvolutionObsidianMaintenance.length"
+                        @click="stageVisibleObsidianMaintenanceSuggestions"
+                      >
+                        {{ selfEvolutionState.stagingAllObsidianMaintenance ? '保存中…' : '保存当前结果草稿' }}
+                      </button>
+                      <button
+                        class="primary-button small-button"
+                        data-testid="self-evolution-obsidian-publish-visible-button"
+                        type="button"
+                        :disabled="selfEvolutionState.publishingAllObsidianMaintenance || filteredSelfEvolutionObsidianPublishable.length === 0"
+                        @click="publishVisibleObsidianMaintenanceSuggestions"
+                      >
+                        {{ selfEvolutionState.publishingAllObsidianMaintenance ? '发布中…' : `发布当前草稿到 Vault (${filteredSelfEvolutionObsidianPublishable.length})` }}
+                      </button>
+                      <button
+                        class="primary-button small-button"
+                        data-testid="self-evolution-obsidian-confirm-merge-visible-button"
+                        type="button"
+                        :disabled="selfEvolutionState.confirmingAllObsidianMaintenanceMerges || filteredSelfEvolutionObsidianMergeConfirmable.length === 0"
+                        @click="confirmVisibleObsidianMaintenanceMerges"
+                      >
+                        {{ selfEvolutionState.confirmingAllObsidianMaintenanceMerges ? '确认中…' : `确认当前 Vault 合并 (${filteredSelfEvolutionObsidianMergeConfirmable.length})` }}
+                      </button>
+                      <button
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-obsidian-ignore-visible-button"
+                        type="button"
+                        :disabled="selfEvolutionState.ignoringAllObsidianMaintenance || filteredSelfEvolutionObsidianIgnorable.length === 0"
+                        @click="ignoreVisibleObsidianMaintenanceSuggestions"
+                      >
+                        {{ selfEvolutionState.ignoringAllObsidianMaintenance ? '忽略中…' : `忽略当前结果 (${filteredSelfEvolutionObsidianIgnorable.length})` }}
+                      </button>
+                      <button
+                        class="secondary-button small-button"
+                        data-testid="self-evolution-obsidian-reopen-visible-button"
+                        type="button"
+                        :disabled="selfEvolutionState.reopeningAllObsidianMaintenance || filteredSelfEvolutionObsidianReopenable.length === 0"
+                        @click="reopenVisibleObsidianMaintenanceSuggestions"
+                      >
+                        {{ selfEvolutionState.reopeningAllObsidianMaintenance ? '恢复中…' : `恢复当前结果 (${filteredSelfEvolutionObsidianReopenable.length})` }}
+                      </button>
+                    </div>
+                  </article>
+                  <article
+                    v-for="item in filteredSelfEvolutionObsidianMaintenance"
+                    :key="item.id || item.title"
+                    class="issue-card"
+                  >
+                    <div class="candidate-title-row">
+                      <strong>{{ item.title }}</strong>
+                      <span class="skill-tag">{{ item.priority || 'medium' }} · {{ obsidianMaintenanceStatusLabel(item) }}</span>
+                    </div>
+	                    <p>{{ item.reason || item.action }}</p>
+	                    <p v-if="item.suggested_path">建议笔记：{{ item.suggested_path }}</p>
+	                    <p v-if="obsidianMaintenanceSourceChapterText(item)">{{ obsidianMaintenanceSourceChapterText(item) }}</p>
+	                    <p v-if="item.draft_path">草稿文件：{{ item.draft_path }}</p>
+                    <p v-if="item.merge_draft_path">Vault 合并草稿：{{ item.merge_draft_path }}</p>
+                    <p v-if="item.merge_draft_manual_edits">Vault 合并草稿已有人工改动，系统已保留原文。</p>
+                    <p v-if="item.draft_missing">草稿文件不存在，可重新保存。</p>
+                    <p v-if="item.published_missing">Vault 笔记不存在，可重新发布。</p>
+                    <p v-if="item.published_outdated">Vault 笔记仍是旧自动草稿，可保存新版草稿后人工合并。</p>
+                    <p v-if="item.preserved_existing_draft">同路径已有人工内容，系统已保留原文。</p>
+                    <p v-else-if="item.manual_draft_edits">草稿已有人工改动，后续自动更新不会覆盖。</p>
+                    <p v-if="item.vault_moved">Vault 笔记已移动：{{ item.moved_from_vault_relative_path }} → {{ item.vault_relative_path }}</p>
+                    <p v-if="item.vault_relative_path">Vault 笔记：{{ item.vault_relative_path }}</p>
+                    <p v-if="item.action">{{ item.action }}</p>
+                    <div class="action-row">
+                      <button
+                        v-if="item.draft_markdown"
+                        class="secondary-button small-button"
+                        type="button"
+                        :disabled="selfEvolutionState.stagingObsidianMaintenanceId === item.id || selfEvolutionState.publishingObsidianMaintenanceId === item.id || selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id || selfEvolutionState.ignoringObsidianMaintenanceId === item.id || selfEvolutionState.reopeningObsidianMaintenanceId === item.id"
+                        @click="stageObsidianMaintenanceSuggestion(item)"
+                      >
+                        {{ selfEvolutionState.stagingObsidianMaintenanceId === item.id ? '保存中…' : '保存草稿' }}
+                      </button>
+                      <button
+                        v-if="item.draft_markdown"
+                        class="primary-button small-button"
+                        data-testid="self-evolution-obsidian-publish-button"
+                        type="button"
+                        :disabled="selfEvolutionState.publishingObsidianMaintenanceId === item.id || selfEvolutionState.stagingObsidianMaintenanceId === item.id || selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id || selfEvolutionState.ignoringObsidianMaintenanceId === item.id || selfEvolutionState.reopeningObsidianMaintenanceId === item.id || item.status === 'published' || item.status === 'published_outdated' || Boolean(item.merge_draft_path)"
+                        @click="publishObsidianMaintenanceSuggestion(item)"
+                      >
+                        {{ selfEvolutionState.publishingObsidianMaintenanceId === item.id ? '发布中…' : '发布到 Vault' }}
+                      </button>
+                      <button
+                        v-if="item.merge_draft_path"
+                        class="primary-button small-button"
+                        data-testid="self-evolution-obsidian-confirm-merge-button"
+                        type="button"
+                        :disabled="selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id || selfEvolutionState.publishingObsidianMaintenanceId === item.id || selfEvolutionState.stagingObsidianMaintenanceId === item.id || selfEvolutionState.ignoringObsidianMaintenanceId === item.id || selfEvolutionState.reopeningObsidianMaintenanceId === item.id"
+                        @click="confirmObsidianMaintenanceMerge(item)"
+                      >
+                        {{ selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id ? '确认中…' : '确认 Vault 已合并' }}
+                      </button>
+                      <button
+                        v-if="item.status === 'ignored'"
+                        class="secondary-button small-button"
+                        type="button"
+                        :disabled="selfEvolutionState.reopeningObsidianMaintenanceId === item.id || selfEvolutionState.stagingObsidianMaintenanceId === item.id || selfEvolutionState.publishingObsidianMaintenanceId === item.id || selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id || selfEvolutionState.ignoringObsidianMaintenanceId === item.id"
+                        @click="reopenObsidianMaintenanceSuggestion(item)"
+                      >
+                        {{ selfEvolutionState.reopeningObsidianMaintenanceId === item.id ? '恢复中…' : '恢复处理' }}
+                      </button>
+                      <button
+                        v-else
+                        class="secondary-button small-button"
+                        type="button"
+                        :disabled="selfEvolutionState.ignoringObsidianMaintenanceId === item.id || selfEvolutionState.stagingObsidianMaintenanceId === item.id || selfEvolutionState.publishingObsidianMaintenanceId === item.id || selfEvolutionState.confirmingObsidianMaintenanceMergeId === item.id || selfEvolutionState.reopeningObsidianMaintenanceId === item.id || item.status === 'published'"
+                        @click="ignoreObsidianMaintenanceSuggestion(item)"
+                      >
+                        {{ selfEvolutionState.ignoringObsidianMaintenanceId === item.id ? '忽略中…' : '忽略' }}
+                      </button>
+                    </div>
+                  </article>
+                  <p
+                    v-if="filteredSelfEvolutionObsidianMaintenance.length === 0"
+                    class="empty-result-copy"
+                  >
+                    没有匹配的 Obsidian 维护项。
+                  </p>
+                </div>
+                <p
+                  v-if="!selfEvolutionNarrativeDebts.length && !selfEvolutionCharacterArcs.length"
+                  class="empty-result-copy"
+                >
+                  保存章节后会在这里显示伏笔、承诺、关系压力和人物弧线状态。
+                </p>
               </section>
 
               <section
@@ -4950,6 +6698,42 @@ async function handleStyleReferenceFilesSelected(event) {
                   <article class="issue-card">
                     <strong>{{ selfEvolutionRegressionRuns[0].chapter_title || selfEvolutionRegressionRuns[0].chapter_id }}</strong>
                     <p>平均评分 {{ percentLabel(selfEvolutionRegressionRuns[0].average_score) }} · {{ selfEvolutionRegressionRuns[0].status }}</p>
+                    <template v-if="selfEvolutionRegressionRuns[0].humanize_ab_benchmark">
+                      <p>
+                        去 AI A/B {{ percentLabel(selfEvolutionRegressionRuns[0].humanize_ab_benchmark.score) }}
+                        · 平均提升 {{ selfEvolutionRegressionRuns[0].humanize_ab_benchmark.average_delta }}
+                        · 通过率 {{ percentLabel(selfEvolutionRegressionRuns[0].humanize_ab_benchmark.pass_rate) }}
+                      </p>
+                      <ul
+                        v-if="selfEvolutionRegressionRuns[0].humanize_ab_benchmark.distilled_rules?.length"
+                        class="plain-list"
+                      >
+                        <li
+                          v-for="rule in selfEvolutionRegressionRuns[0].humanize_ab_benchmark.distilled_rules"
+                          :key="rule"
+                        >
+                          {{ rule }}
+                        </li>
+                      </ul>
+                      <p v-if="selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool?.sample_count">
+                        项目样本池 {{ selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool.sample_count }} 个
+                        · 风险章节 {{ selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool.risk_count }} 个
+                        · 平均评分 {{ percentLabel(selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool.average_score_ratio) }}
+                      </p>
+                      <ul
+                        v-if="selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool?.samples?.length"
+                        class="plain-list"
+                      >
+                        <li
+                          v-for="sample in (selfEvolutionRegressionRuns[0].humanize_ab_benchmark.project_sample_pool.samples || []).slice(0, 3)"
+                          :key="sample.signature || sample.chapter_id"
+                        >
+                          第 {{ sample.chapter_index }} 章 · {{ percentLabel(sample.score_ratio) }} ·
+                          {{ humanizeSampleIssueText(sample) }}
+                          <span v-if="sample.snippet">：{{ sample.snippet }}</span>
+                        </li>
+                      </ul>
+                    </template>
                     <div class="issue-list">
                       <article
                         v-for="item in selfEvolutionRegressionRuns[0].cases"
@@ -4996,6 +6780,17 @@ async function handleStyleReferenceFilesSelected(event) {
                   <strong>{{ selfEvolutionModelReviews[0].summary || '模型审查' }}</strong>
                   <p>{{ selfEvolutionModelReviews[0].status }}</p>
                   <div
+                    v-if="selfEvolutionModelReviews[0].humanize_patrol"
+                    class="detail-pills"
+                  >
+                    <span class="scene-pill">
+                      触发 {{ selfEvolutionModelReviews[0].humanize_patrol.trigger || selfEvolutionModelReviews[0].humanize_patrol.reason }}
+                    </span>
+                    <span class="scene-pill">
+                      来源 {{ selfEvolutionModelReviews[0].humanize_patrol.reason || '巡检' }}
+                    </span>
+                  </div>
+                  <div
                     v-if="selfEvolutionModelReviews[0].cross_review"
                     class="detail-pills"
                   >
@@ -5009,6 +6804,44 @@ async function handleStyleReferenceFilesSelected(event) {
                   <p v-if="selfEvolutionModelReviews[0].cross_review?.summary">
                     {{ selfEvolutionModelReviews[0].cross_review.summary }}
                   </p>
+                  <template v-if="selfEvolutionModelReviews[0].humanize_model_judge">
+                    <p>
+                      去 AI 裁判 {{ percentLabel(selfEvolutionModelReviews[0].humanize_model_judge.score) }}
+                      · 样本 {{ selfEvolutionModelReviews[0].humanize_model_judge.sample_count || 0 }}
+                      · 历史 {{ selfEvolutionModelReviews[0].humanize_model_judge.history_sample_count || 0 }}
+                      · {{ selfEvolutionModelReviews[0].humanize_model_judge.status }}
+                    </p>
+                    <p v-if="selfEvolutionModelReviews[0].humanize_model_judge.summary">
+                      {{ selfEvolutionModelReviews[0].humanize_model_judge.summary }}
+                    </p>
+                    <ul
+                      v-if="selfEvolutionModelReviews[0].humanize_model_judge.issues?.length"
+                      class="plain-list"
+                    >
+                      <li
+                        v-for="issue in selfEvolutionModelReviews[0].humanize_model_judge.issues.slice(0, 4)"
+                        :key="issue.title || issue.label || issue.detail"
+                      >
+                        {{ humanizeJudgeIssueText(issue) }}
+                      </li>
+                    </ul>
+                    <ul
+                      v-if="selfEvolutionModelReviews[0].humanize_model_judge.distilled_rules?.length"
+                      class="plain-list"
+                    >
+                      <li
+                        v-for="rule in selfEvolutionModelReviews[0].humanize_model_judge.distilled_rules.slice(0, 4)"
+                        :key="rule"
+                      >
+                        {{ rule }}
+                      </li>
+                    </ul>
+                    <p v-if="selfEvolutionModelReviews[0].humanize_rule_update">
+                      去 AI 项目规则：新增 {{ selfEvolutionModelReviews[0].humanize_rule_update.inserted || 0 }} 条 ·
+                      刷新 {{ selfEvolutionModelReviews[0].humanize_rule_update.refreshed || 0 }} 条 ·
+                      共 {{ selfEvolutionModelReviews[0].humanize_rule_update.total || 0 }} 条
+                    </p>
+                  </template>
                   <ul class="plain-list">
                     <li
                       v-for="item in [
@@ -5755,6 +7588,34 @@ async function handleStyleReferenceFilesSelected(event) {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.two-column-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.inline-toggle-group,
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #24292f;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.toggle-row input {
+  width: auto;
+  min-width: 16px;
+}
+
 .compact-field {
   max-width: 220px;
 }
@@ -5811,6 +7672,31 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metric-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f6f8fa;
+  border: 1px solid #e2e8ee;
+}
+
+.metric-card span {
+  color: #57606a;
+  font-size: 12px;
+}
+
+.metric-card strong {
+  color: #1f2328;
+  font-size: 18px;
 }
 
 .self-evolution-metric {
@@ -5904,6 +7790,26 @@ textarea {
   justify-content: space-between;
   align-items: start;
   gap: 10px;
+}
+
+.obsidian-task-constraints {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #dfe6ec;
+}
+
+.obsidian-task-constraints strong {
+  font-size: 13px;
+  color: #1f2328;
+}
+
+.obsidian-task-constraints p {
+  margin: 0;
+  color: #4f5b66;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .result-section {
@@ -6056,7 +7962,9 @@ textarea {
 
 @media (max-width: 980px) {
   .workbench-grid,
-  .two-column-grid {
+  .two-column-grid,
+  .two-column-fields,
+  .metric-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }

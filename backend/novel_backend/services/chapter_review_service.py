@@ -17,6 +17,12 @@ from novel_backend.services.config_service import load_config
 from novel_backend.services.humanize_service import analyze_humanize_text
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
+from novel_backend.services.obsidian_service import (
+  _parse_chapter_number,
+  obsidian_note_available_for_chapter,
+  obsidian_source_signature_for_chapter,
+  scoped_obsidian_note_records_for_chapter,
+)
 from novel_backend.services.style_service import get_style
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
 
@@ -36,6 +42,7 @@ _REVIEW_SYSTEM_PROMPT = """
 
 _SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fff]{2,4}")
+_CHAPTER_NUMBER_IN_TEXT_RE = re.compile(r"第\s*([0-9０-９零〇一二两三四五六七八九十百千]+)\s*章")
 _TOKEN_STOPWORDS = {
   "现在",
   "当前",
@@ -73,6 +80,56 @@ _HOOK_TOKENS = (
   "钥匙",
   "线索",
   "失踪",
+)
+_HANDOFF_REQUIRED_MARKERS = (
+  "不能忘",
+  "必须",
+  "务必",
+  "需要",
+  "应当",
+  "应该",
+  "要",
+  "继续",
+  "承接",
+  "推进",
+  "处理",
+  "追问",
+  "追查",
+  "查明",
+  "兑现",
+  "确认",
+  "交代",
+  "写到",
+)
+_HANDOFF_NEGATIVE_MARKERS = ("不要", "不得", "禁止", "不可", "不许")
+_HANDOFF_GENERIC_TERMS = (
+  "下一章",
+  "下章",
+  "后续",
+  "当前章",
+  "本章",
+  "不能忘",
+  "必须",
+  "务必",
+  "需要",
+  "应当",
+  "应该",
+  "要",
+  "继续",
+  "承接",
+  "推进",
+  "处理",
+  "追问",
+  "追查",
+  "查明",
+  "兑现",
+  "确认",
+  "交代",
+  "写到",
+  "安排",
+  "保留",
+  "让",
+  "把",
 )
 _CONFLICT_TOKENS = (
   "追",
@@ -127,6 +184,18 @@ def _tokens(text: str, *, limit: int = 16) -> list[str]:
     counts[token] = counts.get(token, 0) + 1
   ordered = sorted(counts.items(), key=lambda item: (item[1], len(item[0]), item[0]), reverse=True)
   return [token for token, _count in ordered[:limit]]
+
+
+def _ordered_unique(items: list[str]) -> list[str]:
+  seen: set[str] = set()
+  result: list[str] = []
+  for item in items:
+    value = str(item or "").strip()
+    if not value or value in seen:
+      continue
+    seen.add(value)
+    result.append(value)
+  return result
 
 
 def _score_status(score: int) -> str:
@@ -780,6 +849,416 @@ def _continuity_dimension(project_detail, chapter, guard_context=None) -> Chapte
   return _dimension("continuity", "连续性回看", score, summary, highlights=highlights, issues=issues)
 
 
+_CONTRACT_OBLIGATION_HEADINGS = {
+  "必须完成的节拍",
+  "必须推进的债务",
+  "人物检查",
+  "验收项",
+  "Obsidian 章节计划",
+  "Obsidian 剧情债务",
+  "Obsidian 人物弧线",
+  "本章必须处理或明确推进的剧情债务",
+}
+
+
+def _contract_obligation_lines(contract_text: str, *, limit: int = 8) -> list[tuple[str, str]]:
+  obligations: list[tuple[str, str]] = []
+  active_heading = ""
+  for raw_line in str(contract_text or "").splitlines():
+    line = raw_line.strip()
+    if not line:
+      continue
+    if line.startswith("合同目标："):
+      obligations.append(("合同目标", line.split("：", 1)[1].strip()))
+    if not line.startswith("-") and line.endswith("："):
+      heading = line.rstrip("：").strip()
+      active_heading = heading if heading in _CONTRACT_OBLIGATION_HEADINGS else ""
+      continue
+    if active_heading and line.startswith("-"):
+      obligations.append((active_heading, line.lstrip("- ").strip()))
+    if len(obligations) >= limit:
+      break
+  return [(heading, value) for heading, value in obligations if value][:limit]
+
+
+def _contract_line_missing(chapter_text: str, obligation: str) -> bool:
+  if "必写项未完成：" in obligation:
+    marker = obligation.split("必写项未完成：", 1)[1].split("：", 1)[0].strip()
+    if marker and marker in chapter_text:
+      return False
+  if "必须包含：" in obligation:
+    marker = obligation.split("必须包含：", 1)[1].split("：", 1)[0].strip()
+    if marker and marker in chapter_text:
+      return False
+  tokens = [token for token in _tokens(obligation, limit=8) if token not in _TOKEN_STOPWORDS]
+  if not tokens:
+    return False
+  required = min(2, len(tokens))
+  matched = sum(1 for token in tokens if token in chapter_text)
+  return matched < required
+
+
+def _continuity_contract_dimension(project_detail, chapter, guard_context=None) -> ChapterReviewDimension:
+  contract_text = str(getattr(guard_context, "contract_text", "") or "").strip()
+  if not contract_text:
+    try:
+      from novel_backend.services.continuity_guard_service import build_chapter_continuity_contract
+
+      contract_text = build_chapter_continuity_contract(project_detail, chapter)
+    except Exception:
+      contract_text = ""
+  if not contract_text:
+    return _dimension(
+      "continuity_contract",
+      "章节连续性合同",
+      0,
+      "本章没有生成章节连续性合同，暂不计入评分。",
+      status="na",
+    )
+
+  chapter_text = _body_text(chapter)
+  issues: list[ChapterReviewIssue] = []
+  highlights = ["已加载章节连续性合同"]
+  if "账本与章节约束" in contract_text:
+    highlights.append("已读取叙事状态账本")
+  if "近期章节承接" in contract_text:
+    highlights.append("已读取近期章节承接")
+  if "资料证据摘要" in contract_text or "Obsidian" in contract_text:
+    highlights.append("已合并外部资料约束")
+
+  obligations = _contract_obligation_lines(contract_text)
+  for heading, obligation in obligations:
+    if _contract_line_missing(chapter_text, obligation):
+      issues.append(
+        ChapterReviewIssue(
+          level="warning",
+          title=f"缺少连续性合同项：{heading}",
+          detail=f"合同要求：{_compact_text(obligation, 160)}；正文没有命中足够的可核验关键词。",
+        )
+      )
+      if len(issues) >= 4:
+        break
+
+  chapter_index = int(getattr(chapter, "index", 0) or 0)
+  previous_chapter = next(
+    (
+      item for item in getattr(project_detail, "chapters", [])
+      if int(getattr(item, "index", 0) or 0) == chapter_index - 1 and str(getattr(item, "content", "") or "").strip()
+    ),
+    None,
+  )
+  if chapter_index > 1 and previous_chapter is None:
+    issues.append(
+      ChapterReviewIssue(
+        level="warning",
+        title="缺少连续性合同承接源",
+        detail="当前章前一章没有可读取正文，长篇中段生成只能依赖摘要和资料，连续性风险会上升。",
+      )
+    )
+
+  score = 92 - sum(_issue_penalty(item.level) for item in issues)
+  summary = f"章节连续性合同已参与核验，当前检查 {len(obligations)} 个义务项。"
+  if issues:
+    summary = f"章节连续性合同发现 {len(issues)} 个需要处理的承接问题。"
+  return _dimension(
+    "continuity_contract",
+    "章节连续性合同",
+    score,
+    summary,
+    highlights=highlights,
+    issues=issues,
+  )
+
+
+def _obsidian_note_labels(note) -> list[str]:
+  labels = [
+    str(getattr(note, "title", "") or ""),
+    Path(str(getattr(note, "relative_path", "") or "")).stem,
+  ]
+  labels.extend(str(item or "") for item in getattr(note, "aliases", []) or [])
+  return [item.strip() for item in labels if item.strip()]
+
+
+def _obsidian_evidence_paths(guard_context) -> set[str]:
+  paths: set[str] = set()
+  if guard_context is None:
+    return paths
+  for item in list(getattr(guard_context, "knowledge_evidence", []) or []):
+    if str(item.get("source") or "") != "Obsidian":
+      continue
+    source_key = str(item.get("source_key") or "").strip()
+    if source_key.startswith("obsidian:"):
+      relative_path = source_key.split(":", 1)[1].strip().replace("\\", "/")
+      if relative_path:
+        paths.add(relative_path)
+        continue
+    section = str(item.get("section") or "").strip()
+    if "·" in section:
+      relative_path = section.rsplit("·", 1)[1].strip()
+      if relative_path:
+        paths.add(relative_path)
+  return paths
+
+
+def _obsidian_forbidden_matches(note, chapter_text: str) -> list[str]:
+  matches: list[str] = []
+  for phrase in list(getattr(note, "forbidden_phrases", []) or [])[:8]:
+    cleaned = str(phrase or "").strip()
+    if cleaned and cleaned in chapter_text:
+      matches.append(cleaned)
+  return matches
+
+
+def _obsidian_note_focused_on_chapter(note, chapter_index: int) -> bool:
+  try:
+    target = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target = 0
+  if target <= 0:
+    return False
+  try:
+    chapter_start = int(getattr(note, "chapter_start", 0) or 0)
+  except (TypeError, ValueError):
+    chapter_start = 0
+  try:
+    chapter_end = int(getattr(note, "chapter_end", 0) or 0)
+  except (TypeError, ValueError):
+    chapter_end = 0
+  if chapter_start <= 0 or chapter_end <= 0:
+    return False
+  if chapter_start > chapter_end:
+    chapter_start, chapter_end = chapter_end, chapter_start
+  span = chapter_end - chapter_start + 1
+  return span <= 3 and chapter_start <= target <= chapter_end
+
+
+def _handoff_chapter_numbers(text: str) -> list[int]:
+  indexes: list[int] = []
+  for match in _CHAPTER_NUMBER_IN_TEXT_RE.finditer(str(text or "")):
+    index = _parse_chapter_number(match.group(1))
+    if index > 0 and index not in indexes:
+      indexes.append(index)
+  return indexes
+
+
+def _handoff_source_chapters(item: dict[str, object]) -> list[int]:
+  indexes: list[int] = []
+  for value in item.get("source_chapters", []):
+    if isinstance(value, int):
+      index = int(value)
+    else:
+      try:
+        index = int(str(value or ""))
+      except (TypeError, ValueError):
+        index = _parse_chapter_number(value)
+    if index > 0 and index not in indexes:
+      indexes.append(index)
+  return indexes
+
+
+def _handoff_applies_to_chapter(item: dict[str, object], handoff: str, chapter_index: int) -> bool:
+  if chapter_index <= 0:
+    return False
+  explicit_chapters = _handoff_chapter_numbers(handoff)
+  if explicit_chapters:
+    return chapter_index in explicit_chapters
+  source_chapters = _handoff_source_chapters(item)
+  if not source_chapters:
+    return False
+  return max(source_chapters) + 1 == chapter_index
+
+
+def _handoff_is_required(text: str) -> bool:
+  value = str(text or "")
+  if "不能忘" not in value and any(marker in value for marker in _HANDOFF_NEGATIVE_MARKERS):
+    return False
+  return any(marker in value for marker in _HANDOFF_REQUIRED_MARKERS)
+
+
+def _handoff_check_tokens(text: str) -> list[str]:
+  cleaned = _CHAPTER_NUMBER_IN_TEXT_RE.sub("", str(text or ""))
+  for term in _HANDOFF_GENERIC_TERMS:
+    cleaned = cleaned.replace(term, "")
+  candidates: list[str] = []
+  for part in re.split(r"[\s,，、;；。！？!?：:（）()【】\[\]《》“”\"']+", cleaned):
+    token = part.strip()
+    if len(token) >= 3:
+      candidates.append(token)
+  for token in _TOKEN_RE.findall(cleaned):
+    if token in _TOKEN_STOPWORDS or len(token) < 3:
+      continue
+    candidates.append(token)
+  return _ordered_unique(candidates)[:6]
+
+
+def _obsidian_chapter_handoff_issues(project_detail, chapter, chapter_text: str) -> list[ChapterReviewIssue]:
+  try:
+    from novel_backend.services.project_narrative_state_service import build_project_narrative_state_chapter_card
+  except Exception:
+    return []
+
+  chapter_id = str(getattr(chapter, "id", "") or "")
+  chapter_index = int(getattr(chapter, "index", 0) or 0)
+  if not chapter_id or chapter_index <= 0:
+    return []
+  try:
+    card = build_project_narrative_state_chapter_card(project_detail, chapter_id)
+  except Exception:
+    return []
+  entries = card.get("obsidian_chapter_notes", []) if isinstance(card, dict) else []
+  if not isinstance(entries, list):
+    return []
+
+  issues: list[ChapterReviewIssue] = []
+  for item in entries:
+    if not isinstance(item, dict):
+      continue
+    title = str(item.get("title") or item.get("relative_path") or "章节档案").strip()
+    for raw_handoff in item.get("handoff", []):
+      handoff = str(raw_handoff or "").strip()
+      if not handoff or not _handoff_is_required(handoff):
+        continue
+      if not _handoff_applies_to_chapter(item, handoff, chapter_index):
+        continue
+      tokens = _handoff_check_tokens(handoff)
+      if not tokens or any(token in chapter_text for token in tokens):
+        continue
+      issues.append(
+        ChapterReviewIssue(
+          level="warning",
+          title=f"缺少 Obsidian 必需设定：{title}",
+          detail=(
+            f"章节档案交接提醒要求当前章承接：{handoff}；"
+            f"正文未命中可核验关键词：{' / '.join(tokens[:4])}"
+          ),
+        )
+      )
+      if len(issues) >= 4:
+        return issues
+  return issues
+
+
+def _obsidian_dimension(project_detail, chapter, guard_context=None) -> ChapterReviewDimension:
+  obsidian = getattr(getattr(project_detail, "story_overview", None), "obsidian", None)
+  if obsidian is None or not bool(getattr(obsidian, "enabled", False)):
+    return _dimension("obsidian", "Obsidian 设定", 0, "当前未启用 Obsidian，暂不做设定反查。", status="na")
+  all_notes = list(getattr(obsidian, "notes", []) or [])
+  if not all_notes:
+    return _dimension("obsidian", "Obsidian 设定", 0, "Obsidian 当前没有可用于核验的正式笔记。", status="na")
+  chapter_index = int(getattr(chapter, "index", 0) or 0)
+  project_path = str(getattr(project_detail, "path", "") or "").strip()
+  if project_path and chapter_index > 0:
+    try:
+      notes = [
+        record.summary
+        for record in scoped_obsidian_note_records_for_chapter(Path(project_path), chapter_index)
+      ]
+    except Exception:
+      notes = [note for note in all_notes if obsidian_note_available_for_chapter(note, chapter_index)]
+  else:
+    notes = [note for note in all_notes if obsidian_note_available_for_chapter(note, chapter_index)]
+  if not notes:
+    return _dimension(
+      "obsidian",
+      "Obsidian 设定",
+      0,
+      "当前目标章节没有可用的 Obsidian 设定笔记，暂不做设定反查。",
+      status="na",
+    )
+
+  chapter_text = str(getattr(chapter, "content", "") or "")
+  handoff_issues = _obsidian_chapter_handoff_issues(project_detail, chapter, chapter_text)
+  evidence_paths = _obsidian_evidence_paths(guard_context)
+  relevant_notes: list[tuple[object, bool, bool, bool, list[str]]] = []
+  for note in notes:
+    relative_path = str(getattr(note, "relative_path", "") or "").strip()
+    labels = _obsidian_note_labels(note)
+    evidence_matched = relative_path in evidence_paths
+    label_matched = any(label and label in chapter_text for label in labels)
+    forbidden_matches = _obsidian_forbidden_matches(note, chapter_text)
+    focused_scope_matched = (
+      _obsidian_note_focused_on_chapter(note, chapter_index)
+      and any(str(item or "").strip() for item in getattr(note, "required_phrases", []) or [])
+    )
+    if (
+      evidence_matched
+      or label_matched
+      or forbidden_matches
+      or focused_scope_matched
+    ):
+      relevant_notes.append(
+        (note, evidence_matched, label_matched, focused_scope_matched, forbidden_matches)
+      )
+
+  if not relevant_notes and not handoff_issues:
+    return _dimension(
+      "obsidian",
+      "Obsidian 设定",
+      0,
+      "本章没有命中明确的 Obsidian 设定笔记，暂不计入评分。",
+      status="na",
+    )
+
+  score = 88
+  highlights = []
+  if relevant_notes:
+    highlights.append(f"已反查 Obsidian 设定 {len(relevant_notes)} 份")
+  if handoff_issues:
+    highlights.append(f"已检查章节档案交接 {len(handoff_issues)} 项")
+  issues: list[ChapterReviewIssue] = list(handoff_issues)
+  for note, evidence_matched, label_matched, focused_scope_matched, forbidden_matches in relevant_notes[:8]:
+    title = str(getattr(note, "title", "") or "").strip() or str(getattr(note, "relative_path", "") or "").strip()
+    for cleaned in forbidden_matches:
+      issues.append(
+        ChapterReviewIssue(
+          level="critical",
+          title=f"触犯 Obsidian 禁用设定：{title}",
+          detail=f"正文出现了正式笔记标记为禁止的短语：{cleaned}",
+        )
+      )
+    if evidence_matched or label_matched or focused_scope_matched:
+      for phrase in list(getattr(note, "required_phrases", []) or [])[:8]:
+        cleaned = str(phrase or "").strip()
+        if cleaned and cleaned not in chapter_text:
+          if label_matched:
+            reason = "正文提到了该笔记"
+          elif evidence_matched:
+            reason = "本章证据命中了该笔记"
+          else:
+            reason = "Vault 将该笔记绑定到当前章节"
+          issues.append(
+            ChapterReviewIssue(
+              level="warning",
+              title=f"缺少 Obsidian 必需设定：{title}",
+              detail=f"{reason}，但没有出现正式笔记要求保留的短语：{cleaned}",
+            )
+          )
+    ambiguous = [str(item).strip() for item in getattr(note, "ambiguous_links", []) or [] if str(item).strip()]
+    if ambiguous:
+      issues.append(
+        ChapterReviewIssue(
+          level="warning",
+          title=f"相关 Obsidian 笔记存在歧义链接：{title}",
+          detail=f"这些双链不会自动解析：{' / '.join(ambiguous[:4])}",
+        )
+      )
+    unresolved = [str(item).strip() for item in getattr(note, "unresolved_links", []) or [] if str(item).strip()]
+    if unresolved:
+      issues.append(
+        ChapterReviewIssue(
+          level="info",
+          title=f"相关 Obsidian 笔记存在未解析链接：{title}",
+          detail=f"这些双链还没有对应正式笔记：{' / '.join(unresolved[:4])}",
+        )
+      )
+
+  score -= sum(_issue_penalty(item.level) for item in issues)
+  summary = "Obsidian 正式设定已参与本章核验。"
+  if issues:
+    summary = f"Obsidian 设定核验发现 {len(issues)} 个需要处理的风险。"
+  return _dimension("obsidian", "Obsidian 设定", score, summary, highlights=highlights, issues=issues)
+
+
 def _style_dimension(settings: Settings, chapter, style_name: str, model_dimension: dict[str, object] | None) -> ChapterReviewDimension:
   if not style_name.strip():
     return _dimension("style", "文风贴合", 0, "当前没有绑定文风方案，暂时不做贴合度评分。", status="na")
@@ -877,6 +1356,23 @@ def _review_signature(project_detail, chapter, *, style_name: str) -> str:
   if dream_report is not None:
     parts.append(str(getattr(dream_report, "summary", "") or ""))
     parts.extend(getattr(dream_report, "open_questions", []) or [])
+  obsidian = getattr(project_detail.story_overview, "obsidian", None)
+  if obsidian is not None:
+    chapter_index = int(getattr(chapter, "index", 0) or 0)
+    obsidian_signature = str(getattr(obsidian, "source_signature", "") or "")
+    project_path = str(getattr(project_detail, "path", "") or "").strip()
+    if project_path:
+      try:
+        obsidian_signature = obsidian_source_signature_for_chapter(Path(project_path), chapter_index)
+      except Exception:
+        pass
+    visible_note_count = sum(
+      1
+      for note in list(getattr(obsidian, "notes", []) or [])
+      if obsidian_note_available_for_chapter(note, chapter_index)
+    )
+    parts.append(f"obsidian::{obsidian_signature}")
+    parts.append(f"obsidian_notes::{visible_note_count}")
   return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -954,6 +1450,8 @@ def build_chapter_review(
   )
   language_dimension = _language_dimension(chapter)
   continuity_dimension = _continuity_dimension(project_detail, chapter, guard_context)
+  continuity_contract_dimension = _continuity_contract_dimension(project_detail, chapter, guard_context)
+  obsidian_dimension = _obsidian_dimension(project_detail, chapter, guard_context)
   style_dimension = _style_dimension(
     settings,
     chapter,
@@ -968,6 +1466,8 @@ def build_chapter_review(
     suspense_dimension,
     language_dimension,
     continuity_dimension,
+    continuity_contract_dimension,
+    obsidian_dimension,
     style_dimension,
   ]
   scored_dimensions = [item.score for item in dimensions if item.status != "na"]
@@ -983,7 +1483,15 @@ def build_chapter_review(
       summary = "这一章整体比较完整，主要维度都还在线。"
   aggregated_suggestions = suggestions[:]
   if not aggregated_suggestions:
-    for item in (consistency_dimension, structure_dimension, plot_dimension, suspense_dimension, style_dimension):
+    for item in (
+      consistency_dimension,
+      structure_dimension,
+      plot_dimension,
+      suspense_dimension,
+      continuity_contract_dimension,
+      obsidian_dimension,
+      style_dimension,
+    ):
       if item.issues:
         aggregated_suggestions.append(item.issues[0].title)
   highlights: list[str] = []

@@ -14,6 +14,16 @@ function unwrapChapterMutationEnvelope(payload) {
   return {
     detail: unwrapEnvelope(payload),
     reviewError: String(payload?.meta?.review_error ?? ''),
+    selfEvolution: payload?.meta?.self_evolution ?? null,
+    selfEvolutionError: String(payload?.meta?.self_evolution_error ?? ''),
+  };
+}
+
+function unwrapSelfEvolutionEnvelope(payload) {
+  return {
+    data: unwrapEnvelope(payload),
+    selfEvolution: payload?.meta?.self_evolution ?? null,
+    selfEvolutionError: String(payload?.meta?.self_evolution_error ?? ''),
   };
 }
 
@@ -216,6 +226,36 @@ export async function exportProjectBook(projectId, payload) {
   });
 }
 
+export async function exportProjectMigrationPackage(projectId) {
+  return request(`/api/projects/${projectId}/migration/export`, {
+    method: 'POST',
+  });
+}
+
+export async function importProjectMigrationPackage(payload) {
+  return request('/api/projects/migration/import', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function importExistingNovel(payload) {
+  return request('/api/projects/takeover/import', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getProjectTakeoverState(projectId) {
+  return request(`/api/projects/${projectId}/takeover`);
+}
+
+export async function resumeProjectTakeover(projectId) {
+  return request(`/api/projects/${projectId}/takeover/resume`, {
+    method: 'POST',
+  });
+}
+
 export async function updateStoryDocument(projectId, documentKey, payload) {
   return request(`/api/projects/${projectId}/documents/${documentKey}`, {
     method: 'PUT',
@@ -256,54 +296,54 @@ export async function getProjectSelfEvolution(projectId) {
 }
 
 export async function updateProjectSelfEvolutionCandidate(projectId, candidateId, payload) {
-  return request(`/api/projects/${projectId}/self-evolution/candidates/${candidateId}`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/candidates/${candidateId}`, {
     method: 'PATCH',
     body: JSON.stringify(payload),
-  });
+  }));
 }
 
 export async function curateProjectSelfEvolution(projectId) {
-  return request(`/api/projects/${projectId}/self-evolution/curate`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/curate`, {
     method: 'POST',
-  });
+  }));
 }
 
 export async function runProjectSelfEvolutionRegression(projectId) {
-  return request(`/api/projects/${projectId}/self-evolution/regression`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/regression`, {
     method: 'POST',
-  });
+  }));
 }
 
 export async function runProjectSelfEvolutionModelReview(projectId) {
-  return request(`/api/projects/${projectId}/self-evolution/model-review`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/model-review`, {
     method: 'POST',
-  });
+  }));
 }
 
 export async function updateProjectSelfEvolutionDraft(projectId, draftId, payload) {
-  return request(`/api/projects/${projectId}/self-evolution/drafts/${draftId}`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/drafts/${draftId}`, {
     method: 'PATCH',
     body: JSON.stringify(payload),
-  });
+  }));
 }
 
 export async function applyProjectSelfEvolutionDraft(projectId, draftId) {
-  return request(`/api/projects/${projectId}/self-evolution/drafts/${draftId}/apply`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/drafts/${draftId}/apply`, {
     method: 'POST',
-  });
+  }));
 }
 
 export async function updateProjectSelfEvolutionSchedule(projectId, payload) {
-  return request(`/api/projects/${projectId}/self-evolution/schedule`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/schedule`, {
     method: 'PUT',
     body: JSON.stringify(payload),
-  });
+  }));
 }
 
 export async function runProjectSelfEvolutionSchedule(projectId) {
-  return request(`/api/projects/${projectId}/self-evolution/schedule/run`, {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/self-evolution/schedule/run`, {
     method: 'POST',
-  });
+  }));
 }
 
 export async function getSkillVersions(skillId) {
@@ -354,19 +394,25 @@ export async function refreshProjectChapterReview(projectId, chapterId, payload 
   }));
 }
 
-export async function searchProjectKnowledge(projectId, query, limit = 8) {
+export async function searchProjectKnowledge(projectId, query, limit = 8, options = {}) {
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
   });
+  if (Number(options.chapterIndex) > 0) {
+    params.set('chapter_index', String(Number(options.chapterIndex)));
+  }
   return request(`/api/projects/${projectId}/knowledge/search?${params.toString()}`);
 }
 
-export async function researchHistoricalReferences(projectId, query, limit = 8) {
+export async function researchHistoricalReferences(projectId, query, limit = 8, options = {}) {
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
   });
+  if (Number(options.chapterIndex) > 0) {
+    params.set('chapter_index', String(Number(options.chapterIndex)));
+  }
   return request(`/api/projects/${projectId}/research/historical?${params.toString()}`);
 }
 
@@ -382,6 +428,88 @@ export async function importProjectKnowledgeFiles(projectId, payload) {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export async function getProjectObsidian(projectId) {
+  return request(`/api/projects/${projectId}/obsidian`);
+}
+
+export async function updateProjectObsidian(projectId, payload) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }));
+}
+
+export async function syncProjectObsidian(projectId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/sync`, {
+    method: 'POST',
+  }));
+}
+
+export async function stageProjectObsidianMaintenance(projectId, suggestionId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/${encodeURIComponent(suggestionId)}/stage`, {
+    method: 'POST',
+  }));
+}
+
+export async function stageProjectObsidianMaintenanceBatch(projectId, payload = {}) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/stage-batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }));
+}
+
+export async function publishProjectObsidianMaintenanceBatch(projectId, payload = {}) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/publish-batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }));
+}
+
+export async function publishProjectObsidianMaintenance(projectId, suggestionId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/${encodeURIComponent(suggestionId)}/publish`, {
+    method: 'POST',
+  }));
+}
+
+export async function confirmProjectObsidianMaintenanceMergeBatch(projectId, payload = {}) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/confirm-merge-batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }));
+}
+
+export async function confirmProjectObsidianMaintenanceMerge(projectId, suggestionId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/${encodeURIComponent(suggestionId)}/confirm-merge`, {
+    method: 'POST',
+  }));
+}
+
+export async function ignoreProjectObsidianMaintenance(projectId, suggestionId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/${encodeURIComponent(suggestionId)}/ignore`, {
+    method: 'POST',
+  }));
+}
+
+export async function ignoreProjectObsidianMaintenanceBatch(projectId, payload = {}) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/ignore-batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }));
+}
+
+export async function reopenProjectObsidianMaintenance(projectId, suggestionId) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/${encodeURIComponent(suggestionId)}/reopen`, {
+    method: 'POST',
+  }));
+}
+
+export async function reopenProjectObsidianMaintenanceBatch(projectId, payload = {}) {
+  return unwrapSelfEvolutionEnvelope(await requestEnvelope(`/api/projects/${projectId}/obsidian/maintenance/reopen-batch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }));
 }
 
 export async function createProjectSnapshot(projectId, payload = {}) {
@@ -502,6 +630,16 @@ export async function streamBrainstorm(payload, onEvent) {
 
 export async function streamAgentConversation(payload, onEvent, options = {}) {
   return streamRequest('/api/studio/agent/stream', payload, onEvent, options);
+}
+
+export async function getAgentWorkflowRun(projectId, taskId) {
+  return request(`/api/studio/agent/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(taskId)}`);
+}
+
+export async function interruptAgentWorkflowRun(projectId, taskId) {
+  return request(`/api/studio/agent/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(taskId)}/interrupt`, {
+    method: 'POST',
+  });
 }
 
 export async function streamCharacterReplica(payload, onEvent) {

@@ -34,6 +34,7 @@ from novel_backend.services.generation_service import (
 )
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.project_service import get_project_detail
+from novel_backend.services.skill_registry import default_skill_behavior, merge_skill_behavior
 from novel_backend.services.skill_usage_service import record_skill_patch
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
@@ -55,7 +56,7 @@ _SKILL_DRAFT_SYSTEM_PROMPT = """
 7. 如果已有技能正文，请把这轮新要求合并进去，不要把旧技能推翻重写。
 """.strip()
 _FRONTMATTER_LIST_KEYS = {"scenes", "usage", "limitations"}
-_FRONTMATTER_BOOL_KEYS = {"requires_project", "requires_chapter"}
+_FRONTMATTER_BOOL_KEYS = {"requires_project", "requires_chapter", "agent_requires_confirmation"}
 _SIMILARITY_CUTOFF_BUILTIN = 0.22
 _SIMILARITY_CUTOFF_CUSTOM = 0.17
 _REUSABLE_SIGNAL_CUTOFF = 0.58
@@ -71,45 +72,7 @@ class _SkillRecord:
 
 
 def _default_skill_behavior(skill_id: str) -> SkillBehavior:
-  defaults = {
-    "chapter-scenes": SkillBehavior(
-      panel="chapter-workflow",
-      mode="scenes",
-      input_label="拆场要求",
-      submit_label="开始拆场",
-    ),
-    "chapter-diagnose": SkillBehavior(
-      panel="chapter-workflow",
-      mode="diagnose",
-      input_label="诊断要求",
-      submit_label="开始诊断",
-    ),
-    "chapter-draft": SkillBehavior(
-      panel="chapter-workflow",
-      mode="draft",
-      input_label="续写要求",
-      submit_label="开始续写",
-    ),
-    "chapter-finalize": SkillBehavior(
-      panel="chapter-rewrite",
-      mode="finalize",
-      input_label="改稿要求",
-      submit_label="开始定稿",
-    ),
-    "chapter-polish": SkillBehavior(
-      panel="chapter-rewrite",
-      mode="polish",
-      input_label="改稿要求",
-      submit_label="开始润色",
-    ),
-    "chapter-humanize": SkillBehavior(
-      panel="chapter-rewrite",
-      mode="humanize",
-      input_label="改稿要求",
-      submit_label="开始去 AI",
-    ),
-  }
-  return defaults.get(skill_id, SkillBehavior(panel=skill_id))
+  return default_skill_behavior(skill_id)
 
 
 def _now_iso() -> str:
@@ -197,7 +160,7 @@ def _skill_record_from_json(path: Path) -> _SkillRecord | None:
     requires_project=bool(payload.get("requires_project", True)),
     requires_chapter=bool(payload.get("requires_chapter", False)),
     order=int(payload.get("order") or 0),
-    behavior=SkillBehavior.model_validate(payload.get("behavior") or _default_skill_behavior(skill_id)),
+    behavior=merge_skill_behavior(skill_id, payload.get("behavior")),
     source="builtin",
     scope=str(payload.get("scope") or "").strip(),
     updated_at=None,
@@ -305,8 +268,12 @@ def _skill_record_from_markdown(path: Path) -> _SkillRecord | None:
     order=int(frontmatter.get("order") or 0),
     behavior=SkillBehavior(
       panel=str(frontmatter.get("panel") or "conversation-skill").strip() or "conversation-skill",
+      mode=str(frontmatter.get("mode") or "").strip(),
       input_label=str(frontmatter.get("input_label") or "").strip(),
       submit_label=str(frontmatter.get("submit_label") or "").strip(),
+      agent_action_kind=str(frontmatter.get("agent_action_kind") or "").strip(),
+      agent_action_mode=str(frontmatter.get("agent_action_mode") or "").strip(),
+      agent_requires_confirmation=_as_bool(frontmatter.get("agent_requires_confirmation"), False),
     ),
     source=str(frontmatter.get("source") or "custom").strip() or "custom",
     scope=str(frontmatter.get("scope") or "").strip(),

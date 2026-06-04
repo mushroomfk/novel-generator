@@ -7,7 +7,11 @@ from novel_backend.config import Settings
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.model_runtime_service import model_runtime_should_defer_background
 from novel_backend.services.project_service import list_projects
-from novel_backend.services.self_evolution_service import _load_schedule, run_self_evolution_scheduled_tasks
+from novel_backend.services.self_evolution_service import (
+  _load_schedule,
+  run_self_evolution_humanize_patrol,
+  run_self_evolution_scheduled_tasks,
+)
 
 
 class SelfEvolutionScheduler:
@@ -64,16 +68,39 @@ class SelfEvolutionScheduler:
             project_dir,
             force=False,
           )
+        patrol_result: dict[str, object] | None = None
+        scheduled_tasks = [
+          str(item.get("task") or "")
+          for item in result.get("ran") or []
+          if isinstance(item, dict)
+        ]
+        if (
+          bool(schedule.get("enabled"))
+          and "model_review" in tasks
+          and "model_review" not in scheduled_tasks
+          and result.get("status") != "deferred"
+        ):
+          patrol_result = await asyncio.to_thread(
+            run_self_evolution_humanize_patrol,
+            self.settings,
+            project_dir,
+            reason="heartbeat",
+            force=False,
+          )
       except Exception as error:
         append_app_log(self.settings, f"项目 {project.id} 自学习排程失败：{error}", level="WARNING")
         result = {"status": "failed", "error": str(error), "ran": []}
-      if result.get("status") in {"completed", "failed"}:
+        patrol_result = None
+      if result.get("status") in {"completed", "failed"} or (
+        isinstance(patrol_result, dict) and patrol_result.get("status") in {"completed", "failed"}
+      ):
         results.append(
           {
             "project_id": project.id,
             "project_name": project.name,
-            "status": result.get("status", ""),
-            "ran_count": len(result.get("ran") or []),
+            "status": result.get("status", "") if result.get("status") in {"completed", "failed"} else patrol_result.get("status", ""),
+            "ran_count": len(result.get("ran") or []) + (1 if isinstance(patrol_result, dict) and patrol_result.get("status") == "completed" else 0),
+            "humanize_patrol_status": patrol_result.get("status", "") if isinstance(patrol_result, dict) else "",
           }
         )
     if results:

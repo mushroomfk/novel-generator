@@ -114,10 +114,12 @@ def _provider_search_query(query: str) -> str:
   return f"{normalized} 历史典故 出处 背景 用法"
 
 
-def _research_prompt(query: str, local_hits: list[KnowledgeSearchResult]) -> str:
+def _research_prompt(query: str, local_hits: list[KnowledgeSearchResult], chapter_index: int = 0) -> str:
   local_text = "\n".join(f"- {item.section}：{item.preview}" for item in local_hits[:4]) or "无"
+  chapter_line = f"\n目标章节：第 {chapter_index} 章" if chapter_index > 0 else ""
   return f"""
 请联网考据这个小说创作问题：{query}
+{chapter_line}
 
 本项目已有资料命中：
 {local_text}
@@ -312,6 +314,7 @@ def _aliyun_chat_research(
   settings: Settings,
   query: str,
   local_hits: list[KnowledgeSearchResult],
+  chapter_index: int = 0,
 ) -> tuple[str, list[HistoricalResearchSource]]:
   config = load_config(settings).model
   if not _model_is_aliyun(config):
@@ -321,7 +324,7 @@ def _aliyun_chat_research(
     "model": config.model_name,
     "messages": [
       {"role": "system", "content": "你是中文小说考据编辑。"},
-      {"role": "user", "content": _research_prompt(query, local_hits)},
+      {"role": "user", "content": _research_prompt(query, local_hits, chapter_index=chapter_index)},
     ],
     "temperature": 0.2,
     "max_tokens": min(config.max_tokens, 1800),
@@ -352,6 +355,7 @@ def _aliyun_responses_research(
   settings: Settings,
   query: str,
   local_hits: list[KnowledgeSearchResult],
+  chapter_index: int = 0,
 ) -> tuple[str, list[HistoricalResearchSource]]:
   config = load_config(settings).model
   if not _model_is_aliyun(config):
@@ -359,7 +363,7 @@ def _aliyun_responses_research(
   api_key = _resolve_aliyun_api_key(config)
   payload: dict[str, object] = {
     "model": config.model_name,
-    "input": _research_prompt(query, local_hits),
+    "input": _research_prompt(query, local_hits, chapter_index=chapter_index),
     "tools": [
       {"type": "web_search"},
       {"type": "web_extractor"},
@@ -386,11 +390,12 @@ def _aliyun_research(
   settings: Settings,
   query: str,
   local_hits: list[KnowledgeSearchResult],
+  chapter_index: int = 0,
 ) -> tuple[str, list[HistoricalResearchSource]]:
   config = load_config(settings).model
   if _model_uses_responses_search(config.model_name):
-    return _aliyun_responses_research(settings, query, local_hits)
-  return _aliyun_chat_research(settings, query, local_hits)
+    return _aliyun_responses_research(settings, query, local_hits, chapter_index=chapter_index)
+  return _aliyun_chat_research(settings, query, local_hits, chapter_index=chapter_index)
 
 
 def _bocha_research(query: str, limit: int) -> tuple[str, list[HistoricalResearchSource]]:
@@ -441,9 +446,11 @@ def _synthesize_answer(
   local_hits: list[KnowledgeSearchResult],
   provider_answer: str,
   sources: list[HistoricalResearchSource],
+  chapter_index: int = 0,
 ) -> str:
   source_text = _format_sources_for_prompt(sources)
   local_text = "\n".join(f"- {item.section}：{item.preview}" for item in local_hits[:4]) or "无"
+  chapter_line = f"\n目标章节：第 {chapter_index} 章" if chapter_index > 0 else ""
   messages = [
     {
       "role": "system",
@@ -456,6 +463,7 @@ def _synthesize_answer(
       "role": "user",
       "content": f"""
 考据问题：{query}
+{chapter_line}
 
 搜索服务摘要：
 {provider_answer or "无"}
@@ -514,6 +522,7 @@ def research_historical_reference(
   project_id: str,
   query: str,
   limit: int = 8,
+  chapter_index: int = 0,
 ) -> HistoricalResearchResult:
   normalized = query.strip()
   if not normalized:
@@ -522,14 +531,18 @@ def research_historical_reference(
   search_limit = max(1, min(limit, 12))
   warnings: list[str] = []
   try:
-    local_hits = search_project_knowledge(settings, project_id, normalized, limit=4)
+    target_chapter = int(chapter_index or 0)
+  except (TypeError, ValueError):
+    target_chapter = 0
+  try:
+    local_hits = search_project_knowledge(settings, project_id, normalized, limit=4, chapter_index=target_chapter)
   except Exception as error:
     local_hits = []
     warnings.append(f"本地资料检索未完成：{error}")
 
   provider_errors: list[str] = []
   try:
-    answer, sources = _aliyun_research(settings, normalized, local_hits)
+    answer, sources = _aliyun_research(settings, normalized, local_hits, chapter_index=target_chapter)
     return HistoricalResearchResult(
       query=normalized,
       provider="aliyun-bailian",
@@ -570,7 +583,14 @@ def research_historical_reference(
     )
 
   try:
-    answer = _synthesize_answer(settings, normalized, local_hits, provider_answer, sources)
+    answer = _synthesize_answer(
+      settings,
+      normalized,
+      local_hits,
+      provider_answer,
+      sources,
+      chapter_index=target_chapter,
+    )
   except Exception as error:
     warnings.append(f"模型整理失败：{error}")
     answer = _fallback_answer(normalized, provider_answer, sources)

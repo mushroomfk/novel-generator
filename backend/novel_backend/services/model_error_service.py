@@ -21,6 +21,10 @@ _RATE_LIMIT_PATTERNS = (
   "请求过多",
 )
 _BILLING_PATTERNS = (
+  "arrearage",
+  "overdue-payment",
+  "overdue payment",
+  "account is in good standing",
   "insufficient credits",
   "insufficient_quota",
   "quota",
@@ -127,19 +131,19 @@ def classify_model_error(error: object) -> ModelErrorClassification:
   lowered = text.lower()
   status = _http_status(lowered)
 
-  if status in {401, 403} or _contains_any(lowered, _AUTH_PATTERNS):
-    return ModelErrorClassification(
-      kind="auth",
-      title="模型认证失败",
-      user_action="检查 API Key、Base URL 和当前模型供应商权限。",
-      retryable=False,
-    )
-
   if status == 402 or _contains_any(lowered, _BILLING_PATTERNS):
     return ModelErrorClassification(
       kind="billing",
       title="模型额度不可用",
       user_action="检查账户余额、额度上限或供应商套餐状态。",
+      retryable=False,
+    )
+
+  if status in {401, 403} or _contains_any(lowered, _AUTH_PATTERNS):
+    return ModelErrorClassification(
+      kind="auth",
+      title="模型认证失败",
+      user_action="检查 API Key、Base URL 和当前模型供应商权限。",
       retryable=False,
     )
 

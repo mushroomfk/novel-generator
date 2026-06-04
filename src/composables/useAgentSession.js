@@ -1,5 +1,9 @@
 import { ref } from 'vue';
-import { streamAgentConversation } from '../lib/api.js';
+import {
+  getAgentWorkflowRun,
+  interruptAgentWorkflowRun,
+  streamAgentConversation,
+} from '../lib/api.js';
 
 function normalizeString(value) {
   return String(value ?? '').trim();
@@ -80,15 +84,77 @@ function normalizeSubtask(data, status) {
   };
 }
 
+function normalizeWorkflowTimelineStatus(status) {
+  const normalized = normalizeString(status).toUpperCase();
+  if (normalized === 'SUCCEEDED') {
+    return 'completed';
+  }
+  if (normalized === 'FAILED' || normalized === 'BLOCKED' || normalized === 'TIMED_OUT' || normalized === 'STALLED') {
+    return 'failed';
+  }
+  if (normalized === 'CANCELLED') {
+    return 'cancelled';
+  }
+  return 'running';
+}
+
+function normalizeWorkflowSessionStatus(status) {
+  const normalized = normalizeString(status).toUpperCase();
+  if (normalized === 'SUCCEEDED') {
+    return 'completed';
+  }
+  if (normalized === 'CANCELLED') {
+    return 'cancelled';
+  }
+  if (normalized === 'CANCELLING') {
+    return 'cancelling';
+  }
+  if (normalized === 'FAILED' || normalized === 'BLOCKED' || normalized === 'TIMED_OUT' || normalized === 'STALLED' || normalized === 'MISSING') {
+    return 'failed';
+  }
+  if (normalized === 'RUNNING') {
+    return 'disconnected';
+  }
+  return normalized.toLowerCase() || 'idle';
+}
+
+function workflowRunToTimelineItems(run) {
+  const actions = Array.isArray(run?.actions) ? run.actions : [];
+  const total = actions.length;
+  return actions
+    .map((action) => normalizeTrace(null, {
+      step: action?.step,
+      total,
+      action_kind: action?.kind,
+      label: action?.label,
+      task_pack_kind: action?.task_pack_kind,
+      status: normalizeWorkflowTimelineStatus(action?.status),
+      summary: normalizeString(action?.message),
+      subTasks: Array.isArray(action?.subtasks)
+        ? action.subtasks.map((item) => ({
+          id: normalizeString(item?.subtask_id) || `${normalizeString(item?.role)}:${normalizeString(item?.capability)}`,
+          role: normalizeString(item?.role) || '子任务',
+          capability: normalizeString(item?.capability),
+          parallelGroup: normalizeString(item?.parallel_group),
+          status: normalizeWorkflowTimelineStatus(item?.status),
+          summary: normalizeString(item?.summary),
+        }))
+        : [],
+    }))
+    .sort((left, right) => left.step - right.step);
+}
+
 export function useAgentSession(options = {}) {
   const running = ref(false);
   const runtimeError = ref('');
   const runtimeState = ref(null);
   const taskId = ref('');
   const sessionStatus = ref('idle');
+  const recoveryStatus = ref('idle');
   const timelineItems = ref([]);
   const latestResult = ref(null);
   let activeAbortController = null;
+  let activeProjectId = '';
 
   function clearTimeline() {
     timelineItems.value = [];
@@ -96,10 +162,12 @@ export function useAgentSession(options = {}) {
 
   function resetSession() {
     activeAbortController = null;
+    activeProjectId = '';
     runtimeError.value = '';
     runtimeState.value = null;
     taskId.value = '';
     sessionStatus.value = 'idle';
+    recoveryStatus.value = 'idle';
     latestResult.value = null;
     clearTimeline();
   }
@@ -329,14 +397,61 @@ export function useAgentSession(options = {}) {
     handleLegacyEvent(eventName, data);
   }
 
+  function applyWorkflowRun(run) {
+    if (!run || typeof run !== 'object') {
+      return null;
+    }
+    const nextTaskId = normalizeString(run.task_id);
+    if (nextTaskId) {
+      taskId.value = nextTaskId;
+    }
+    timelineItems.value = workflowRunToTimelineItems(run);
+    sessionStatus.value = normalizeWorkflowSessionStatus(run.status);
+    if (sessionStatus.value === 'failed') {
+      runtimeError.value = normalizeString(run.message) || runtimeError.value || '执行状态异常。';
+    }
+    return run;
+  }
+
+  async function recoverSession(projectId, recoveryTaskId = taskId.value) {
+    const normalizedProjectId = normalizeString(projectId);
+    const normalizedTaskId = normalizeString(recoveryTaskId);
+    if (!normalizedProjectId || !normalizedTaskId) {
+      return null;
+    }
+    recoveryStatus.value = 'loading';
+    try {
+      const run = await getAgentWorkflowRun(normalizedProjectId, normalizedTaskId);
+      recoveryStatus.value = 'loaded';
+      return applyWorkflowRun(run);
+    } catch (error) {
+      recoveryStatus.value = 'failed';
+      runtimeError.value = error instanceof Error ? error.message : '执行状态读取失败。';
+      return null;
+    }
+  }
+
   function stopSession() {
-    if (!running.value || !activeAbortController) {
+    if (!running.value && !activeAbortController) {
       return false;
     }
 
     sessionStatus.value = 'cancelling';
     runtimeError.value = '';
-    activeAbortController.abort();
+    const projectId = activeProjectId;
+    const currentTaskId = taskId.value;
+    if (projectId && currentTaskId) {
+      void interruptAgentWorkflowRun(projectId, currentTaskId)
+        .then((run) => {
+          applyWorkflowRun(run);
+        })
+        .catch((error) => {
+          runtimeError.value = error instanceof Error ? error.message : '停止请求发送失败。';
+        });
+    }
+    if (activeAbortController) {
+      activeAbortController.abort();
+    }
     return true;
   }
 
@@ -344,6 +459,7 @@ export function useAgentSession(options = {}) {
     resetSession();
     running.value = true;
     sessionStatus.value = 'running';
+    activeProjectId = normalizeString(payload?.project_id);
     activeAbortController = new AbortController();
 
     try {
@@ -360,6 +476,17 @@ export function useAgentSession(options = {}) {
 
       runtimeError.value = error instanceof Error ? error.message : '处理失败';
       sessionStatus.value = 'failed';
+      if (activeProjectId && taskId.value) {
+        const recovered = await recoverSession(activeProjectId, taskId.value);
+        if (recovered) {
+          if (sessionStatus.value === 'disconnected') {
+            runtimeError.value = '连接已断开，已读取当前 workflow 状态。';
+          } else if (sessionStatus.value === 'completed' || sessionStatus.value === 'cancelled') {
+            runtimeError.value = '';
+          }
+          return null;
+        }
+      }
       throw error;
     } finally {
       running.value = false;
@@ -373,10 +500,12 @@ export function useAgentSession(options = {}) {
     runtimeState,
     taskId,
     sessionStatus,
+    recoveryStatus,
     timelineItems,
     latestResult,
     resetSession,
     clearTimeline,
+    recoverSession,
     stopSession,
     runAgentSession,
   };

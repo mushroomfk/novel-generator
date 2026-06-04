@@ -36,6 +36,9 @@ from novel_backend.models import (
   ChapterWorkflowRequest,
   ConsistencyCheckRequest,
   ContinueProjectRequest,
+  KnowledgeImportItem,
+  KnowledgeImportRequest,
+  KNOWLEDGE_IMPORT_CONTENT_MAX_LENGTH,
   SkillMaterializeRequest,
   StoryDocumentBatchUpdateRequest,
   StoryDocumentPatch,
@@ -74,12 +77,20 @@ from novel_backend.services.generation_service import (
 from novel_backend.services.project_distillation_service import build_distillation_review_text, resolve_task_pack_kind
 from novel_backend.services.project_learning_service import build_learning_review_artifact
 from novel_backend.services.project_auxiliary_service import enqueue_project_auxiliary_tasks
+from novel_backend.services.model_runtime_service import model_runtime_foreground_session
+from novel_backend.services.obsidian_service import obsidian_note_available_for_chapter
+from novel_backend.services.project_narrative_state_service import (
+  load_project_narrative_state,
+  obsidian_maintenance_suggestion_sort_key,
+)
 from novel_backend.services.project_service import (
   build_project_agent_thread_context,
   clear_architecture_progress,
   get_project_detail,
+  import_project_knowledge,
   load_architecture_progress,
   load_project_knowledge_material_contents,
+  load_project_obsidian_note_contents,
   save_architecture_progress,
   save_story_document_incremental,
   summarize_chapter_review_status,
@@ -88,6 +99,7 @@ from novel_backend.services.project_service import (
 )
 from novel_backend.services.self_evolution_service import build_agent_capability_context, run_self_evolution_cycle
 from novel_backend.services.agent_workflow_service import (
+  agent_workflow_interrupt_message,
   complete_agent_workflow_run,
   create_agent_workflow_run,
   heartbeat_agent_workflow_action,
@@ -107,6 +119,7 @@ from novel_backend.services.skill_service import (
 )
 from novel_backend.services.studio_service import (
   _continue_project,
+  _brainstorm_chapter_index_from_text,
   _generate_brainstorm,
   _generate_chapter,
   _generate_consistency,
@@ -201,6 +214,7 @@ JSON 结构固定为：
 10. 如果用户明确提到用户沉淀技能，或者技能目录里某个 custom 技能很贴合，把它的 id 放进 action.skill_ids。
 11. 用户说“以后都按这个方式”“把这套规则记住”“保存成技能”“优化这个技能”时，用 skill_optimize；如果是在更新某个用户技能，把该技能 id 放进 skill_ids。
 12. 用户要生成章节正文、长篇逐章生产、续写下一章或改稿入稿时，把写回后的语言去 AI 和一致性复查纳入执行顺序；用户明确只要初稿、不改稿或不检查时除外。
+13. 用户明确要求生成一个章节范围的正文时，每章都要有独立的 chapter_generate 或 chapter_workflow/draft 动作；一次直接生成正文最多安排 3 章，更多章节应返回 reply 要求拆成多批或先整理蓝图。
 """.strip()
 
 _NEXT_CHAPTER_HINT_PATTERN = re.compile(r"(下一章|下章|后面一章|下一回|后续一章)")
@@ -209,19 +223,61 @@ _TARGET_CHAPTER_NUMBER_PATTERN = re.compile(
   r"第\s*([0-9零一二三四五六七八九十百两]+)\s*章"
 )
 _CHAPTER_NUMBER_PATTERN = re.compile(r"第\s*([0-9零一二三四五六七八九十百两]+)\s*章")
+_CHAPTER_RANGE_PATTERN = re.compile(
+  r"第\s*([0-9零一二三四五六七八九十百两]+)\s*(?:章)?\s*(?:[-~—–]|到|至)\s*"
+  r"(?:第)?\s*([0-9零一二三四五六七八九十百两]+)\s*章"
+)
 _CHAPTER_TITLE_PATTERN = re.compile(r"《([^》]{1,40})》")
 _NEW_CHAPTER_COUNT_PATTERN = re.compile(r"(?:新增|增加|扩写|继续规划|后面再加|再加)\s*([0-9零一二三四五六七八九十百两]+)\s*章")
+_CAPABILITY_CHAPTER_NUMBER_PATTERNS = (
+  r"(?:生成|续写|写|补写|扩写)\s*第\s*([0-9零一二三四五六七八九十百两]+)\s*章",
+  r"(?:重写|改写|润色|修订|定稿|处理)\s*第\s*([0-9零一二三四五六七八九十百两]+)\s*章",
+  r"(?:拆(?:场景)?|场景规划)\s*第\s*([0-9零一二三四五六七八九十百两]+)\s*章",
+  r"(?:诊断|检查|判断|分析)\s*第\s*([0-9零一二三四五六七八九十百两]+)\s*章",
+)
 _KNOWLEDGE_REVIEW_PATTERN = re.compile(r"(资料库|知识库|参考资料|资料分析|分析资料|先看资料|先读资料|通读资料|吃透资料)")
+_ARCHITECTURE_CONTEXT_PATTERN = re.compile(r"(架构|蓝图|大纲|整书规划|整本规划|世界观|人物设定|情节骨架|继续规划|后续规划|往后规划|扩写整书)")
 _LONGFORM_SUPERVISION_SKIP_PATTERN = re.compile(
   r"(只(?:要|生成|写).{0,12}初稿|先(?:别|不).{0,8}(?:改稿|去\s*ai|检查|复查)|"
   r"不(?:要|用|需要).{0,8}(?:改稿|去\s*ai|检查|复查)|暂时不(?:改稿|检查|复查))",
   re.IGNORECASE,
 )
+_LONG_INPUT_MATERIALIZE_THRESHOLD = 20_000
+_LONG_INPUT_MATERIAL_CHUNK_LIMIT = min(50_000, KNOWLEDGE_IMPORT_CONTENT_MAX_LENGTH - 1_000)
+_LONG_INPUT_MATERIAL_BLOCK_LIMIT = 4_000
+_LONG_INPUT_IMPORT_INTENT_PATTERN = re.compile(
+  r"(小说|故事|写作|创作|正文|续写|扩写|润色|改稿|章节|场景|人物|角色|剧情|情节|设定|世界观|"
+  r"大纲|架构|蓝图|线索|伏笔|冲突|动机|文风|语气|节奏|资料|素材|参考|考据|知识库|Obsidian)",
+  re.IGNORECASE,
+)
+_LONG_INPUT_RELEVANT_PATTERN = re.compile(
+  r"(小说|故事|叙事|正文|续写|扩写|章节|章纲|场景|对白|旁白|人物|角色|主角|配角|反派|"
+  r"剧情|情节|桥段|设定|世界观|地点|组织|势力|道具|线索|伏笔|悬念|冲突|动机|转折|结局|"
+  r"大纲|架构|蓝图|文风|语气|节奏|资料|素材|参考|考据|历史|地理|民俗|神话|案件|证据)",
+  re.IGNORECASE,
+)
+_LONG_INPUT_TECHNICAL_NOISE_PATTERN = re.compile(
+  r"(Traceback|Exception|Error:|ERROR|WARN|warning|node_modules|npm\s|pnpm\s|yarn\s|"
+  r"stack trace|console\.(?:log|error|warn)|function\s+\w+|class\s+\w+|from\s+\w+\s+import|"
+  r"import\s+\{|SELECT\s+|CREATE\s+TABLE|INSERT\s+INTO|curl\s+|HTTP/\d|localhost|127\.0\.0\.1|"
+  r"<script|</div>|</span>|TypeError|ReferenceError|SyntaxError|ValidationError|pytest|unittest|vite|FastAPI)",
+  re.IGNORECASE,
+)
+_LONG_INPUT_BOILERPLATE_PATTERN = re.compile(
+  r"(cookie|privacy policy|newsletter|subscribe|advertisement|版权所有|ICP备案|登录|注册|导航|菜单|"
+  r"联系我们|隐私政策|用户协议|广告|分享到|点击加载)",
+  re.IGNORECASE,
+)
+_MAX_CHAPTER_RANGE_GENERATION_ACTIONS = 3
 _SKILL_OPTIMIZE_PATTERN = re.compile(
   r"(记成技能|保存成技能|沉淀成技能|创建技能|新建技能|优化.*技能|更新.*技能|修改.*技能|"
   r"以后.*(按|照|都|就).*(方式|规则|流程|处理|写|改)|每次.*(按|照|都|就).*(方式|规则|流程|处理|写|改)|"
   r"把.*(规则|流程|方法|方式).*(记住|保存|沉淀))"
 )
+
+
+class AgentSessionInterrupted(RuntimeError):
+  pass
 
 _KNOWLEDGE_REVIEW_SYSTEM_PROMPT = """
 你是小说项目里的资料库分析器。你的任务是先通读资料，再提炼后续架构、蓝图和续写必须遵守的信息。
@@ -265,11 +321,81 @@ class RuntimeState:
   next_chapter: object | None
 
 
+@dataclass(slots=True)
+class LongInputMaterialization:
+  titles: list[str]
+  original_length: int
+  candidate_blocks: int = 0
+  imported_blocks: int = 0
+  skipped_blocks: int = 0
+  project_detail: object | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _BuiltinSkillActionHint:
+  skill_id: str
+  name: str
+  action_kind: str
+  action_mode: str
+  requires_confirmation: bool
+
+
 def _compact_text(text: str, limit: int = 120) -> str:
   normalized = " ".join(str(text or "").split())
   if len(normalized) <= limit:
     return normalized
   return f"{normalized[:limit].rstrip()}…"
+
+
+def _clip_middle(text: str, limit: int) -> str:
+  normalized = str(text or "").strip()
+  if len(normalized) <= limit:
+    return normalized
+  if limit <= 1:
+    return normalized[:limit]
+  if limit <= 12:
+    return normalized[:limit].rstrip()
+  marker = "……"
+  body_limit = max(1, limit - len(marker))
+  head_limit = max(1, int(body_limit * 0.55))
+  tail_limit = max(1, body_limit - head_limit)
+  return f"{normalized[:head_limit].rstrip()}{marker}{normalized[-tail_limit:].lstrip()}"
+
+
+def _agent_message_model_content(message: object, limit: int = 1200) -> str:
+  content = str(getattr(message, "content", "") or "").strip()
+  if len(content) <= limit:
+    return content
+
+  original_length = int(getattr(message, "original_length", 0) or 0)
+  original_length = max(original_length, len(content))
+  summary = " ".join(str(getattr(message, "summary", "") or "").split())
+  header = f"[长文本压缩，原文约 {original_length} 字]"
+
+  if summary:
+    summary_block = f"{header}\n摘要：{summary}"
+    if len(summary_block) >= limit:
+      return _clip_middle(summary_block, limit)
+    remaining = limit - len(summary_block) - len("\n原文片段：\n")
+    if remaining <= 20:
+      return _clip_middle(summary_block, limit)
+    return f"{summary_block}\n原文片段：\n{_clip_middle(content, remaining)}"
+
+  remaining = limit - len(header) - 1
+  if remaining <= 20:
+    return _clip_middle(header, limit)
+  return f"{header}\n{_clip_middle(content, remaining)}"
+
+
+def _agent_message_model_messages(messages: list[object], *, limit: int = 3800) -> list[BrainstormMessage]:
+  model_messages: list[BrainstormMessage] = []
+  for item in messages:
+    content = _agent_message_model_content(item, limit=limit).strip()
+    if not content:
+      continue
+    role = str(getattr(item, "role", "") or "")
+    model_messages.append(BrainstormMessage(role=role if role in {"user", "assistant", "system"} else "assistant", content=content))
+  return model_messages
 
 
 def _ordered_unique_strings(items: list[str]) -> list[str]:
@@ -282,6 +408,321 @@ def _ordered_unique_strings(items: list[str]) -> list[str]:
     seen.add(value)
     ordered.append(value)
   return ordered
+
+
+def _append_long_input_sized_blocks(blocks: list[str], text: str, limit: int = _LONG_INPUT_MATERIAL_BLOCK_LIMIT) -> None:
+  normalized = str(text or "").strip()
+  if not normalized:
+    return
+  if len(normalized) <= limit:
+    blocks.append(normalized)
+    return
+
+  lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+  if len(lines) > 1:
+    buffer = ""
+    for line in lines:
+      candidate = f"{buffer}\n{line}".strip() if buffer else line
+      if len(candidate) > limit and buffer:
+        blocks.append(buffer)
+        buffer = line
+      else:
+        buffer = candidate
+    if buffer:
+      blocks.append(buffer)
+    return
+
+  parts = [item.strip() for item in re.split(r"(?<=[。！？!?\.])\s*", normalized) if item.strip()]
+  buffer = ""
+  for part in parts or [normalized]:
+    candidate = f"{buffer}{part}" if buffer else part
+    if len(candidate) > limit and buffer:
+      blocks.append(buffer)
+      buffer = part
+    else:
+      buffer = candidate
+    while len(buffer) > limit:
+      blocks.append(buffer[:limit].strip())
+      buffer = buffer[limit:].strip()
+  if buffer:
+    blocks.append(buffer)
+
+
+def _split_long_input_candidate_blocks(text: str) -> list[str]:
+  normalized = str(text or "").replace("\r\n", "\n").strip()
+  if not normalized:
+    return []
+  blocks: list[str] = []
+  for raw_block in re.split(r"\n{2,}", normalized):
+    _append_long_input_sized_blocks(blocks, raw_block)
+  return blocks
+
+
+def _long_input_pattern_score(pattern: re.Pattern[str], text: str) -> int:
+  return len(pattern.findall(str(text or "")[:6_000]))
+
+
+def _long_input_alnum_blob_ratio(text: str) -> float:
+  compact = re.sub(r"\s+", "", str(text or ""))
+  if not compact:
+    return 0.0
+  blobs = "".join(re.findall(r"[A-Za-z0-9+/=_-]{80,}", compact))
+  return len(blobs) / max(1, len(compact))
+
+
+def _long_input_code_symbol_ratio(text: str) -> float:
+  compact = re.sub(r"\s+", "", str(text or ""))
+  if not compact:
+    return 0.0
+  symbols = re.findall(r"[{}<>\[\]();=\\]", compact)
+  return len(symbols) / max(1, len(compact))
+
+
+def _long_input_readable_ratio(text: str) -> float:
+  compact = re.sub(r"\s+", "", str(text or ""))
+  if not compact:
+    return 0.0
+  readable = re.findall(r"[\w\u4e00-\u9fff，。！？、；：“”‘’（）《》]", compact)
+  return len(readable) / max(1, len(compact))
+
+
+def _long_input_repeated_char_ratio(text: str) -> float:
+  compact = re.sub(r"\s+", "", str(text or ""))
+  if len(compact) < 80:
+    return 0.0
+  counts: dict[str, int] = {}
+  for char in compact:
+    counts[char] = counts.get(char, 0) + 1
+  return max(counts.values()) / max(1, len(compact))
+
+
+def _long_input_has_material_intent(text: str) -> bool:
+  head = str(text or "")[:3_000]
+  tail = str(text or "")[-1_200:]
+  return bool(_LONG_INPUT_IMPORT_INTENT_PATTERN.search(f"{head}\n{tail}"))
+
+
+def _keep_long_input_material_block(block: str, *, material_intent: bool) -> bool:
+  text = str(block or "").strip()
+  if len(text) < 24:
+    return False
+
+  relevant_score = _long_input_pattern_score(_LONG_INPUT_RELEVANT_PATTERN, text)
+  technical_score = _long_input_pattern_score(_LONG_INPUT_TECHNICAL_NOISE_PATTERN, text)
+  boilerplate_score = _long_input_pattern_score(_LONG_INPUT_BOILERPLATE_PATTERN, text)
+  readable_ratio = _long_input_readable_ratio(text)
+  code_symbol_ratio = _long_input_code_symbol_ratio(text)
+
+  if _long_input_repeated_char_ratio(text) >= 0.65:
+    return False
+  if _long_input_alnum_blob_ratio(text) >= 0.45:
+    return False
+  if technical_score >= 2 and relevant_score == 0:
+    return False
+  if technical_score >= 1 and relevant_score == 0 and code_symbol_ratio >= 0.16:
+    return False
+  if boilerplate_score >= 3 and relevant_score == 0:
+    return False
+  if readable_ratio < 0.55 and relevant_score == 0:
+    return False
+
+  if relevant_score > 0:
+    return True
+  return material_intent and readable_ratio >= 0.72 and code_symbol_ratio < 0.12
+
+
+def _pack_long_input_material_blocks(
+  blocks: list[str],
+  limit: int = _LONG_INPUT_MATERIAL_CHUNK_LIMIT,
+) -> list[str]:
+  chunk_limit = max(1_000, min(limit, KNOWLEDGE_IMPORT_CONTENT_MAX_LENGTH - 1_000))
+  chunks: list[str] = []
+  buffer = ""
+  for block in blocks:
+    text = str(block or "").strip()
+    if not text:
+      continue
+    candidate = f"{buffer}\n\n{text}".strip() if buffer else text
+    if len(candidate) > chunk_limit and buffer:
+      chunks.append(buffer)
+      buffer = text
+    else:
+      buffer = candidate
+    while len(buffer) > chunk_limit:
+      chunks.append(buffer[:chunk_limit].strip())
+      buffer = buffer[chunk_limit:].strip()
+  if buffer:
+    chunks.append(buffer)
+  return chunks
+
+
+def _filtered_long_input_material_chunks(content: str) -> tuple[list[str], int, int]:
+  blocks = _split_long_input_candidate_blocks(content)
+  material_intent = _long_input_has_material_intent(content)
+  kept_blocks = [
+    block
+    for block in blocks
+    if _keep_long_input_material_block(block, material_intent=material_intent)
+  ]
+  skipped_blocks = max(0, len(blocks) - len(kept_blocks))
+  return _pack_long_input_material_blocks(kept_blocks), len(kept_blocks), skipped_blocks
+
+
+def _long_input_material_title(content_hash: str, index: int, total: int) -> str:
+  if total <= 1:
+    return f"Agent长输入-{content_hash}"
+  return f"Agent长输入-{content_hash}-第{index:02d}部分"
+
+
+def _long_input_material_content(
+  message: object,
+  content: str,
+  chunk: str,
+  index: int,
+  total: int,
+  *,
+  skipped_blocks: int = 0,
+) -> str:
+  message_id = str(getattr(message, "id", "") or "").strip() or "未提供"
+  header = "\n".join(
+    [
+      "来源：Agent 主对话长文本",
+      f"消息 ID：{message_id}",
+      f"分段：{index}/{total}",
+      f"原文总长度：{len(content)} 字",
+      "筛选：已排除明显无关、技术日志或网页样板段落" if skipped_blocks > 0 else "筛选：未发现需要排除的段落",
+      "",
+    ]
+  )
+  return f"{header}{chunk}".strip()
+
+
+def _materialize_long_agent_inputs(settings: Settings, payload: AgentChatRequest) -> LongInputMaterialization:
+  items: list[KnowledgeImportItem] = []
+  titles: list[str] = []
+  original_length = 0
+  candidate_blocks = 0
+  imported_blocks = 0
+  skipped_blocks = 0
+
+  for message in payload.messages:
+    if str(getattr(message, "role", "") or "") != "user":
+      continue
+    content = str(getattr(message, "content", "") or "").strip()
+    if len(content) < _LONG_INPUT_MATERIALIZE_THRESHOLD:
+      continue
+
+    original_length += len(content)
+    content_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+    chunks, kept_block_count, skipped_block_count = _filtered_long_input_material_chunks(content)
+    imported_blocks += kept_block_count
+    skipped_blocks += skipped_block_count
+    candidate_blocks += kept_block_count + skipped_block_count
+    total = len(chunks)
+    for index, chunk in enumerate(chunks, start=1):
+      title = _long_input_material_title(content_hash, index, total)
+      titles.append(title)
+      items.append(
+        KnowledgeImportItem(
+          title=title,
+          content=_long_input_material_content(
+            message,
+            content,
+            chunk,
+            index,
+            total,
+            skipped_blocks=skipped_block_count,
+          ),
+        )
+      )
+
+  if not items:
+    return LongInputMaterialization(
+      titles=[],
+      original_length=original_length,
+      candidate_blocks=candidate_blocks,
+      imported_blocks=0,
+      skipped_blocks=skipped_blocks,
+    )
+
+  detail = import_project_knowledge(
+    settings,
+    payload.project_id,
+    KnowledgeImportRequest(items=items),
+  )
+  return LongInputMaterialization(
+    titles=_ordered_unique_strings(titles),
+    original_length=original_length,
+    candidate_blocks=candidate_blocks,
+    imported_blocks=imported_blocks,
+    skipped_blocks=skipped_blocks,
+    project_detail=detail,
+  )
+
+
+def _payload_with_auto_material_references(
+  payload: AgentChatRequest,
+  materialization: LongInputMaterialization,
+) -> AgentChatRequest:
+  if not materialization.titles:
+    return payload
+  references = _ordered_unique_strings([*materialization.titles, *payload.reference_filenames])[:20]
+  return payload.model_copy(update={"reference_filenames": references})
+
+
+def _long_input_materialization_changes(materialization: LongInputMaterialization) -> list[str]:
+  if not materialization.titles:
+    if materialization.skipped_blocks > 0:
+      return [
+        (
+          "本轮超长输入未写入资料库：没有识别到和作品创作相关的资料段；"
+          f"已跳过 {materialization.skipped_blocks} 段。"
+        )
+      ]
+    return []
+  filter_text = (
+    f"筛选保留 {materialization.imported_blocks}/{materialization.candidate_blocks} 段，"
+    f"跳过 {materialization.skipped_blocks} 段；"
+    if materialization.candidate_blocks > 0
+    else ""
+  )
+  return [
+    (
+      f"已把本轮超长输入按 {len(materialization.titles)} 份资料导入项目资料库；"
+      f"{filter_text}原文约 {materialization.original_length} 字，执行时通过资料库检索使用。"
+    )
+  ]
+
+
+def _plan_with_reference_note(plan: AgentPlan, reference_filenames: list[str]) -> AgentPlan:
+  if not reference_filenames:
+    return plan
+  actions = [
+    action.model_copy(
+      update={
+        "instruction": _preserve_thread_context_text(
+          _append_reference_note(action.instruction, reference_filenames),
+          3900,
+        )
+      }
+    )
+    for action in plan.actions
+  ]
+  return plan.model_copy(update={"actions": actions})
+
+
+def _result_with_session_changes(
+  result: AgentChatResult,
+  changes: list[str],
+  project_detail: object | None,
+) -> AgentChatResult:
+  if not changes and project_detail is None:
+    return result
+  merged_changes = _ordered_unique_strings([*changes, *result.changes])
+  update_payload: dict[str, object] = {"changes": merged_changes}
+  if project_detail is not None and result.project_detail is None:
+    update_payload["project_detail"] = project_detail
+  return result.model_copy(update=update_payload)
 
 
 def _list_from_raw(value: object) -> list[str]:
@@ -297,7 +738,7 @@ def _latest_user_text(payload: AgentChatRequest) -> str:
     (item for item in reversed(payload.messages) if item.role == "user" and item.content.strip()),
     None,
   )
-  return latest_user_message.content.strip() if latest_user_message is not None else ""
+  return _agent_message_model_content(latest_user_message, limit=1200) if latest_user_message is not None else ""
 
 
 def _skill_query_text(payload: AgentChatRequest) -> str:
@@ -347,8 +788,15 @@ def _build_skill_catalog_context(settings: Settings) -> str:
       behavior = item.behavior.panel
       if item.behavior.mode:
         behavior = f"{behavior}/{item.behavior.mode}"
+      action_hint = ""
+      if item.behavior.agent_action_kind:
+        agent_action = item.behavior.agent_action_kind
+        if item.behavior.agent_action_mode:
+          agent_action = f"{agent_action}/{item.behavior.agent_action_mode}"
+        confirm_label = "需要确认" if item.behavior.agent_requires_confirmation else "无需确认"
+        action_hint = f"，Agent action:{agent_action}，{confirm_label}"
       summary = item.description or item.instruction_preview
-      line = f"- {item.name}（id:{item.id}，{source}，{behavior}）：{summary}"
+      line = f"- {item.name}（id:{item.id}，{source}，{behavior}{action_hint}）：{summary}"
       if scenes:
         line = f"{line}；适用：{scenes}"
       if item.source == "custom" and item.instruction_preview:
@@ -359,6 +807,50 @@ def _build_skill_catalog_context(settings: Settings) -> str:
   if len(text) <= 3600:
     return text
   return f"{text[:3600].rstrip()}…"
+
+
+def _builtin_skill_action_hints(settings: Settings, skill_ids: list[str]) -> list[_BuiltinSkillActionHint]:
+  selected_ids = _ordered_unique_strings(skill_ids)
+  if not selected_ids:
+    return []
+  try:
+    catalog = list_skill_catalog(settings)
+  except Exception:
+    return []
+
+  items_by_id = {
+    item.id: item
+    for section in catalog.sections
+    for item in section.items
+  }
+  hints: list[_BuiltinSkillActionHint] = []
+  for skill_id in selected_ids:
+    item = items_by_id.get(skill_id)
+    if item is None or item.source == "custom":
+      continue
+    behavior = item.behavior
+    action_kind = behavior.agent_action_kind.strip()
+    if not action_kind:
+      continue
+    hints.append(
+      _BuiltinSkillActionHint(
+        skill_id=item.id,
+        name=item.name,
+        action_kind=action_kind,
+        action_mode=behavior.agent_action_mode.strip(),
+        requires_confirmation=behavior.agent_requires_confirmation,
+      )
+    )
+  return hints
+
+
+def _custom_skill_ids_from_ids(settings: Settings, skill_ids: list[str]) -> list[str]:
+  return match_custom_skill_ids(
+    settings,
+    "",
+    active_skill_ids=_ordered_unique_strings(skill_ids),
+    limit=5,
+  )
 
 
 def _resolve_agent_skill_ids(settings: Settings, payload: AgentChatRequest) -> list[str]:
@@ -380,14 +872,14 @@ def _skill_ids_from_plan(plan: AgentPlan | None) -> list[str]:
   return _ordered_unique_strings(skill_ids)
 
 
-def _apply_skill_ids_to_plan(plan: AgentPlan | None, skill_ids: list[str]) -> AgentPlan | None:
+def _apply_skill_ids_to_plan(settings: Settings, plan: AgentPlan | None, skill_ids: list[str]) -> AgentPlan | None:
   if plan is None:
     return None
   resolved_ids = _ordered_unique_strings(skill_ids)
   if not resolved_ids and not _skill_ids_from_plan(plan):
     return plan
   actions = [
-    action.model_copy(update={"skill_ids": _ordered_unique_strings([*action.skill_ids, *resolved_ids])[:5]})
+    action.model_copy(update={"skill_ids": _custom_skill_ids_from_ids(settings, [*action.skill_ids, *resolved_ids])})
     for action in plan.actions
   ]
   return plan.model_copy(update={"actions": actions})
@@ -396,7 +888,7 @@ def _apply_skill_ids_to_plan(plan: AgentPlan | None, skill_ids: list[str]) -> Ag
 def _brainstorm_messages_from_agent(payload: AgentChatRequest) -> list[BrainstormMessage]:
   messages: list[BrainstormMessage] = []
   for item in payload.messages[-20:]:
-    content = item.content.strip()
+    content = _agent_message_model_content(item, limit=3800).strip()
     if not content or content in {"确认执行", "确认执行。"} or _looks_like_plan_reply(content):
       continue
     messages.append(BrainstormMessage(role=item.role, content=content))
@@ -512,7 +1004,7 @@ def _discussion_context_from_messages(messages: list[object], limit: int = 6) ->
   collected: list[str] = []
   for item in reversed(messages):
     role = str(getattr(item, "role", "") or "")
-    content = str(getattr(item, "content", "") or "").strip()
+    content = _agent_message_model_content(item, limit=900).strip()
     if role not in {"user", "assistant"} or not content:
       continue
     if content == "确认执行。":
@@ -541,8 +1033,11 @@ def _append_reference_note(instruction: str, reference_filenames: list[str]) -> 
   if not names:
     return instruction.strip()
   parts = [instruction.strip()] if instruction.strip() else []
+  shown_names = "、".join(names[:8])
+  if len(names) > 8:
+    shown_names = f"{shown_names} 等 {len(names)} 份"
   parts.append(
-    f"本轮已导入参考资料：{'、'.join(names[:8])}。请优先检索并使用这些资料，遇到冲突先指出。"
+    f"本轮已导入参考资料：{shown_names}。请优先检索并使用这些资料，遇到冲突先指出。"
   )
   return "\n\n".join(parts).strip()
 
@@ -748,6 +1243,130 @@ def _append_chapter_review_artifact(state: AgentExecutionState, chapter_id: str)
   )
 
 
+def _obsidian_maintenance_action_signature(action: dict[str, object]) -> tuple[str, ...]:
+  return (
+    str(action.get("suggestion_id") or ""),
+    str(action.get("status") or ""),
+    str(action.get("draft_path") or ""),
+    str(action.get("draft_content_hash") or ""),
+    str(action.get("vault_relative_path") or ""),
+    str(action.get("published_content_hash") or ""),
+    str(action.get("merge_draft_path") or ""),
+  )
+
+
+def _obsidian_maintenance_action_signatures(project_dir: Path) -> set[tuple[str, ...]]:
+  try:
+    narrative_state = load_project_narrative_state(project_dir)
+  except Exception:
+    return set()
+  signatures: set[tuple[str, ...]] = set()
+  for item in narrative_state.get("obsidian_maintenance_actions", []) if isinstance(narrative_state, dict) else []:
+    if isinstance(item, dict):
+      signatures.add(_obsidian_maintenance_action_signature(item))
+  return signatures
+
+
+def _obsidian_action_status_label(value: object) -> str:
+  status = str(value or "").strip()
+  return {
+    "staged": "待审草稿",
+    "published": "已发布到 Vault",
+    "published_outdated": "Vault 待更新",
+    "published_missing": "Vault 笔记缺失",
+    "draft_missing": "草稿缺失",
+    "ignored": "已忽略",
+  }.get(status, status or "待处理")
+
+
+def _append_obsidian_maintenance_delta_artifact(
+  state: AgentExecutionState,
+  *,
+  chapter: object,
+  before_signatures: set[tuple[str, ...]],
+) -> list[str]:
+  obsidian = getattr(getattr(state.runtime.detail, "story_overview", None), "obsidian", None)
+  if not bool(getattr(obsidian, "enabled", False)):
+    return []
+  try:
+    chapter_index = int(getattr(chapter, "index", 0) or 0)
+  except (TypeError, ValueError):
+    chapter_index = 0
+  if chapter_index <= 0:
+    return []
+
+  project_dir = Path(state.runtime.detail.path)
+  try:
+    narrative_state = load_project_narrative_state(project_dir)
+  except Exception:
+    return []
+  actions = [
+    item
+    for item in narrative_state.get("obsidian_maintenance_actions", [])
+    if isinstance(item, dict) and _obsidian_maintenance_action_signature(item) not in before_signatures
+  ]
+  if not actions:
+    return []
+
+  suggestions = {
+    str(item.get("id") or ""): item
+    for item in narrative_state.get("obsidian_maintenance_suggestions", [])
+    if isinstance(item, dict)
+  }
+  related: list[tuple[dict[str, object], dict[str, object]]] = []
+  for action in actions:
+    suggestion = suggestions.get(str(action.get("suggestion_id") or ""))
+    if not suggestion:
+      continue
+    source_chapters: list[int] = []
+    for raw in suggestion.get("source_chapters", []) if isinstance(suggestion.get("source_chapters"), list) else []:
+      try:
+        source_chapter = int(raw or 0)
+      except (TypeError, ValueError):
+        continue
+      if source_chapter > 0:
+        source_chapters.append(source_chapter)
+    if source_chapters and chapter_index not in source_chapters:
+      continue
+    related.append((suggestion, action))
+
+  if not related:
+    return []
+  related.sort(key=lambda item: obsidian_maintenance_suggestion_sort_key(item[0], chapter_index), reverse=True)
+  lines: list[str] = []
+  for suggestion, action in related[:6]:
+    title = _compact_text(suggestion.get("title") or action.get("title") or "Obsidian 维护建议", 72)
+    path_text = _compact_text(
+      action.get("relative_path") or action.get("vault_relative_path") or suggestion.get("suggested_path"),
+      100,
+    )
+    status_label = _obsidian_action_status_label(action.get("status") or suggestion.get("status"))
+    if path_text:
+      lines.append(f"- {title}｜{status_label}｜{path_text}")
+    else:
+      lines.append(f"- {title}｜{status_label}")
+  if not lines:
+    return []
+
+  count = len(related)
+  change = f"已生成第 {chapter_index} 章相关 Obsidian 维护产物 {count} 条"
+  state.changes.append(change)
+  _append_artifact(
+    state,
+    kind="obsidian_maintenance",
+    title=f"第 {chapter_index} 章 Obsidian 维护产物",
+    summary=f"已生成第 {chapter_index} 章相关 Obsidian 维护产物 {count} 条。",
+    content_preview="\n".join(lines),
+    metadata={
+      "chapter_id": str(getattr(chapter, "id", "") or ""),
+      "chapter_index": chapter_index,
+      "item_count": count,
+      "suggestion_ids": [str(item[0].get("id") or "") for item in related[:12]],
+    },
+  )
+  return [change]
+
+
 def _review_metadata(review_status: dict[str, object]) -> dict[str, object]:
   metadata: dict[str, object] = {}
   for key in ("score", "status", "status_label", "summary", "is_stale", "updated_at", "error"):
@@ -893,30 +1512,120 @@ def _record_action_failure(
   )
 
 
-def _review_project_knowledge(settings: Settings, runtime: RuntimeState, instruction: str) -> tuple[str, int]:
-  material_count = len(getattr(runtime.detail.story_overview, "materials", []) or [])
-  distillation_summary = build_distillation_review_text(runtime.detail, instruction=instruction)
+def _knowledge_source_count(detail, chapter_index: int = 0) -> int:
+  material_count = len(getattr(detail.story_overview, "materials", []) or [])
+  obsidian = getattr(detail.story_overview, "obsidian", None)
+  if chapter_index > 0:
+    obsidian_count = sum(
+      1
+      for note in list(getattr(obsidian, "notes", []) or [])
+      if obsidian_note_available_for_chapter(note, chapter_index)
+    )
+  else:
+    obsidian_count = int(getattr(obsidian, "included_count", 0) or 0)
+  return material_count + obsidian_count
+
+
+def _target_chapter_id_for_index(runtime: RuntimeState, chapter_index: int) -> str:
+  if chapter_index <= 0:
+    return ""
+  chapter = next(
+    (
+      item
+      for item in runtime.detail.chapters
+      if int(getattr(item, "index", 0) or 0) == chapter_index
+    ),
+    None,
+  )
+  return str(getattr(chapter, "id", "") or "").strip()
+
+
+def _knowledge_review_target_context(
+  settings: Settings,
+  runtime: RuntimeState,
+  instruction: str,
+  *,
+  task_pack_kind: str = "",
+  chapter_index: int = 0,
+) -> str:
+  chapter_id = _target_chapter_id_for_index(runtime, chapter_index)
+  if not chapter_id:
+    return ""
+  try:
+    bundle = build_project_context_bundle(
+      settings,
+      runtime.detail.id,
+      include_blueprint=True,
+      include_character_state=True,
+      chapter_id=chapter_id,
+      knowledge_query=instruction,
+      knowledge_limit=4,
+      task_pack_kind=task_pack_kind or "continuation",
+      task_instruction=instruction,
+    )
+  except Exception:
+    return ""
+  return _compact_text(bundle.context_text, 4500)
+
+
+def _review_project_knowledge(
+  settings: Settings,
+  runtime: RuntimeState,
+  instruction: str,
+  *,
+  task_pack_kind: str = "",
+  chapter_index: int = 0,
+) -> tuple[str, int]:
+  source_count = _knowledge_source_count(runtime.detail, chapter_index=chapter_index)
+  target_context = _knowledge_review_target_context(
+    settings,
+    runtime,
+    instruction,
+    task_pack_kind=task_pack_kind,
+    chapter_index=chapter_index,
+  )
+  distillation_summary = build_distillation_review_text(
+    runtime.detail,
+    kind=task_pack_kind,
+    instruction=instruction,
+    chapter_index=chapter_index,
+  )
   if distillation_summary:
-    if material_count > 0:
+    context_block = f"\n\n目标章节上下文：\n{target_context}" if target_context else ""
+    if source_count > 0:
       return (
-        f"{distillation_summary}\n\n资料库统计：当前共整理 {material_count} 份上传资料。",
-        material_count,
+        f"{distillation_summary}{context_block}\n\n资料库统计：当前共整理 {source_count} 份上传资料或 Obsidian 笔记。",
+        source_count,
       )
     return (
-      f"{distillation_summary}\n\n资料库统计：当前没有上传资料，已按现有项目文档、记忆和正文整理。",
+      f"{distillation_summary}{context_block}\n\n资料库统计：当前没有上传资料或 Obsidian 笔记，已按现有项目文档、记忆和正文整理。",
       0,
     )
 
   materials = load_project_knowledge_material_contents(settings, runtime.detail.id, limit=10)
-  if not materials:
+  obsidian_notes = load_project_obsidian_note_contents(
+    settings,
+    runtime.detail.id,
+    limit=10,
+    chapter_index=chapter_index,
+    query=f"{task_pack_kind} {instruction}".strip(),
+  )
+  sources = [
+    {**item, "source": "资料库"}
+    for item in materials
+  ] + obsidian_notes
+  if not sources:
+    if target_context:
+      return f"资料库当前没有额外资料。\n\n目标章节上下文：\n{target_context}", 0
     return "资料库当前为空，没有可分析的资料。", 0
 
   material_blocks: list[str] = []
   total_chars = 0
-  for index, item in enumerate(materials, start=1):
+  for index, item in enumerate(sources, start=1):
     content = str(item.get("content") or "").strip()
     snippet = _compact_text(content, 1200)
-    block = f"资料 {index}｜{item.get('title') or '未命名'}\n{snippet}"
+    source_label = str(item.get("source") or "资料库").strip()
+    block = f"资料 {index}｜{source_label}｜{item.get('title') or '未命名'}\n{snippet}"
     material_blocks.append(block)
     total_chars += len(block)
     if total_chars >= 12000:
@@ -931,6 +1640,7 @@ def _review_project_knowledge(settings: Settings, runtime: RuntimeState, instruc
         "content": (
           f"作品：{runtime.detail.name}\n"
           f"用户要求：{instruction.strip() or '无'}\n\n"
+          f"目标章节上下文：\n{target_context or '无'}\n\n"
           f"资料库内容：\n\n{'\n\n'.join(material_blocks)}"
         ).strip(),
       },
@@ -939,10 +1649,51 @@ def _review_project_knowledge(settings: Settings, runtime: RuntimeState, instruc
   ).strip()
 
   if content:
-    return content, len(materials)
+    return content, len(sources)
 
-  fallback_lines = [f"- {item.get('title') or '未命名'}：{_compact_text(item.get('content') or '', 140)}" for item in materials[:6]]
-  return "已确认事实：\n" + "\n".join(fallback_lines), len(materials)
+  fallback_lines = [
+    f"- {item.get('source') or '资料库'}｜{item.get('title') or '未命名'}：{_compact_text(item.get('content') or '', 140)}"
+    for item in sources[:6]
+  ]
+  context_block = f"\n\n目标章节上下文：\n{target_context}" if target_context else ""
+  return "已确认事实：\n" + "\n".join(fallback_lines) + context_block, len(sources)
+
+
+async def _knowledge_summary_for_action(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> str:
+  if not state.knowledge_summary.strip():
+    return ""
+  if not ctx.action.chapter_id:
+    return state.knowledge_summary
+  if state.knowledge_summary_chapter_id in {"", ctx.action.chapter_id}:
+    return state.knowledge_summary
+  if ctx.action.chapter_id in state.chapter_knowledge_summaries:
+    return state.chapter_knowledge_summaries[ctx.action.chapter_id]
+
+  chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None)
+  chapter_index = int(getattr(chapter, "index", 0) or 0) if chapter is not None else 0
+  if chapter_index <= 0:
+    return state.knowledge_summary
+
+  knowledge_summary, material_count = await asyncio.to_thread(
+    _review_project_knowledge,
+    ctx.settings,
+    state.runtime,
+    ctx.action.instruction,
+    task_pack_kind=ctx.task_pack_kind,
+    chapter_index=chapter_index,
+  )
+  state.chapter_knowledge_summaries[ctx.action.chapter_id] = knowledge_summary
+  if material_count > 0:
+    state.changes.append(f"已按第 {chapter_index} 章刷新资料库和 Obsidian 分析")
+  _append_artifact(
+    state,
+    kind="knowledge_summary",
+    title=f"资料库分析：第 {chapter_index} 章",
+    summary=f"已按第 {chapter_index} 章刷新资料库和 Obsidian 分析。" if material_count > 0 else "已检查目标章节资料。",
+    content_preview=knowledge_summary,
+    metadata={"material_count": material_count, "chapter_id": ctx.action.chapter_id, "chapter_index": chapter_index},
+  )
+  return knowledge_summary
 
 
 def _build_route_context(runtime: RuntimeState, messages: list[object]) -> str:
@@ -953,7 +1704,10 @@ def _build_route_context(runtime: RuntimeState, messages: list[object]) -> str:
 
   history_lines = []
   for item in messages[-8:]:
-    history_lines.append(f"{item.role}: {item.content.strip()}")
+    role = str(getattr(item, "role", "") or "")
+    content = _agent_message_model_content(item, limit=650).strip()
+    if role and content:
+      history_lines.append(f"{role}: {content}")
 
   selected = runtime.selected_chapter
   return "\n".join(
@@ -1031,6 +1785,67 @@ def _chapter_number_from_text(text: str) -> int:
   return _cn_number_to_int(matched.group(1))
 
 
+def _append_chapter_index(indexes: list[int], value: int, limit: int) -> None:
+  if value > 0 and value not in indexes and len(indexes) < limit:
+    indexes.append(value)
+
+
+def _chapter_range_indexes_from_text(text: str, limit: int = 6) -> list[int]:
+  normalized = str(text or "")
+  indexes: list[int] = []
+  for matched in _CHAPTER_RANGE_PATTERN.finditer(normalized):
+    start = _cn_number_to_int(matched.group(1))
+    end = _cn_number_to_int(matched.group(2))
+    if start <= 0 or end <= 0:
+      continue
+    lower, upper = (start, end) if start <= end else (end, start)
+    for chapter_index in range(lower, upper + 1):
+      _append_chapter_index(indexes, chapter_index, limit)
+  return indexes
+
+
+def _capability_chapter_indexes_from_text(text: str, limit: int = 6) -> list[int]:
+  normalized = str(text or "")
+  indexes: list[int] = []
+  for pattern in _CAPABILITY_CHAPTER_NUMBER_PATTERNS:
+    matches = list(re.finditer(pattern, normalized, flags=re.IGNORECASE))
+    if matches:
+      for matched in reversed(matches):
+        _append_chapter_index(indexes, _cn_number_to_int(matched.group(1)), limit)
+      break
+
+  for chapter_index in _chapter_range_indexes_from_text(normalized, limit):
+    _append_chapter_index(indexes, chapter_index, limit)
+
+  for matched in _CHAPTER_NUMBER_PATTERN.finditer(normalized):
+    _append_chapter_index(indexes, _cn_number_to_int(matched.group(1)), limit)
+  return indexes
+
+
+def _capability_chapter_number_from_text(text: str) -> int:
+  indexes = _capability_chapter_indexes_from_text(text, limit=1)
+  return indexes[0] if indexes else 0
+
+
+def _capability_context_chapter_indexes(runtime: RuntimeState, instruction: str) -> tuple[list[int], bool]:
+  normalized = str(instruction or "").strip()
+  chapter_indexes = _capability_chapter_indexes_from_text(normalized)
+  if chapter_indexes:
+    return chapter_indexes, True
+  if _ARCHITECTURE_CONTEXT_PATTERN.search(normalized):
+    return [], True
+  if _NEXT_CHAPTER_HINT_PATTERN.search(normalized) and runtime.next_chapter is not None:
+    return [int(getattr(runtime.next_chapter, "index", 0) or 0)], True
+  if runtime.selected_chapter is not None:
+    return [int(getattr(runtime.selected_chapter, "index", 0) or 0)], True
+  return [], False
+
+
+def _capability_context_scope(runtime: RuntimeState, instruction: str) -> tuple[int, bool]:
+  chapter_indexes, include_obsidian_suggestions = _capability_context_chapter_indexes(runtime, instruction)
+  return (chapter_indexes[0] if chapter_indexes else 0), include_obsidian_suggestions
+
+
 def _chapter_number_from_text_for_action(text: str, kind: str, mode: str = "") -> int:
   normalized = str(text or "")
   action_patterns = {
@@ -1105,9 +1920,11 @@ def _chapter_step_text(action: AgentPlanAction, runtime: RuntimeState) -> str:
   )
 
   if action.kind == "review_knowledge":
-    material_count = len(getattr(runtime.detail.story_overview, "materials", []) or [])
-    if material_count > 0:
-      return f"先通读资料库里的 {material_count} 份资料，提炼事实、线索和硬约束"
+    chapter_index = int(getattr(chapter, "index", 0) or 0) if chapter is not None else 0
+    source_count = _knowledge_source_count(runtime.detail, chapter_index=chapter_index)
+    if source_count > 0:
+      scope_text = f"第 {chapter_index} 章可用的" if chapter_index > 0 else ""
+      return f"先通读{scope_text}资料库和 Obsidian 里的 {source_count} 份资料，提炼事实、线索和硬约束"
     return "先检查资料库是否有可用资料，再决定后续怎么执行"
 
   if action.kind == "generate_architecture":
@@ -1165,6 +1982,26 @@ def _plan_summary_from_actions(actions: list[AgentPlanAction], runtime: RuntimeS
   if "skill_optimize" in kinds:
     return "已读取当前对话，计划整理或更新用户技能。"
   return "已读取当前状态，建议按下面顺序处理。"
+
+
+def _review_knowledge_scope_chapter_id(actions: list[AgentPlanAction], start_index: int) -> str:
+  for item in actions[start_index + 1:]:
+    if item.kind == "generate_architecture":
+      return ""
+    if item.chapter_id and item.kind in {"chapter_generate", "chapter_workflow", "consistency_check", "rewrite_chapter"}:
+      return item.chapter_id
+  return ""
+
+
+def _scope_review_knowledge_actions(actions: list[AgentPlanAction]) -> list[AgentPlanAction]:
+  scoped: list[AgentPlanAction] = []
+  for index, action in enumerate(actions):
+    if action.kind == "review_knowledge" and not action.chapter_id:
+      chapter_id = _review_knowledge_scope_chapter_id(actions, index)
+      if chapter_id:
+        action = action.model_copy(update={"chapter_id": chapter_id})
+    scoped.append(action)
+  return scoped
 
 
 def _action_requires_existing_chapter(kind: str, mode: str = "") -> bool:
@@ -1404,11 +2241,94 @@ def _ensure_plan_dependencies(runtime: RuntimeState, instruction: str, actions: 
       ),
     )
 
-  return next_actions
+  return _scope_review_knowledge_actions(next_actions)
 
 
 def _longform_generation_action(action: AgentPlanAction) -> bool:
   return action.kind == "chapter_generate" or (action.kind == "chapter_workflow" and action.mode == "draft")
+
+
+def _chapter_index_for_plan_action(runtime: RuntimeState, action: AgentPlanAction) -> int:
+  chapter = next((item for item in runtime.detail.chapters if item.id == action.chapter_id), None)
+  return int(getattr(chapter, "index", 0) or 0) if chapter is not None else 0
+
+
+def _chapter_range_generation_label(action: AgentPlanAction, chapter_index: int) -> str:
+  if action.kind == "chapter_workflow" and action.mode == "draft":
+    return f"续写第 {chapter_index} 章"
+  return f"生成第 {chapter_index} 章正文"
+
+
+def _expand_chapter_range_generation_actions(
+  runtime: RuntimeState,
+  instruction: str,
+  actions: list[AgentPlanAction],
+) -> list[AgentPlanAction]:
+  range_indexes = _chapter_range_indexes_from_text(
+    instruction,
+    limit=_MAX_CHAPTER_RANGE_GENERATION_ACTIONS + 1,
+  )
+  if len(range_indexes) < 2 or len(range_indexes) > _MAX_CHAPTER_RANGE_GENERATION_ACTIONS:
+    return actions
+
+  core_actions = [item for item in actions if item.kind not in {"review_knowledge", "generate_architecture"}]
+  if len(core_actions) != 1 or not _longform_generation_action(core_actions[0]):
+    return actions
+
+  generation_indexes = [
+    _chapter_index_for_plan_action(runtime, item)
+    for item in actions
+    if _longform_generation_action(item)
+  ]
+  if set(range_indexes).issubset({item for item in generation_indexes if item > 0}):
+    return actions
+
+  base_action = core_actions[0]
+  expanded_actions: list[AgentPlanAction] = []
+  for chapter_index in range_indexes:
+    chapter = _find_chapter(runtime, chapter_index)
+    if chapter is None:
+      return actions
+
+    requested_target = base_action.target_words or 1800
+    target_words = _chapter_generation_target_for_action(
+      runtime,
+      chapter,
+      requested_target=requested_target,
+      instruction=base_action.instruction or instruction,
+    )
+    expanded_actions.append(
+      base_action.model_copy(
+        update={
+          "label": _chapter_range_generation_label(base_action, chapter_index),
+          "chapter_id": chapter.id,
+          "target_words": target_words,
+        }
+      )
+    )
+
+  next_actions: list[AgentPlanAction] = []
+  for action in actions:
+    if action is base_action:
+      next_actions.extend(expanded_actions)
+    else:
+      next_actions.append(action)
+  return next_actions
+
+
+def _chapter_range_generation_limit_message(instruction: str, actions: list[AgentPlanAction]) -> str:
+  range_indexes = _chapter_range_indexes_from_text(
+    instruction,
+    limit=_MAX_CHAPTER_RANGE_GENERATION_ACTIONS + 1,
+  )
+  if len(range_indexes) <= _MAX_CHAPTER_RANGE_GENERATION_ACTIONS:
+    return ""
+  if any(_longform_generation_action(action) for action in actions):
+    return (
+      f"一次直接生成正文最多支持 {_MAX_CHAPTER_RANGE_GENERATION_ACTIONS} 章。"
+      "请把章节范围分成 2 到 3 章一批，或先整理章节蓝图。"
+    )
+  return ""
 
 
 def _longform_rewrite_action(action: AgentPlanAction) -> bool:
@@ -1602,7 +2522,208 @@ def _default_requires_confirmation(actions: list[AgentPlanAction]) -> bool:
   )
 
 
+def _chapter_for_builtin_skill_action(
+  runtime: RuntimeState,
+  hint: _BuiltinSkillActionHint,
+  base_action: AgentPlanAction | None,
+):
+  if base_action is not None and base_action.chapter_id:
+    chapter = next((item for item in runtime.detail.chapters if item.id == base_action.chapter_id), None)
+    if chapter is not None:
+      return chapter
+
+  require_existing = _action_requires_existing_chapter(hint.action_kind, hint.action_mode)
+  decision = RoutingDecision()
+  return _resolve_target_chapter(runtime, decision, require_existing=require_existing)
+
+
+def _action_from_builtin_skill_hint(
+  runtime: RuntimeState,
+  request: AgentChatRequest,
+  hint: _BuiltinSkillActionHint,
+  instruction: str,
+  base_action: AgentPlanAction | None = None,
+) -> AgentPlanAction | None:
+  action_kind = hint.action_kind
+  action_mode = hint.action_mode
+  base_instruction = str(base_action.instruction if base_action is not None else "").strip()
+  action_instruction = base_instruction or instruction
+  custom_skill_ids = base_action.skill_ids if base_action is not None else []
+
+  if action_kind in {"brainstorm", "review_knowledge", "generate_architecture", "skill_optimize"}:
+    label = {
+      "brainstorm": "继续讨论项目方向",
+      "review_knowledge": "分析资料库",
+      "generate_architecture": "生成整书架构",
+      "skill_optimize": "整理用户技能",
+    }[action_kind]
+    return AgentPlanAction(
+      kind=action_kind,
+      label=label if base_action is None else base_action.label or label,
+      task_pack_kind=_task_pack_kind_for_action(action_kind, action_instruction, action_mode),
+      instruction=action_instruction,
+      skill_ids=custom_skill_ids,
+    )
+
+  if action_kind == "continue_project":
+    return AgentPlanAction(
+      kind="continue_project",
+      label=base_action.label if base_action is not None and base_action.label else "扩写后续章节规划",
+      task_pack_kind=_task_pack_kind_for_action("continue_project", action_instruction, action_mode),
+      instruction=action_instruction,
+      new_chapters=base_action.new_chapters if base_action is not None and base_action.new_chapters else 5,
+      style_name=request.style_name,
+      xp_preset=request.xp_preset,
+      skill_ids=custom_skill_ids,
+    )
+
+  chapter = _chapter_for_builtin_skill_action(runtime, hint, base_action)
+  if chapter is None:
+    return None
+
+  if action_kind == "chapter_generate":
+    requested_target = base_action.target_words if base_action is not None and base_action.target_words else 1800
+    target_words = _chapter_generation_target_for_action(
+      runtime,
+      chapter,
+      requested_target=requested_target,
+      instruction=action_instruction,
+    )
+    return AgentPlanAction(
+      kind="chapter_generate",
+      label=f"生成第 {chapter.index} 章正文",
+      task_pack_kind=_task_pack_kind_for_action("chapter_generate", action_instruction, action_mode),
+      chapter_id=chapter.id,
+      instruction=action_instruction,
+      target_words=target_words,
+      style_name=request.style_name,
+      xp_preset=request.xp_preset,
+      characters_involved=request.characters_involved,
+      key_items=request.key_items,
+      scene_location=request.scene_location,
+      time_constraint=request.time_constraint,
+      skill_ids=custom_skill_ids,
+    )
+
+  if action_kind == "chapter_workflow":
+    workflow_mode = action_mode if action_mode in {"diagnose", "scenes", "draft"} else "diagnose"
+    requested_target = (
+      base_action.target_words
+      if base_action is not None and base_action.target_words
+      else 1800 if workflow_mode == "draft" else 1200
+    )
+    target_words = (
+      _chapter_generation_target_for_action(
+        runtime,
+        chapter,
+        requested_target=requested_target,
+        instruction=action_instruction,
+      )
+      if workflow_mode == "draft"
+      else requested_target
+    )
+    return AgentPlanAction(
+      kind="chapter_workflow",
+      label=(
+        f"拆第 {chapter.index} 章场景" if workflow_mode == "scenes"
+        else f"续写第 {chapter.index} 章" if workflow_mode == "draft"
+        else f"判断第 {chapter.index} 章"
+      ),
+      task_pack_kind=_task_pack_kind_for_action("chapter_workflow", action_instruction, workflow_mode),
+      chapter_id=chapter.id,
+      mode=workflow_mode,
+      instruction=action_instruction,
+      target_words=target_words,
+      style_name=request.style_name,
+      xp_preset=request.xp_preset,
+      skill_ids=custom_skill_ids,
+    )
+
+  if action_kind == "consistency_check":
+    return AgentPlanAction(
+      kind="consistency_check",
+      label=f"检查第 {chapter.index} 章一致性",
+      task_pack_kind=_task_pack_kind_for_action("consistency_check", action_instruction, action_mode),
+      chapter_id=chapter.id,
+      instruction=action_instruction,
+      skill_ids=custom_skill_ids,
+    )
+
+  rewrite_mode = action_mode if action_mode in {"finalize", "polish", "humanize"} else "polish"
+  if not (chapter.exists and chapter.content.strip()):
+    return None
+  return AgentPlanAction(
+    kind="rewrite_chapter",
+    label=f"修订第 {chapter.index} 章",
+    task_pack_kind=_task_pack_kind_for_action("rewrite_chapter", action_instruction, rewrite_mode),
+    chapter_id=chapter.id,
+    mode=rewrite_mode,
+    instruction=action_instruction,
+    style_name=request.style_name,
+    xp_preset=request.xp_preset,
+    skill_ids=custom_skill_ids,
+  )
+
+
+def _apply_active_builtin_skill_to_plan(
+  settings: Settings,
+  runtime: RuntimeState,
+  instruction: str,
+  request: AgentChatRequest,
+  plan: AgentPlan | None,
+) -> AgentPlan | None:
+  if plan is None:
+    return None
+  hints = _builtin_skill_action_hints(settings, request.active_skill_ids)
+  if not hints:
+    return plan
+
+  hint = next((item for item in hints if item.action_kind != "brainstorm"), None)
+  if hint is None:
+    return plan
+
+  actions = list(plan.actions)
+  if not actions:
+    return plan
+
+  chapter_action_kinds = {"chapter_generate", "chapter_workflow", "consistency_check", "rewrite_chapter"}
+  if hint.action_kind in chapter_action_kinds:
+    target_kinds = chapter_action_kinds
+  elif hint.action_kind in {"continue_project", "generate_architecture", "review_knowledge", "skill_optimize"}:
+    target_kinds = {hint.action_kind}
+  else:
+    target_kinds = {hint.action_kind}
+  target_index = next((index for index, action in enumerate(actions) if action.kind in target_kinds), -1)
+  if target_index < 0 and hint.action_kind in chapter_action_kinds:
+    target_index = next((index for index, action in enumerate(actions) if action.kind not in {"review_knowledge", "generate_architecture"}), -1)
+  if target_index < 0:
+    target_index = len(actions)
+    base_action = None
+  else:
+    base_action = actions[target_index]
+
+  replacement = _action_from_builtin_skill_hint(runtime, request, hint, instruction, base_action)
+  if replacement is None:
+    return plan
+
+  if target_index >= len(actions):
+    actions.append(replacement)
+  else:
+    actions[target_index] = replacement
+
+  actions = _ensure_plan_dependencies(runtime, instruction, actions)
+  return plan.model_copy(
+    update={
+      "summary": plan.summary,
+      "requires_confirmation": plan.requires_confirmation or hint.requires_confirmation or _default_requires_confirmation(actions),
+      "steps": [_chapter_step_text(action, runtime) for action in actions],
+      "actions": actions,
+    }
+  )
+
+
 def _plan_from_payload(
+  settings: Settings,
   runtime: RuntimeState,
   instruction: str,
   request: AgentChatRequest,
@@ -1636,6 +2757,10 @@ def _plan_from_payload(
     if action is not None:
       actions.append(action)
 
+  limit_message = _chapter_range_generation_limit_message(instruction, actions)
+  if limit_message:
+    return None, limit_message
+  actions = _expand_chapter_range_generation_actions(runtime, instruction, actions)
   actions = _ensure_plan_dependencies(runtime, instruction, actions)
   if not actions:
     return None, reply or "当前请求还不够明确，请说明具体要处理什么。"
@@ -1667,6 +2792,7 @@ def _plan_with_model(
     (item for item in reversed(payload.messages) if item.role == "user" and item.content.strip()),
     payload.messages[-1],
   )
+  latest_user_prompt = _agent_message_model_content(latest_user_message, limit=2400)
   planner_messages = [
     {"role": "system", "content": _PLAN_SYSTEM_PROMPT},
     {"role": "system", "content": _build_route_context(runtime, payload.messages)},
@@ -1674,10 +2800,25 @@ def _plan_with_model(
   skill_catalog_context = _build_skill_catalog_context(settings)
   if skill_catalog_context:
     planner_messages.append({"role": "system", "content": skill_catalog_context})
-  capability_context = build_agent_capability_context(Path(runtime.detail.path))
+  capability_chapter_indexes, include_obsidian_suggestions = _capability_context_chapter_indexes(
+    runtime,
+    latest_user_prompt,
+  )
+  capability_chapter_index = capability_chapter_indexes[0] if capability_chapter_indexes else 0
+  capability_context = build_agent_capability_context(
+    Path(runtime.detail.path),
+    project_detail=runtime.detail,
+    auto_stage_obsidian_drafts=True,
+    chapter_index=capability_chapter_index,
+    chapter_indexes=capability_chapter_indexes,
+    include_obsidian_suggestions=include_obsidian_suggestions,
+  )
   if capability_context:
     planner_messages.append({"role": "system", "content": capability_context})
-  planner_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"})
+  reference_context = _append_reference_note("", payload.reference_filenames)
+  if reference_context:
+    planner_messages.append({"role": "system", "content": reference_context})
+  planner_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_prompt}"})
   content = _invoke_model(
     settings,
     planner_messages,
@@ -1686,7 +2827,7 @@ def _plan_with_model(
   planner_payload = _extract_json_object(content)
   if not isinstance(planner_payload, dict):
     raise RuntimeError("规划结果不是合法 JSON")
-  return _plan_from_payload(runtime, instruction, payload, planner_payload)
+  return _plan_from_payload(settings, runtime, instruction, payload, planner_payload)
 
 
 def _heuristic_route(text: str) -> RoutingDecision:
@@ -1707,7 +2848,7 @@ def _heuristic_route(text: str) -> RoutingDecision:
       reason="命中技能优化表达",
     )
 
-  if _LONGFORM_SUPERVISION_SKIP_PATTERN.search(normalized) and re.search(r"(续写|写正文|写这一章|写第.+章|补写|扩成正文)", normalized):
+  if _LONGFORM_SUPERVISION_SKIP_PATTERN.search(normalized) and re.search(r"(续写|生成.*正文|生成第.+章|写正文|写这一章|写第.+章|补写|扩成正文)", normalized):
     return RoutingDecision(
       intent="write_chapter",
       objective="生成章节初稿",
@@ -1770,7 +2911,7 @@ def _heuristic_route(text: str) -> RoutingDecision:
       reason="命中诊断关键词",
     )
 
-  if re.search(r"(续写|写正文|补完本章|完整章|整章|写完整|写这一章|写第.+章|补写|扩成正文|扩成完整|扩到完整|按目标字数|补到目标字数)", normalized):
+  if re.search(r"(续写|生成.*正文|生成第.+章|写正文|补完本章|完整章|整章|写完整|写这一章|写第.+章|补写|扩成正文|扩成完整|扩到完整|按目标字数|补到目标字数)", normalized):
     return RoutingDecision(
       intent="write_chapter",
       objective="生成章节正文",
@@ -1813,19 +2954,40 @@ def _heuristic_route(text: str) -> RoutingDecision:
   )
 
 
-def _route_with_model(settings: Settings, runtime: RuntimeState, messages: list[object]) -> RoutingDecision:
+def _route_with_model(
+  settings: Settings,
+  runtime: RuntimeState,
+  messages: list[object],
+  reference_filenames: list[str] | None = None,
+) -> RoutingDecision:
   latest_user_message = next(
     (item for item in reversed(messages) if item.role == "user" and item.content.strip()),
     messages[-1],
   )
+  latest_user_prompt = _agent_message_model_content(latest_user_message, limit=2400)
   route_messages = [
     {"role": "system", "content": _ROUTE_SYSTEM_PROMPT},
     {"role": "system", "content": _build_route_context(runtime, messages)},
   ]
-  capability_context = build_agent_capability_context(Path(runtime.detail.path))
+  capability_chapter_indexes, include_obsidian_suggestions = _capability_context_chapter_indexes(
+    runtime,
+    latest_user_prompt,
+  )
+  capability_chapter_index = capability_chapter_indexes[0] if capability_chapter_indexes else 0
+  capability_context = build_agent_capability_context(
+    Path(runtime.detail.path),
+    project_detail=runtime.detail,
+    auto_stage_obsidian_drafts=True,
+    chapter_index=capability_chapter_index,
+    chapter_indexes=capability_chapter_indexes,
+    include_obsidian_suggestions=include_obsidian_suggestions,
+  )
   if capability_context:
     route_messages.append({"role": "system", "content": capability_context})
-  route_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_message.content.strip()}"})
+  reference_context = _append_reference_note("", reference_filenames or [])
+  if reference_context:
+    route_messages.append({"role": "system", "content": reference_context})
+  route_messages.append({"role": "user", "content": f"当前用户消息：{latest_user_prompt}"})
   content = _invoke_model(
     settings,
     route_messages,
@@ -1846,7 +3008,12 @@ def _route_with_model(settings: Settings, runtime: RuntimeState, messages: list[
   )
 
 
-def _resolve_decision(settings: Settings, runtime: RuntimeState, messages: list[object]) -> RoutingDecision:
+def _resolve_decision(
+  settings: Settings,
+  runtime: RuntimeState,
+  messages: list[object],
+  reference_filenames: list[str] | None = None,
+) -> RoutingDecision:
   latest_user_message = next(
     (item for item in reversed(messages) if item.role == "user" and item.content.strip()),
     None,
@@ -1859,7 +3026,7 @@ def _resolve_decision(settings: Settings, runtime: RuntimeState, messages: list[
     return heuristic
 
   try:
-    decision = _route_with_model(settings, runtime, messages)
+    decision = _route_with_model(settings, runtime, messages, reference_filenames=reference_filenames)
     if decision.intent:
       return decision
   except Exception:
@@ -1936,23 +3103,30 @@ def _prepend_knowledge_review_step(
   if not _instruction_requires_knowledge_review(instruction):
     return steps, actions
 
-  material_count = len(getattr(runtime.detail.story_overview, "materials", []) or [])
+  review_action = AgentPlanAction(
+    kind="review_knowledge",
+    label="分析资料库",
+    task_pack_kind=_task_pack_kind_for_action("review_knowledge", instruction),
+    instruction=instruction,
+  )
+  scoped_actions = _scope_review_knowledge_actions([review_action, *actions])
+  scoped_review_action = scoped_actions[0]
+  chapter = (
+    next((item for item in runtime.detail.chapters if item.id == scoped_review_action.chapter_id), None)
+    if scoped_review_action.chapter_id
+    else None
+  )
+  chapter_index = int(getattr(chapter, "index", 0) or 0) if chapter is not None else 0
+  material_count = _knowledge_source_count(runtime.detail, chapter_index=chapter_index)
+  scope_text = f"第 {chapter_index} 章可用的" if chapter_index > 0 else ""
   review_step = (
-    f"先通读资料库里的 {material_count} 份资料，提炼事实、线索和硬约束"
+    f"先通读{scope_text}资料库和 Obsidian 里的 {material_count} 份资料，提炼事实、线索和硬约束"
     if material_count > 0
     else "先检查资料库是否有可用资料，再决定后续怎么执行"
   )
   return (
     [review_step, *steps],
-    [
-      AgentPlanAction(
-        kind="review_knowledge",
-        label="分析资料库",
-        task_pack_kind=_task_pack_kind_for_action("review_knowledge", instruction),
-        instruction=instruction,
-      ),
-      *actions,
-    ],
+    scoped_actions,
   )
 
 
@@ -2171,7 +3345,12 @@ def _build_plan(runtime: RuntimeState, decision: RoutingDecision, instruction: s
       }.get(decision.rewrite_mode or "polish", "修订正文")
       steps.append(f"{rewrite_label}，并写回第 {target_chapter.index} 章《{target_chapter.title}》")
 
+    limit_message = _chapter_range_generation_limit_message(instruction, actions)
+    if limit_message:
+      return None, limit_message
+    actions = _expand_chapter_range_generation_actions(runtime, instruction, actions)
     steps, actions = _prepend_knowledge_review_step(runtime, instruction, steps, actions)
+    steps = [_chapter_step_text(action, runtime) for action in actions]
     plan = AgentPlan(
       id=f"plan-{uuid4().hex[:10]}",
       title=actions[-1].label,
@@ -2195,13 +3374,17 @@ def _resolve_plan(settings: Settings, runtime: RuntimeState, instruction: str, p
     try:
       plan, reply = _plan_with_model(settings, runtime, instruction, payload)
       if plan is not None or reply is not None:
-        return _enhance_longform_plan(runtime, _apply_skill_ids_to_plan(plan, resolved_skill_ids)), reply
+        plan = _apply_active_builtin_skill_to_plan(settings, runtime, instruction, payload, plan)
+        plan = _apply_skill_ids_to_plan(settings, plan, resolved_skill_ids)
+        return _enhance_longform_plan(runtime, plan), reply
     except Exception:
       pass
 
-  decision = _resolve_decision(settings, runtime, payload.messages)
+  decision = _resolve_decision(settings, runtime, payload.messages, reference_filenames=payload.reference_filenames)
   plan, reply = _build_plan(runtime, decision, instruction, payload)
-  return _enhance_longform_plan(runtime, _apply_skill_ids_to_plan(plan, resolved_skill_ids)), reply
+  plan = _apply_active_builtin_skill_to_plan(settings, runtime, instruction, payload, plan)
+  plan = _apply_skill_ids_to_plan(settings, plan, resolved_skill_ids)
+  return _enhance_longform_plan(runtime, plan), reply
 
 
 def _brainstorm_request(
@@ -2210,6 +3393,23 @@ def _brainstorm_request(
   skill_prompt: str = "",
   active_skill_ids: list[str] | None = None,
 ) -> BrainstormRequest:
+  discussion_text = "\n".join(
+    _agent_message_model_content(item, limit=1200)
+    for item in payload.messages[-8:]
+    if str(getattr(item, "content", "") or "").strip()
+  )
+  chapter_indexes, _include_obsidian_suggestions = _capability_context_chapter_indexes(runtime, discussion_text)
+  chapter_index = chapter_indexes[0] if chapter_indexes else 0
+  if chapter_index <= 0:
+    chapter_index = _brainstorm_chapter_index_from_text(discussion_text)
+  target_chapter = next(
+    (
+      item
+      for item in runtime.detail.chapters
+      if int(getattr(item, "index", 0) or 0) == chapter_index
+    ),
+    None,
+  ) if chapter_index > 0 else runtime.selected_chapter
   extra_context = _append_reference_note("", payload.reference_filenames)
   thread_context = _thread_context_from_payload(payload)
   if thread_context:
@@ -2231,16 +3431,14 @@ def _brainstorm_request(
   extra_context = _preserve_thread_context_text(extra_context, 3900)
   return BrainstormRequest(
     project_id=payload.project_id,
-    messages=[
-      BrainstormMessage(role=item.role, content=item.content)
-      for item in payload.messages[-20:]
-    ],
+    messages=_agent_message_model_messages(payload.messages[-20:], limit=3800),
     include_core_seed=True,
     include_characters=True,
     include_world_building=True,
     include_plot=True,
     include_blueprint=runtime.architecture_ready,
     include_character_state=runtime.architecture_ready,
+    chapter_id=str(getattr(target_chapter, "id", "") or "").strip(),
     skill_id=(active_skill_ids or [""])[0],
     extra_context=extra_context,
   )
@@ -2349,85 +3547,80 @@ def _generate_full_architecture(
   messages: list[object],
   task_id: str,
 ):
-  workspace = ArchitectureWorkspace(**{
-    key: runtime.documents.get(key, "")
-    for key, _label in _ARCHITECTURE_STEPS
-  })
-  guidance = _architecture_guidance(runtime, instruction, messages)
-  signature = _architecture_resume_signature(runtime, instruction, guidance)
-  completed_steps = _architecture_completed_steps_from_progress(
-    load_architecture_progress(settings, runtime.detail.id),
-    signature,
-    workspace,
-  )
-  _save_architecture_running_progress(
-    settings,
-    runtime.detail.id,
-    task_id=task_id,
-    signature=signature,
-    completed_steps=completed_steps,
-  )
-  context_snapshot = _build_architecture_task_context_snapshot(settings, runtime, workspace, guidance)
+  with model_runtime_foreground_session():
+    workspace = ArchitectureWorkspace(**{
+      key: runtime.documents.get(key, "")
+      for key, _label in _ARCHITECTURE_STEPS
+    })
+    guidance = _architecture_guidance(runtime, instruction, messages)
+    signature = _architecture_resume_signature(runtime, instruction, guidance)
+    completed_steps = _architecture_completed_steps_from_progress(
+      load_architecture_progress(settings, runtime.detail.id),
+      signature,
+      workspace,
+    )
+    _save_architecture_running_progress(
+      settings,
+      runtime.detail.id,
+      task_id=task_id,
+      signature=signature,
+      completed_steps=completed_steps,
+    )
+    context_snapshot = _build_architecture_task_context_snapshot(settings, runtime, workspace, guidance)
 
-  for step_key, _step_label in _ARCHITECTURE_STEPS:
-    if step_key in completed_steps:
-      continue
-    try:
-      result = _generate_architecture_step(
-        settings,
-        ArchitectureStepRequest(
-          project_id=runtime.detail.id,
-          step=step_key,
-          mode="initial",
-          guidance=guidance,
-          workspace=workspace,
-        ),
-        task_id,
-        context_snapshot,
-      )
-      setattr(workspace, step_key, result.content)
-      save_story_document_incremental(settings, runtime.detail.id, step_key, result.content)
-      completed_steps.append(step_key)
-      _save_architecture_running_progress(
-        settings,
-        runtime.detail.id,
-        task_id=task_id,
-        signature=signature,
-        completed_steps=completed_steps,
-      )
-      enqueue_project_auxiliary_tasks(
-        settings,
-        runtime.detail.id,
-        tasks=["knowledge_index", "story_overview_model", "system_memory"],
-        reason=f"architecture_step:{step_key}",
-      )
-    except Exception as error:
-      _save_architecture_running_progress(
-        settings,
-        runtime.detail.id,
-        task_id=task_id,
-        signature=signature,
-        completed_steps=completed_steps,
-        failed_step=step_key,
-        error=str(error),
-      )
-      if completed_steps:
-        enqueue_project_auxiliary_tasks(
+    for step_key, _step_label in _ARCHITECTURE_STEPS:
+      if step_key in completed_steps:
+        continue
+      try:
+        result = _generate_architecture_step(
+          settings,
+          ArchitectureStepRequest(
+            project_id=runtime.detail.id,
+            step=step_key,
+            mode="initial",
+            guidance=guidance,
+            workspace=workspace,
+          ),
+          task_id,
+          context_snapshot,
+        )
+        setattr(workspace, step_key, result.content)
+        save_story_document_incremental(settings, runtime.detail.id, step_key, result.content)
+        completed_steps.append(step_key)
+        _save_architecture_running_progress(
           settings,
           runtime.detail.id,
-          tasks=["knowledge_index", "story_overview_model", "system_memory"],
-          reason=f"architecture_failed:{step_key}",
+          task_id=task_id,
+          signature=signature,
+          completed_steps=completed_steps,
         )
-      raise
+      except Exception as error:
+        _save_architecture_running_progress(
+          settings,
+          runtime.detail.id,
+          task_id=task_id,
+          signature=signature,
+          completed_steps=completed_steps,
+          failed_step=step_key,
+          error=str(error),
+        )
+        if completed_steps:
+          enqueue_project_auxiliary_tasks(
+            settings,
+            runtime.detail.id,
+            tasks=["knowledge_index", "story_overview_model", "system_memory"],
+            reason=f"architecture_failed:{step_key}",
+          )
+        raise
 
-  clear_architecture_progress(settings, runtime.detail.id)
-  enqueue_project_auxiliary_tasks(
-    settings,
-    runtime.detail.id,
-    tasks=["knowledge_index", "story_overview_model", "system_memory"],
-    reason="architecture_completed",
-  )
-  return get_project_detail(settings, runtime.detail.id, allow_model_overview=False), workspace
+    clear_architecture_progress(settings, runtime.detail.id)
+    enqueue_project_auxiliary_tasks(
+      settings,
+      runtime.detail.id,
+      tasks=["knowledge_index", "story_overview_model", "system_memory"],
+      reason="architecture_completed",
+    )
+    return get_project_detail(settings, runtime.detail.id, allow_model_overview=False), workspace
 
 
 def _execute_chapter_workflow(
@@ -2788,6 +3981,8 @@ def _complete_underfilled_rewrite(
     style_task_type="chapter",
     style_query=action.instruction,
     xp_name=action.xp_preset,
+    project_id=project_id,
+    chapter_id=action.chapter_id,
   )
 
   target_for_rounds = max(0, int(target_words or current_status.get("target_words") or 0))
@@ -2896,22 +4091,30 @@ def _complete_underfilled_rewrite(
 
 @register_action_handler("review_knowledge")
 async def _handle_review_knowledge(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
+  chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None) if ctx.action.chapter_id else None
+  chapter_index = int(getattr(chapter, "index", 0) or 0)
   knowledge_summary, material_count = await asyncio.to_thread(
     _review_project_knowledge,
     ctx.settings,
     state.runtime,
     ctx.action.instruction,
+    task_pack_kind=ctx.action.task_pack_kind,
+    chapter_index=chapter_index,
   )
   state.knowledge_summary = knowledge_summary
+  state.knowledge_summary_chapter_id = ctx.action.chapter_id
+  if ctx.action.chapter_id:
+    state.chapter_knowledge_summaries[ctx.action.chapter_id] = knowledge_summary
   if material_count > 0:
-    state.knowledge_review_note = f"已先分析资料库 {material_count} 份资料。"
-    state.changes.append(f"已分析资料库 {material_count} 份资料")
-  elif "当前没有上传资料，已按现有项目文档、记忆和正文整理" in knowledge_summary:
-    state.knowledge_review_note = "已先整理当前项目资料，资料库当前没有上传资料。"
+    scope_text = f"第 {chapter_index} 章可用的" if chapter_index > 0 else ""
+    state.knowledge_review_note = f"已先分析{scope_text}资料库和 Obsidian {material_count} 份资料。"
+    state.changes.append(f"已分析{scope_text}资料库和 Obsidian {material_count} 份资料")
+  elif "当前没有上传资料或 Obsidian 笔记" in knowledge_summary:
+    state.knowledge_review_note = "已先整理当前项目资料，资料库和 Obsidian 当前没有可用资料。"
     state.changes.append("已整理当前项目文档、记忆和正文")
   else:
-    state.knowledge_review_note = "已先检查资料库，当前没有可用资料。"
-    state.changes.append("已检查资料库，当前没有可用资料")
+    state.knowledge_review_note = "已先检查资料库和 Obsidian，当前没有可用资料。"
+    state.changes.append("已检查资料库和 Obsidian，当前没有可用资料")
 
   _append_artifact(
     state,
@@ -2967,7 +4170,7 @@ async def _handle_skill_optimize(ctx: AgentActionExecutionContext, state: AgentE
   selected_skill_id = selected_skill_ids[0] if selected_skill_ids else ""
   selected_skill_names = custom_skill_names(ctx.settings, selected_skill_ids)
   materialize_messages = [
-    BrainstormMessage(role=item.role, content=item.content)
+    BrainstormMessage(role=item.role, content=_agent_message_model_content(item, limit=3800))
     for item in ctx.payload.messages[-20:]
     if item.content.strip()
   ]
@@ -3128,13 +4331,15 @@ async def _handle_continue_project(ctx: AgentActionExecutionContext, state: Agen
 
 @register_action_handler("chapter_generate")
 async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
+  knowledge_summary = await _knowledge_summary_for_action(ctx, state)
+  before_obsidian_signatures = _obsidian_maintenance_action_signatures(Path(state.runtime.detail.path))
   result, detail, review_error, repair_result = await asyncio.to_thread(
     _execute_chapter_generate,
     ctx.settings,
     state.runtime,
     ctx.action,
     ctx.task_id,
-    state.knowledge_summary,
+    knowledge_summary,
     state.skill_prompt_block,
   )
   state.runtime = _build_runtime_state(ctx.settings, detail.id, ctx.payload.selected_chapter_id)
@@ -3170,25 +4375,32 @@ async def _handle_chapter_generate(ctx: AgentActionExecutionContext, state: Agen
     },
   )
   _append_chapter_review_artifact(state, chapter.id)
+  obsidian_changes = _append_obsidian_maintenance_delta_artifact(
+    state,
+    chapter=chapter,
+    before_signatures=before_obsidian_signatures,
+  )
   _record_action_completion(
     state,
     ctx.step,
     ctx.action,
     task_pack_kind=ctx.task_pack_kind,
     summary=result.summary,
-    changes=chapter_changes,
+    changes=[*chapter_changes, *obsidian_changes],
   )
 
 
 @register_action_handler("chapter_workflow")
 async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
+  knowledge_summary = await _knowledge_summary_for_action(ctx, state)
+  before_obsidian_signatures = _obsidian_maintenance_action_signatures(Path(state.runtime.detail.path))
   result, detail, review_error, repair_result = await asyncio.to_thread(
     _execute_chapter_workflow,
     ctx.settings,
     state.runtime,
     ctx.action,
     ctx.task_id,
-    state.knowledge_summary,
+    knowledge_summary,
     state.skill_prompt_block,
   )
   state.runtime = _build_runtime_state(ctx.settings, detail.id, ctx.payload.selected_chapter_id)
@@ -3240,18 +4452,26 @@ async def _handle_chapter_workflow_action(ctx: AgentActionExecutionContext, stat
   )
   if result.mode == "draft":
     _append_chapter_review_artifact(state, chapter.id)
+  obsidian_changes = []
+  if result.mode == "draft":
+    obsidian_changes = _append_obsidian_maintenance_delta_artifact(
+      state,
+      chapter=chapter,
+      before_signatures=before_obsidian_signatures,
+    )
   _record_action_completion(
     state,
     ctx.step,
     ctx.action,
     task_pack_kind=ctx.task_pack_kind,
     summary=result.summary,
-    changes=workflow_changes,
+    changes=[*workflow_changes, *obsidian_changes],
   )
 
 
 @register_action_handler("consistency_check")
 async def _handle_consistency_check(ctx: AgentActionExecutionContext, state: AgentExecutionState) -> None:
+  knowledge_summary = await _knowledge_summary_for_action(ctx, state)
   result = await asyncio.to_thread(
     _generate_consistency,
     ctx.settings,
@@ -3260,7 +4480,7 @@ async def _handle_consistency_check(ctx: AgentActionExecutionContext, state: Age
       chapter_id=ctx.action.chapter_id,
       focus=_compose_execution_instruction(
         ctx.action.instruction,
-        knowledge_summary=state.knowledge_summary,
+        knowledge_summary=knowledge_summary,
         skill_prompt=state.skill_prompt_block,
       ),
     ),
@@ -3299,6 +4519,8 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
   original_chapter = next((item for item in state.runtime.detail.chapters if item.id == ctx.action.chapter_id), None)
   if original_chapter is None:
     raise RuntimeError("目标章节不存在")
+  knowledge_summary = await _knowledge_summary_for_action(ctx, state)
+  before_obsidian_signatures = _obsidian_maintenance_action_signatures(Path(state.runtime.detail.path))
   target_words, target_basis = _rewrite_target_for_action(state.runtime, ctx.action, original_chapter)
   result = await asyncio.to_thread(
     _rewrite_chapter,
@@ -3308,7 +4530,7 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
       chapter_id=ctx.action.chapter_id,
       instruction=_compose_execution_instruction(
         ctx.action.instruction,
-        knowledge_summary=state.knowledge_summary,
+        knowledge_summary=knowledge_summary,
         skill_prompt=state.skill_prompt_block,
       ),
       style_name=ctx.action.style_name,
@@ -3335,7 +4557,7 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
     xp_preset=ctx.action.xp_preset,
     instruction=_compose_execution_instruction(
       ctx.action.instruction,
-      knowledge_summary=state.knowledge_summary,
+      knowledge_summary=knowledge_summary,
       skill_prompt=state.skill_prompt_block,
     ),
   )
@@ -3376,7 +4598,7 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
       length_status=length_status,
       target_words=target_words,
       target_basis=target_basis,
-      knowledge_summary=state.knowledge_summary,
+      knowledge_summary=knowledge_summary,
       skill_prompt=state.skill_prompt_block,
     )
     state.runtime = _build_runtime_state(ctx.settings, detail.id, ctx.payload.selected_chapter_id)
@@ -3389,6 +4611,22 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
     length_status,
     force=bool(completion_info.get("attempted")),
   )
+  humanize_quality_metadata: dict[str, object] = {}
+  quality_report = getattr(result, "quality_report", None)
+  if ctx.action.mode == "humanize" and quality_report is not None and not completion_info.get("restored_original"):
+    display_changes.append(quality_report.summary)
+    if quality_report.delta <= 0:
+      _append_ordered_unique(state.suggestions, "这版本地去 AI 评分没有改善，建议继续按残留问题处理。")
+    humanize_quality_metadata = {
+      "humanize_before_score": quality_report.before_score,
+      "humanize_after_score": quality_report.after_score,
+      "humanize_delta": quality_report.delta,
+      "humanize_summary": quality_report.summary,
+      "humanize_remaining_issues": [
+        item.model_dump(mode="json")
+        for item in quality_report.remaining_issues
+      ],
+    }
   if completion_info.get("restored_original"):
     display_changes = []
   if completion_info.get("applied"):
@@ -3457,18 +4695,24 @@ async def _handle_rewrite_chapter(ctx: AgentActionExecutionContext, state: Agent
       "chapter_id": chapter.id,
       "chapter_index": chapter.index,
       **length_metadata,
+      **humanize_quality_metadata,
       **_review_metadata(review_status),
       **_auto_repair_metadata(repair_result),
     },
   )
   _append_chapter_review_artifact(state, chapter.id)
+  obsidian_changes = _append_obsidian_maintenance_delta_artifact(
+    state,
+    chapter=chapter,
+    before_signatures=before_obsidian_signatures,
+  )
   _record_action_completion(
     state,
     ctx.step,
     ctx.action,
     task_pack_kind=ctx.task_pack_kind,
     summary=trace_summary,
-    changes=rewrite_changes,
+    changes=[*rewrite_changes, *obsidian_changes],
   )
 
 
@@ -3491,7 +4735,7 @@ def _trajectory_record_from_state(
     "thread_id": payload.thread_id,
     "status": status,
     "error": error,
-    "latest_user_message": latest_user_message.content.strip() if latest_user_message else "",
+    "latest_user_message": _agent_message_model_content(latest_user_message, limit=2000) if latest_user_message else "",
     "plan": {
       "id": plan.id,
       "title": plan.title,
@@ -3659,7 +4903,16 @@ async def _run_action_handler_with_heartbeat(
       pass
 
 
+def _raise_if_workflow_interrupted(project_dir: Path, task_id: str) -> None:
+  message = agent_workflow_interrupt_message(project_dir, task_id)
+  if not message:
+    return
+  complete_agent_workflow_run(project_dir, task_id, status="CANCELLED", message=message)
+  raise AgentSessionInterrupted(message)
+
+
 async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: AgentPlan, task_id: str):
+  plan = plan.model_copy(update={"actions": _scope_review_knowledge_actions(plan.actions)})
   active_skill_ids = _ordered_unique_strings([
     *_resolve_agent_skill_ids(settings, payload),
     *_skill_ids_from_plan(plan),
@@ -3697,6 +4950,7 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
   completed_action_kinds: list[str] = []
 
   for index, action in enumerate(plan.actions, start=1):
+    _raise_if_workflow_interrupted(project_dir, task_id)
     current_task_pack_kind = action.task_pack_kind or _task_pack_kind_for_action(action.kind, action.instruction, action.mode)
     if current_task_pack_kind:
       state.active_task_pack_kind = current_task_pack_kind
@@ -3924,6 +5178,8 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
       "project_detail": state.runtime.detail if action.kind in {"generate_architecture", "continue_project", "chapter_generate", "chapter_workflow", "rewrite_chapter"} else None,
     }
 
+  _raise_if_workflow_interrupted(project_dir, task_id)
+
   if state.knowledge_review_note:
     state.last_reply = f"{state.knowledge_review_note}\n\n{state.last_reply}".strip()
 
@@ -3990,6 +5246,13 @@ async def _execute_plan(settings: Settings, payload: AgentChatRequest, plan: Age
     summary=f"workflow 状态：{workflow_info.get('status', '')}",
     content_preview=str(workflow_info.get("path") or ""),
     metadata=workflow_info,
+  )
+  _append_event_block(
+    state,
+    event_type="session_result",
+    title="执行结果",
+    status="completed",
+    summary=_compact_text(state.last_reply or "执行完成。", 360),
   )
 
   result_payload = AgentChatResult(
@@ -4138,12 +5401,43 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
     yield chunk
 
   runtime = _build_runtime_state(settings, payload.project_id, payload.selected_chapter_id)
+  materialization = LongInputMaterialization(titles=[], original_length=0)
+  session_changes: list[str] = []
+
+  try:
+    materialization = await asyncio.to_thread(_materialize_long_agent_inputs, settings, payload)
+    session_changes = _long_input_materialization_changes(materialization)
+    if materialization.titles:
+      payload = _payload_with_auto_material_references(payload, materialization)
+      runtime = _build_runtime_state(settings, payload.project_id, payload.selected_chapter_id)
+      if materialization.project_detail is not None:
+        for chunk in emitter.project_updated(materialization.project_detail.model_dump(mode="json")):
+          yield chunk
+  except Exception as error:
+    for chunk in emitter.session_error(f"长文本自动导入资料库失败：{error}"):
+      yield chunk
+    for chunk in emitter.session_finished("failed"):
+      yield chunk
+    return
 
   if payload.approved_plan is not None:
+    approved_plan = payload.approved_plan
+    if materialization.titles:
+      approved_plan = _plan_with_reference_note(approved_plan, payload.reference_filenames)
     try:
-      async for item in _execute_plan(settings, payload, payload.approved_plan, task_id):
+      async for item in _execute_plan(settings, payload, approved_plan, task_id):
+        if isinstance(item, AgentChatResult):
+          item = _result_with_session_changes(
+            item,
+            session_changes,
+            runtime.detail if materialization.titles else None,
+          )
         for chunk in _iter_execution_event_chunks(emitter, item):
           yield chunk
+    except AgentSessionInterrupted:
+      for chunk in emitter.session_finished("cancelled"):
+        yield chunk
+      return
     except Exception as error:
       for chunk in emitter.session_error(str(error)):
         yield chunk
@@ -4174,9 +5468,6 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
       yield chunk
     return
 
-  instruction = _append_reference_note(latest_user_message.content, payload.reference_filenames)
-  instruction = _append_thread_context_note(instruction, payload)
-
   try:
     for chunk in emitter.action_started(
       step=1,
@@ -4186,13 +5477,22 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
       task_pack_kind="",
     ):
       yield chunk
-    decision = await asyncio.to_thread(_resolve_decision, settings, runtime, payload.messages)
+    instruction = _append_reference_note(latest_user_message.content, payload.reference_filenames)
+    instruction = _append_thread_context_note(instruction, payload)
+    decision = await asyncio.to_thread(
+      _resolve_decision,
+      settings,
+      runtime,
+      payload.messages,
+      payload.reference_filenames,
+    )
     for chunk in emitter.action_result(
       step=1,
       total=2,
       action_kind="session_prepare",
       label="读取当前项目状态",
       task_pack_kind="",
+      changes=session_changes,
     ):
       yield chunk
     for chunk in emitter.action_started(
@@ -4233,6 +5533,8 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
       thread_id=payload.thread_id,
       task_pack_kind=_plan_task_pack_kind(plan),
       plan=plan,
+      changes=session_changes,
+      project_detail=runtime.detail if materialization.titles else None,
       event_blocks=[
         AgentEventBlock(
           event_type="plan_generated",
@@ -4264,6 +5566,8 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
       state=_state_summary(runtime),
       thread_id=payload.thread_id,
       task_pack_kind="",
+      changes=session_changes,
+      project_detail=runtime.detail if materialization.titles else None,
     )
     for chunk in emitter.session_result(result_payload.model_dump(mode="json")):
       yield chunk
@@ -4290,8 +5594,18 @@ async def agent_session_stream(settings: Settings, payload: AgentChatRequest):
 
   try:
     async for item in _execute_plan(settings, payload, direct_plan, task_id):
+      if isinstance(item, AgentChatResult):
+        item = _result_with_session_changes(
+          item,
+          session_changes,
+          runtime.detail if materialization.titles else None,
+        )
       for chunk in _iter_execution_event_chunks(emitter, item):
         yield chunk
+  except AgentSessionInterrupted:
+    for chunk in emitter.session_finished("cancelled"):
+      yield chunk
+    return
   except Exception as error:
     for chunk in emitter.session_error(str(error)):
       yield chunk

@@ -27,8 +27,26 @@ from novel_backend.services.generation_service import (
   _string_list_from_keys,
 )
 from novel_backend.services.config_service import load_config
-from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
+from novel_backend.services.log_service import append_app_log, get_prompt_history_records
+from novel_backend.services.model_runtime_service import (
+  mark_model_runtime_cooldown,
+  model_runtime_should_defer_background,
+  model_runtime_slot,
+)
 from novel_backend.services.project_memory_service import append_project_memory
+from novel_backend.services.project_narrative_state_service import (
+  build_project_narrative_state_chapter_card,
+  load_project_narrative_state,
+  obsidian_pending_soft_constraint_lines,
+  obsidian_maintenance_suggestion_available_for_chapter,
+  obsidian_maintenance_suggestion_preview,
+  obsidian_maintenance_suggestion_sort_key,
+  refresh_project_narrative_state_chapter_cards,
+)
+from novel_backend.services.project_style_xp_evolution_service import (
+  build_obsidian_style_xp_reference_prompt,
+  load_project_style_xp_state,
+)
 from novel_backend.services.skill_service import materialize_skill
 from novel_backend.services.skill_usage_service import (
   get_skill_usage_state,
@@ -78,6 +96,61 @@ _GOLDEN_EVALUATOR_CASES = (
     "expected_findings": [],
   },
 )
+_HUMANIZE_AB_CASES = (
+  {
+    "id": "novel_stock_scene",
+    "label": "套版画面和意义宣告",
+    "before": (
+      "# 第一章 雨夜靠港\n"
+      "此外，林追站在旧码头边，空气仿佛凝固。"
+      "这不仅仅是一场普通的会面，更是他命运转折的重要一步。"
+      "总的来说，故事才刚刚开始。"
+    ),
+    "after": (
+      "# 第一章 雨夜靠港\n"
+      "林追站在旧码头边。雨水从仓库檐角滴下来，他把钥匙换到左手，右手摸向门缝里的铁锈。"
+      "二楼窗帘动了一下，他没有抬头。"
+    ),
+    "min_delta": 35,
+    "min_length_ratio": 0.72,
+  },
+  {
+    "id": "abstract_emotion",
+    "label": "抽象情绪和潜台词解释",
+    "before": (
+      "# 第二章 旧账\n"
+      "他感到一种说不清的恐惧，内心深处涌起复杂的情绪。"
+      "这个眼神意味着真正的危险，所有人都意识到局势已经不可逆转。"
+    ),
+    "after": (
+      "# 第二章 旧账\n"
+      "林追把账册合上，指尖在封皮上停了停。对面的人没催，只把茶杯往里收了半寸。"
+      "屋里没人再提那艘船。"
+    ),
+    "min_delta": 30,
+    "min_length_ratio": 0.72,
+  },
+  {
+    "id": "dialogue_sameness",
+    "label": "对白口气同质",
+    "before": (
+      "# 第三章 门后\n"
+      "林追低声说道：我们必须找到钥匙。宋闻低声说道：我们必须尽快行动。"
+      "阿砚低声说道：我们必须保持冷静。三个人的语气都很坚定。"
+    ),
+    "after": (
+      "# 第三章 门后\n"
+      "“钥匙不在柜里。”林追把抽屉推回去。\n"
+      "宋闻看了眼窗外：“那人没走远。”\n"
+      "阿砚没接话，只把门闩重新扣上。"
+    ),
+    "min_delta": 24,
+    "min_length_ratio": 0.72,
+  },
+)
+_HUMANIZE_PATROL_SCHEMA_VERSION = 1
+_HUMANIZE_PATROL_COOLDOWN_HOURS = 12
+_HUMANIZE_PATROL_STALE_RECHECK_HOURS = 24 * 7
 
 
 def _now_iso() -> str:
@@ -136,6 +209,14 @@ def _model_review_path(project_dir: Path) -> Path:
 
 def _writing_regression_path(project_dir: Path) -> Path:
   return _learning_dir(project_dir) / "writing_regression_runs.jsonl"
+
+
+def _humanize_evolution_rules_path(project_dir: Path) -> Path:
+  return _learning_dir(project_dir) / "humanize_evolution_rules.json"
+
+
+def _humanize_patrol_path(project_dir: Path) -> Path:
+  return _learning_dir(project_dir) / "humanize_review_patrol.json"
 
 
 def _schedule_path(project_dir: Path) -> Path:
@@ -408,6 +489,81 @@ def _load_capability_rules(project_dir: Path) -> dict[str, object]:
   return payload
 
 
+def _load_humanize_evolution_rules(project_dir: Path) -> dict[str, object]:
+  payload = read_json(_humanize_evolution_rules_path(project_dir), None)
+  if not isinstance(payload, dict):
+    return {"schema_version": 1, "updated_at": _now_iso(), "rules": []}
+  rules = payload.get("rules")
+  if not isinstance(rules, list):
+    payload["rules"] = []
+  payload.setdefault("schema_version", 1)
+  payload.setdefault("updated_at", _now_iso())
+  return payload
+
+
+def _save_humanize_evolution_rules(project_dir: Path, store: dict[str, object]) -> None:
+  store["updated_at"] = _now_iso()
+  atomic_write_json(_humanize_evolution_rules_path(project_dir), store)
+
+
+def _load_humanize_patrol(project_dir: Path) -> dict[str, object]:
+  payload = read_json(_humanize_patrol_path(project_dir), None)
+  if not isinstance(payload, dict) or payload.get("schema_version") != _HUMANIZE_PATROL_SCHEMA_VERSION:
+    return {
+      "schema_version": _HUMANIZE_PATROL_SCHEMA_VERSION,
+      "last_check_at": "",
+      "last_review_at": "",
+      "last_signature": "",
+      "last_reason": "",
+      "last_status": "",
+      "last_signal": {},
+      "updated_at": _now_iso(),
+    }
+  payload.setdefault("last_check_at", "")
+  payload.setdefault("last_review_at", "")
+  payload.setdefault("last_signature", "")
+  payload.setdefault("last_reason", "")
+  payload.setdefault("last_status", "")
+  if not isinstance(payload.get("last_signal"), dict):
+    payload["last_signal"] = {}
+  payload.setdefault("updated_at", _now_iso())
+  return payload
+
+
+def _save_humanize_patrol(project_dir: Path, state: dict[str, object]) -> None:
+  state["schema_version"] = _HUMANIZE_PATROL_SCHEMA_VERSION
+  state["updated_at"] = _now_iso()
+  atomic_write_json(_humanize_patrol_path(project_dir), state)
+
+
+def build_project_humanize_evolution_context(project_dir: Path, limit: int = 6) -> str:
+  store = _load_humanize_evolution_rules(Path(project_dir).expanduser().resolve())
+  rules = [
+    item
+    for item in store.get("rules") or []
+    if isinstance(item, dict) and str(item.get("status") or "active") == "active"
+  ]
+  if not rules:
+    return ""
+  rules.sort(
+    key=lambda item: (
+      float(item.get("confidence") or 0),
+      int(item.get("seen_count") or 1),
+      str(item.get("last_seen_at") or item.get("created_at") or ""),
+    ),
+    reverse=True,
+  )
+  lines = ["项目去 AI 自学习规则："]
+  for item in rules[:max(1, limit)]:
+    title = _compact_text(str(item.get("title") or "规则"), 48)
+    content = _compact_text(str(item.get("content") or ""), 180)
+    if title and content:
+      lines.append(f"- {title}：{content}")
+    elif content:
+      lines.append(f"- {content}")
+  return "\n".join(lines).strip()
+
+
 def _apply_capability_rules(project_dir: Path, candidates: list[dict[str, object]]) -> dict[str, object]:
   store = _load_capability_rules(project_dir)
   rules = store.get("rules")
@@ -459,7 +615,350 @@ def _apply_capability_rules(project_dir: Path, candidates: list[dict[str, object
   return {"applied": applied, "refreshed": refreshed, "total": len(next_rules)}
 
 
-def build_agent_capability_context(project_dir: Path, limit: int = 6) -> str:
+def _chapter_id_for_index(project_detail: object, chapter_index: int) -> str:
+  for item in getattr(project_detail, "chapters", []) or []:
+    if int(getattr(item, "index", 0) or 0) == chapter_index:
+      return str(getattr(item, "id", "") or "").strip()
+  return f"chapter-{chapter_index:03d}"
+
+
+def _obsidian_card_text_items(value: object, *, limit: int = 4) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  items: list[str] = []
+  for item in value:
+    text = _compact_text(str(item or ""), 120)
+    if text:
+      items.append(text)
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _obsidian_card_debt_items(value: object, *, limit: int = 3) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  items: list[str] = []
+  for item in value:
+    if not isinstance(item, dict):
+      continue
+    title = _compact_text(str(item.get("title") or "剧情债务"), 40)
+    content = _compact_text(str(item.get("content") or ""), 120)
+    payoff = item.get("expected_payoff_range")
+    payoff_text = ""
+    if isinstance(payoff, list) and len(payoff) >= 2:
+      payoff_text = f"预计第 {payoff[0]}-{payoff[1]} 章处理"
+    risk = _compact_text(str(item.get("risk_level") or ""), 20)
+    meta = "；".join(part for part in [risk, payoff_text] if part)
+    if title or content:
+      items.append(f"{title}{f'：{content}' if content else ''}{f'（{meta}）' if meta else ''}")
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _obsidian_card_arc_items(value: object, *, limit: int = 3) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  items: list[str] = []
+  for item in value:
+    if not isinstance(item, dict):
+      continue
+    name = _compact_text(str(item.get("name") or item.get("title") or "人物弧线"), 32)
+    state = _compact_text(str(item.get("current_state") or ""), 120)
+    check = _compact_text(str(item.get("required_next_check") or ""), 90)
+    detail = "；".join(part for part in [state, check] if part)
+    if name or detail:
+      items.append(f"{name}{f'：{detail}' if detail else ''}")
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _obsidian_card_plan_items(value: object, *, limit: int = 3) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  items: list[str] = []
+  for item in value:
+    if not isinstance(item, dict):
+      continue
+    title = _compact_text(str(item.get("title") or "章节计划"), 44)
+    plan_lines = (
+      [
+        _compact_text(str(line or ""), 90)
+        for line in item.get("plan_lines", [])
+        if str(line or "").strip()
+      ]
+      if isinstance(item.get("plan_lines"), list)
+      else []
+    )
+    if title and plan_lines:
+      items.append(f"{title}：{'；'.join(plan_lines[:3])}")
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _obsidian_card_chapter_note_items(value: object, *, limit: int = 3) -> list[str]:
+  if not isinstance(value, list):
+    return []
+  items: list[str] = []
+  for item in value:
+    if not isinstance(item, dict):
+      continue
+    title = _compact_text(str(item.get("title") or "章节档案"), 44)
+    summary = _compact_text(str(item.get("summary") or ""), 110)
+    state_changes = (
+      [
+        _compact_text(str(line or ""), 70)
+        for line in item.get("state_changes", [])
+        if str(line or "").strip()
+      ]
+      if isinstance(item.get("state_changes"), list)
+      else []
+    )
+    handoff = (
+      [
+        _compact_text(str(line or ""), 80)
+        for line in item.get("handoff", [])
+        if str(line or "").strip()
+      ]
+      if isinstance(item.get("handoff"), list)
+      else []
+    )
+    detail_parts = []
+    if summary:
+      detail_parts.append(f"摘要：{summary}")
+    if state_changes:
+      detail_parts.append(f"状态变化：{' / '.join(state_changes[:2])}")
+    if handoff:
+      detail_parts.append(f"交接：{' / '.join(handoff[:2])}")
+    if title and detail_parts:
+      items.append(f"{title}：{'；'.join(detail_parts)}")
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _chapter_obsidian_task_context(project_detail: object | None, chapter_index: int) -> list[str]:
+  if project_detail is None or chapter_index <= 0:
+    return []
+  card = build_project_narrative_state_chapter_card(
+    project_detail,
+    _chapter_id_for_index(project_detail, chapter_index),
+  )
+  if not card:
+    return []
+  sources = _obsidian_card_text_items(card.get("obsidian_sources"), limit=3)
+  external_references = _obsidian_card_text_items(card.get("obsidian_external_references"), limit=3)
+  required = _obsidian_card_text_items(card.get("obsidian_required"), limit=4)
+  forbidden = _obsidian_card_text_items(card.get("obsidian_forbidden"), limit=4)
+  risks = _obsidian_card_text_items(card.get("obsidian_risks"), limit=3)
+  plans = _obsidian_card_plan_items(card.get("obsidian_chapter_plans"), limit=3)
+  chapter_notes = _obsidian_card_chapter_note_items(card.get("obsidian_chapter_notes"), limit=3)
+  debts = _obsidian_card_debt_items(card.get("obsidian_narrative_debts"), limit=3)
+  arcs = _obsidian_card_arc_items(card.get("obsidian_character_arcs"), limit=3)
+  if not any([sources, external_references, required, forbidden, risks, plans, chapter_notes, debts, arcs]):
+    return []
+  lines = [f"目标章节 Obsidian 任务：第 {chapter_index} 章。"]
+  if sources:
+    lines.append(f"- 来源：{'；'.join(sources)}")
+  if external_references:
+    lines.append(f"- 考据来源：{'；'.join(external_references)}")
+  if plans:
+    lines.append(f"- 章节计划：{'；'.join(plans)}")
+  if chapter_notes:
+    lines.append(f"- 章节档案：{'；'.join(chapter_notes)}")
+  if required:
+    lines.append(f"- 必写：{'；'.join(required)}")
+  if forbidden:
+    lines.append(f"- 禁写：{'；'.join(forbidden)}")
+  if debts:
+    lines.append(f"- 剧情债务：{'；'.join(debts)}")
+  if arcs:
+    lines.append(f"- 人物弧线：{'；'.join(arcs)}")
+  if risks:
+    lines.append(f"- 图谱风险：{'；'.join(risks)}")
+  return lines
+
+
+def _obsidian_style_xp_capability_lines(
+  project_dir: Path,
+  project_detail: object | None,
+  chapter_index: int = 0,
+) -> list[str]:
+  reference = build_obsidian_style_xp_reference_prompt(
+    project_dir,
+    project_detail=project_detail,
+    chapter_index=chapter_index,
+    max_obsidian_notes=3,
+  )
+  items = [
+    _compact_text(line[2:].strip(), 180)
+    for line in reference.splitlines()
+    if line.strip().startswith("- ")
+  ]
+  items = [item for item in items if item]
+  if not items:
+    return []
+  if chapter_index > 0:
+    lines = [f"目标章节 Obsidian 文风 / XP：第 {chapter_index} 章。"]
+  else:
+    lines = ["全局 Obsidian 文风 / XP："]
+  lines.extend(f"- {item}" for item in items[:3])
+  return lines
+
+
+def _obsidian_suggestion_source_chapter_text(item: dict[str, object]) -> str:
+  indexes: list[int] = []
+  for raw in item.get("source_chapters", []) if isinstance(item.get("source_chapters"), list) else []:
+    try:
+      chapter_index = int(raw or 0)
+    except (TypeError, ValueError):
+      continue
+    if chapter_index > 0 and chapter_index not in indexes:
+      indexes.append(chapter_index)
+  if not indexes:
+    return ""
+  if len(indexes) == 1:
+    return f"来源第 {indexes[0]} 章"
+  return f"来源第 {'、'.join(str(index) for index in indexes[:4])} 章"
+
+
+def _agent_capability_target_chapter_indexes(
+  chapter_index: int = 0,
+  chapter_indexes: list[int] | tuple[int, ...] | None = None,
+) -> list[int]:
+  indexes: list[int] = []
+  raw_values: list[object] = []
+  if chapter_index > 0:
+    raw_values.append(chapter_index)
+  if chapter_indexes:
+    raw_values.extend(chapter_indexes)
+  for raw in raw_values:
+    try:
+      index = int(raw or 0)
+    except (TypeError, ValueError):
+      continue
+    if index > 0 and index not in indexes:
+      indexes.append(index)
+  return indexes
+
+
+def _obsidian_suggestion_available_for_chapter_targets(
+  item: dict[str, object],
+  chapter_indexes: list[int],
+  project_dir: Path,
+) -> bool:
+  if not chapter_indexes:
+    return obsidian_maintenance_suggestion_available_for_chapter(item, 0, project_dir)
+  return any(
+    obsidian_maintenance_suggestion_available_for_chapter(item, chapter_index, project_dir)
+    for chapter_index in chapter_indexes
+  )
+
+
+def _obsidian_suggestion_sort_key_for_chapter_targets(
+  item: dict[str, object],
+  chapter_indexes: list[int],
+) -> tuple[int, int, int, str]:
+  if not chapter_indexes:
+    return obsidian_maintenance_suggestion_sort_key(item, 0)
+  return max(
+    obsidian_maintenance_suggestion_sort_key(item, chapter_index)
+    for chapter_index in chapter_indexes
+  )
+
+
+def _obsidian_maintenance_status_for_agent(item: dict[str, object]) -> str:
+  status = str(item.get("status") or "open")
+  return status if status else "open"
+
+
+def _obsidian_maintenance_summary_for_agent_targets(
+  items: list[dict[str, object]],
+  chapter_indexes: list[int],
+) -> dict[str, object]:
+  counts = {
+    "open": 0,
+    "staged": 0,
+    "published": 0,
+    "draft_missing": 0,
+    "published_missing": 0,
+    "published_outdated": 0,
+    "vault_moved": 0,
+    "ignored": 0,
+  }
+  auto_staged = 0
+  manual_draft_edits = 0
+  preserved_existing_draft = 0
+  high_priority = 0
+  for item in items:
+    status = _obsidian_maintenance_status_for_agent(item)
+    if status in counts:
+      counts[status] += 1
+    if item.get("vault_moved"):
+      counts["vault_moved"] += 1
+    if item.get("auto_staged"):
+      auto_staged += 1
+    if item.get("manual_draft_edits"):
+      manual_draft_edits += 1
+    if item.get("preserved_existing_draft"):
+      preserved_existing_draft += 1
+    if str(item.get("priority") or "") == "high":
+      high_priority += 1
+
+  top_items: list[dict[str, object]] = []
+  actionable = [
+    item
+    for item in items
+    if _obsidian_maintenance_status_for_agent(item) not in {"published", "ignored"}
+  ]
+  actionable.sort(
+    key=lambda item: _obsidian_suggestion_sort_key_for_chapter_targets(item, chapter_indexes),
+    reverse=True,
+  )
+  for item in actionable[:4]:
+    top_items.append(
+      {
+        "id": str(item.get("id") or ""),
+        "title": str(item.get("title") or ""),
+        "priority": str(item.get("priority") or "medium"),
+        "status": _obsidian_maintenance_status_for_agent(item),
+        "suggested_path": str(item.get("suggested_path") or ""),
+        "action": str(item.get("action") or item.get("reason") or ""),
+      }
+    )
+
+  needs_action = (
+    counts["open"]
+    + counts["staged"]
+    + counts["draft_missing"]
+    + counts["published_missing"]
+    + counts["published_outdated"]
+  )
+  return {
+    "total": len(items),
+    "needs_action": needs_action,
+    "high_priority": high_priority,
+    "auto_staged": auto_staged,
+    "manual_draft_edits": manual_draft_edits,
+    "preserved_existing_draft": preserved_existing_draft,
+    "by_status": counts,
+    "top_items": top_items,
+  }
+
+
+def build_agent_capability_context(
+  project_dir: Path,
+  limit: int = 6,
+  project_detail: object | None = None,
+  *,
+  auto_stage_obsidian_drafts: bool = False,
+  chapter_index: int = 0,
+  chapter_indexes: list[int] | tuple[int, ...] | None = None,
+  include_obsidian_suggestions: bool = True,
+) -> str:
   store = _load_capability_rules(project_dir)
   rules = store.get("rules")
   if not isinstance(rules, list):
@@ -488,6 +987,98 @@ def build_agent_capability_context(project_dir: Path, limit: int = 6) -> str:
       content = _compact_text(str(item.get("content") or ""), 180)
       if title and content:
         lines.append(f"- {title}：{content}")
+  narrative_state = (
+    refresh_project_narrative_state_chapter_cards(
+      project_dir,
+      project_detail,
+      persist=True,
+      auto_stage_drafts=auto_stage_obsidian_drafts,
+    )
+    if project_detail is not None
+    else load_project_narrative_state(project_dir)
+  )
+  target_chapter_indexes = _agent_capability_target_chapter_indexes(chapter_index, chapter_indexes)
+  visible_chapter_indexes = target_chapter_indexes[:3]
+  for target_chapter_index in visible_chapter_indexes:
+    lines.extend(_chapter_obsidian_task_context(project_detail, target_chapter_index))
+    lines.extend(_obsidian_style_xp_capability_lines(project_dir, project_detail, target_chapter_index))
+    pending_soft_constraints = obsidian_pending_soft_constraint_lines(
+      narrative_state,
+      chapter_index=target_chapter_index,
+      project_dir=project_dir,
+      max_items=4,
+    )
+    if pending_soft_constraints:
+      lines.append(f"目标章节 Obsidian 待审软约束：第 {target_chapter_index} 章。")
+      lines.extend(pending_soft_constraints)
+  if len(target_chapter_indexes) > len(visible_chapter_indexes):
+    omitted = len(target_chapter_indexes) - len(visible_chapter_indexes)
+    lines.append(f"目标章节 Obsidian 任务：还有 {omitted} 个目标章节未展开。")
+  if not target_chapter_indexes:
+    lines.extend(_obsidian_style_xp_capability_lines(project_dir, project_detail, 0))
+  visible_obsidian_maintenance_items = [
+    item
+    for item in narrative_state.get("obsidian_maintenance_suggestions", [])
+    if (
+      isinstance(item, dict)
+      and str(item.get("title") or "").strip()
+      and _obsidian_suggestion_available_for_chapter_targets(item, target_chapter_indexes, project_dir)
+    )
+  ]
+  obsidian_suggestions = [
+    item
+    for item in visible_obsidian_maintenance_items
+    if _obsidian_maintenance_status_for_agent(item) not in {"published", "ignored"}
+  ]
+  obsidian_suggestions.sort(
+    key=lambda item: _obsidian_suggestion_sort_key_for_chapter_targets(item, target_chapter_indexes),
+    reverse=True,
+  )
+  global_obsidian_summary = narrative_state.get("obsidian_maintenance_summary")
+  obsidian_summary = (
+    _obsidian_maintenance_summary_for_agent_targets(visible_obsidian_maintenance_items, target_chapter_indexes)
+    if target_chapter_indexes
+    else global_obsidian_summary
+  )
+  should_show_obsidian_summary = False
+  if isinstance(obsidian_summary, dict) and obsidian_summary.get("total"):
+    should_show_obsidian_summary = True
+  elif (
+    target_chapter_indexes
+    and isinstance(global_obsidian_summary, dict)
+    and global_obsidian_summary.get("total")
+  ):
+    should_show_obsidian_summary = True
+  if isinstance(obsidian_summary, dict) and should_show_obsidian_summary:
+    by_status = obsidian_summary.get("by_status") if isinstance(obsidian_summary.get("by_status"), dict) else {}
+    summary_parts = [
+      f"待处理 {int(obsidian_summary.get('needs_action') or 0)}",
+      f"高优先级 {int(obsidian_summary.get('high_priority') or 0)}",
+      f"自动草稿 {int(obsidian_summary.get('auto_staged') or 0)}",
+    ]
+    draft_missing = int(by_status.get("draft_missing") or 0)
+    published_missing = int(by_status.get("published_missing") or 0)
+    if draft_missing:
+      summary_parts.append(f"草稿缺失 {draft_missing}")
+    if published_missing:
+      summary_parts.append(f"Vault 缺失 {published_missing}")
+    ignored = int(by_status.get("ignored") or 0)
+    if ignored:
+      summary_parts.append(f"已忽略 {ignored}")
+    lines.append(f"Obsidian 维护摘要：{'，'.join(summary_parts)}。")
+  if include_obsidian_suggestions and obsidian_suggestions:
+    lines.append("Obsidian 维护建议：")
+    for item in obsidian_suggestions[:4]:
+      title = _compact_text(str(item.get("title") or ""), 56)
+      action = _compact_text(str(item.get("action") or item.get("reason") or ""), 160)
+      path = _compact_text(str(item.get("suggested_path") or ""), 80)
+      source_chapters = _obsidian_suggestion_source_chapter_text(item)
+      source_prefix = f"{source_chapters}；" if source_chapters else ""
+      preview = obsidian_maintenance_suggestion_preview(item, project_dir)
+      if path:
+        lines.append(f"- {title}：{source_prefix}建议笔记 {path}；{action}{preview}")
+      elif action:
+        lines.append(f"- {title}：{source_prefix}{action}{preview}")
   failure_context = _failure_case_context(project_dir, limit=3)
   if failure_context:
     lines.append(failure_context)
@@ -960,6 +1551,11 @@ def _score_status(score: float) -> str:
   return "risk"
 
 
+def _regression_visible_len(text: str) -> int:
+  lines = [item for item in str(text or "").splitlines() if not item.lstrip().startswith("#")]
+  return len(re.sub(r"\s+", "", "\n".join(lines)))
+
+
 def _project_documents(project_dir: Path) -> dict[str, str]:
   docs: dict[str, str] = {}
   for filename in (
@@ -997,6 +1593,113 @@ def _selected_regression_chapter(project_dir: Path) -> dict[str, object]:
     "title": "第 1 章",
     "content": "",
     "path": "",
+  }
+
+
+def _chapter_index_from_path(path: Path) -> int:
+  match = re.search(r"(\d+)", path.stem)
+  if not match:
+    return 1
+  try:
+    return max(1, int(match.group(1)))
+  except ValueError:
+    return 1
+
+
+def _chapter_title_from_content(content: str, chapter_index: int) -> str:
+  first_line = next((line.strip("# ").strip() for line in str(content or "").splitlines() if line.strip()), "")
+  return first_line[:80] or f"第 {chapter_index} 章"
+
+
+def _extract_project_humanize_snippet(content: str, issue_examples: list[str], limit: int = 520) -> str:
+  body_lines = [
+    line.strip()
+    for line in str(content or "").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+  ]
+  body = "\n".join(body_lines).strip() or str(content or "").strip()
+  for example in issue_examples:
+    needle = str(example or "").strip()
+    if not needle or needle.startswith(("句长序列", "段长序列")):
+      continue
+    offset = body.find(needle)
+    if offset < 0:
+      continue
+    start = max(0, offset - 140)
+    end = min(len(body), offset + len(needle) + 260)
+    return _compact_text(body[start:end], limit)
+  return _compact_text(body, limit)
+
+
+def _build_project_humanize_sample_pool(project_dir: Path, limit: int = 5) -> dict[str, object]:
+  from novel_backend.services.humanize_service import analyze_humanize_text
+
+  candidates: list[dict[str, object]] = []
+  issue_counts: dict[str, int] = {}
+  for path in sorted((project_dir / "chapters").glob("*.md")):
+    try:
+      content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+      continue
+    if not content:
+      continue
+    profile = analyze_humanize_text(content)
+    if not profile.issues or profile.score >= 92:
+      continue
+    chapter_index = _chapter_index_from_path(path)
+    issue_examples = [
+      example
+      for issue in profile.issues[:5]
+      for example in issue.examples
+      if str(example or "").strip()
+    ]
+    for issue in profile.issues[:5]:
+      issue_counts[issue.label] = issue_counts.get(issue.label, 0) + max(1, issue.count)
+    candidates.append(
+      {
+        "chapter_id": f"chapter-{chapter_index:03d}",
+        "chapter_index": chapter_index,
+        "chapter_title": _chapter_title_from_content(content, chapter_index),
+        "chapter_path": path.as_posix(),
+        "score": profile.score,
+        "score_ratio": round(profile.score / 100, 3),
+        "issue_count": len(profile.issues),
+        "top_issues": [issue.model_dump(mode="json") for issue in profile.issues[:5]],
+        "snippet": _extract_project_humanize_snippet(content, issue_examples),
+        "signature": hashlib.sha1(content.encode("utf-8")).hexdigest()[:12],
+        "_penalty": profile.total_penalty,
+      }
+    )
+
+  candidates.sort(
+    key=lambda item: (
+      float(item.get("score") or 0),
+      -int(item.get("_penalty") or 0),
+      int(item.get("chapter_index") or 0),
+    )
+  )
+  samples = []
+  for item in candidates[:limit]:
+    item.pop("_penalty", None)
+    samples.append(item)
+
+  average_score = (
+    sum(float(item.get("score") or 0) for item in samples) / len(samples)
+    if samples
+    else 100.0
+  )
+  top_issue_labels = [
+    label
+    for label, _count in sorted(issue_counts.items(), key=lambda pair: pair[1], reverse=True)[:6]
+  ]
+  return {
+    "sample_count": len(samples),
+    "risk_count": len(candidates),
+    "average_score": round(average_score, 3),
+    "average_score_ratio": round(average_score / 100, 3),
+    "status": _score_status(average_score / 100) if samples else "good",
+    "top_issue_labels": top_issue_labels,
+    "samples": samples,
   }
 
 
@@ -1161,6 +1864,684 @@ def _run_golden_evaluator_benchmark() -> dict[str, object]:
   }
 
 
+def _run_humanize_ab_benchmark(chapter_content: str, project_dir: Path | None = None) -> dict[str, object]:
+  from novel_backend.services.humanize_service import analyze_humanize_text, build_humanize_quality_report
+
+  results: list[dict[str, object]] = []
+  total_delta = 0
+  passed_count = 0
+  fixed_labels: dict[str, int] = {}
+  remaining_labels: dict[str, int] = {}
+  for item in _HUMANIZE_AB_CASES:
+    before_text = str(item.get("before") or "")
+    after_text = str(item.get("after") or "")
+    report = build_humanize_quality_report(before_text, after_text)
+    before_len = _regression_visible_len(before_text)
+    after_len = _regression_visible_len(after_text)
+    length_ratio = round(after_len / max(before_len, 1), 3)
+    min_delta = int(item.get("min_delta") or 0)
+    min_length_ratio = float(item.get("min_length_ratio") or 0.0)
+    passed = report.delta >= min_delta and length_ratio >= min_length_ratio
+    if passed:
+      passed_count += 1
+    total_delta += report.delta
+    for fixed in report.fixed_issues:
+      fixed_labels[fixed.label] = fixed_labels.get(fixed.label, 0) + max(1, fixed.count)
+    for remaining in report.remaining_issues:
+      remaining_labels[remaining.label] = remaining_labels.get(remaining.label, 0) + max(1, remaining.count)
+    results.append(
+      {
+        "id": item.get("id", ""),
+        "label": item.get("label", ""),
+        "before_score": report.before_score,
+        "after_score": report.after_score,
+        "delta": report.delta,
+        "length_ratio": length_ratio,
+        "status": "good" if passed else "risk",
+        "summary": report.summary,
+        "fixed_issues": [fixed.model_dump(mode="json") for fixed in report.fixed_issues],
+        "remaining_issues": [remaining.model_dump(mode="json") for remaining in report.remaining_issues],
+      }
+    )
+
+  project_profile = analyze_humanize_text(chapter_content) if chapter_content.strip() else None
+  project_issues = [item.model_dump(mode="json") for item in project_profile.issues[:6]] if project_profile else []
+  project_sample_pool = (
+    _build_project_humanize_sample_pool(project_dir)
+    if project_dir is not None
+    else {
+      "sample_count": 0,
+      "risk_count": 0,
+      "average_score": 100.0,
+      "average_score_ratio": 1.0,
+      "status": "good",
+      "top_issue_labels": [],
+      "samples": [],
+    }
+  )
+  pass_rate = passed_count / max(len(results), 1)
+  average_delta = total_delta / max(len(results), 1)
+  if int(project_sample_pool.get("sample_count") or 0) > 0:
+    project_score_factor = float(project_sample_pool.get("average_score_ratio") or 0)
+  else:
+    project_score_factor = (float(project_profile.score) / 100) if project_profile else 0.72
+  score = round((pass_rate * 0.56) + (min(average_delta, 45) / 45 * 0.28) + (project_score_factor * 0.16), 3)
+  fixed_rank = sorted(fixed_labels.items(), key=lambda pair: pair[1], reverse=True)
+  remaining_rank = sorted(remaining_labels.items(), key=lambda pair: pair[1], reverse=True)
+  distilled_rules = [
+    f"A/B 对照里{label}改善 {count} 处。"
+    for label, count in fixed_rank[:4]
+  ]
+  if remaining_rank:
+    distilled_rules.extend(
+      f"残留{label}，下次回归需要加样本或强化规则。"
+      for label, _count in remaining_rank[:3]
+    )
+  if project_issues:
+    distilled_rules.append(
+      "项目样本当前重点：" + "、".join(str(item.get("label") or "") for item in project_issues[:3] if isinstance(item, dict))
+    )
+  project_issue_labels = [
+    str(item or "").strip()
+    for item in project_sample_pool.get("top_issue_labels") or []
+    if str(item or "").strip()
+  ]
+  if project_issue_labels:
+    distilled_rules.append("真实章节样本池重点：" + "、".join(project_issue_labels[:4]))
+  return {
+    "id": f"humanize-ab-{_candidate_id('humanize-ab', _now_iso(), str(score))}",
+    "generated_at": _now_iso(),
+    "score": score,
+    "status": _score_status(score),
+    "case_count": len(results),
+    "pass_rate": round(pass_rate, 3),
+    "average_delta": round(average_delta, 3),
+    "cases": results,
+    "distilled_rules": _ordered_unique(distilled_rules)[:8],
+    "project_probe": {
+      "score": project_profile.score if project_profile else 0,
+      "issue_count": len(project_profile.issues) if project_profile else 0,
+      "issues": project_issues,
+    },
+    "project_sample_pool": project_sample_pool,
+  }
+
+
+def _coerce_score_ratio(value: object, default: float = 0.0) -> float:
+  try:
+    numeric = float(value)
+  except (TypeError, ValueError):
+    return default
+  if numeric > 1:
+    numeric = numeric / 100
+  return round(max(0.0, min(numeric, 1.0)), 3)
+
+
+def _coerce_score_100(value: object, default: int = 0) -> int:
+  try:
+    numeric = float(value)
+  except (TypeError, ValueError):
+    return default
+  if 0 <= numeric <= 1:
+    numeric *= 100
+  return int(max(0, min(round(numeric), 100)))
+
+
+def _dict_items_from_value(value: object, limit: int = 6) -> list[dict[str, object]]:
+  if not isinstance(value, list):
+    return []
+  items: list[dict[str, object]] = []
+  for item in value:
+    if isinstance(item, dict):
+      items.append(item)
+    if len(items) >= limit:
+      break
+  return items
+
+
+def _humanize_response_text(response: object) -> str:
+  raw = str(response or "").strip()
+  if not raw:
+    return ""
+  try:
+    parsed = _extract_json_object(raw)
+  except Exception:
+    parsed = {}
+  if isinstance(parsed, dict):
+    for key in ("revised", "content", "draft", "text", "chapter", "正文"):
+      value = parsed.get(key)
+      if isinstance(value, str) and value.strip():
+        return value.strip()
+  return raw
+
+
+def _build_humanize_history_replay(settings: Settings, limit: int = 5) -> dict[str, object]:
+  from novel_backend.services.humanize_service import analyze_humanize_text
+
+  records_payload = get_prompt_history_records(settings, tail=240, search="humanize")
+  records = records_payload.get("records") if isinstance(records_payload, dict) else []
+  samples: list[dict[str, object]] = []
+  iterable_records = records if isinstance(records, list) else []
+  for record in iterable_records:
+    if not isinstance(record, dict):
+      continue
+    task = str(record.get("task") or "")
+    if "humanize" not in task.lower():
+      continue
+    text = _humanize_response_text(record.get("response"))
+    if not text:
+      continue
+    profile = analyze_humanize_text(text)
+    samples.append(
+      {
+        "timestamp": record.get("timestamp", ""),
+        "task": task,
+        "status": record.get("status", ""),
+        "elapsed": record.get("elapsed", 0),
+        "score": profile.score,
+        "score_ratio": round(profile.score / 100, 3),
+        "remaining_issues": [issue.model_dump(mode="json") for issue in profile.issues[:5]],
+        "text_excerpt": _compact_text(text, 520),
+      }
+    )
+    if len(samples) >= limit:
+      break
+  average_score = (
+    sum(float(item.get("score") or 0) for item in samples) / len(samples)
+    if samples
+    else 0.0
+  )
+  return {
+    "sample_count": len(samples),
+    "average_score": round(average_score, 3),
+    "average_score_ratio": round(average_score / 100, 3) if samples else 0.0,
+    "samples": samples,
+  }
+
+
+def _latest_humanize_ab_for_review(project_dir: Path, regression_runs: list[dict[str, object]]) -> dict[str, object]:
+  latest_regression = regression_runs[0] if regression_runs else {}
+  if isinstance(latest_regression, dict) and isinstance(latest_regression.get("humanize_ab_benchmark"), dict):
+    return latest_regression["humanize_ab_benchmark"]
+  chapter = _selected_regression_chapter(project_dir)
+  return _run_humanize_ab_benchmark(str(chapter.get("content") or ""), project_dir)
+
+
+def _heuristic_humanize_model_judge(
+  *,
+  humanize_ab: dict[str, object],
+  history_replay: dict[str, object],
+  status: str,
+  error: str = "",
+) -> dict[str, object]:
+  sample_pool = humanize_ab.get("project_sample_pool") if isinstance(humanize_ab.get("project_sample_pool"), dict) else {}
+  sample_average = _coerce_score_100(sample_pool.get("average_score"), 72) if sample_pool else 72
+  history_average = _coerce_score_100(history_replay.get("average_score"), 0) if int(history_replay.get("sample_count") or 0) else sample_average
+  naturalness_score = int(round((sample_average * 0.65) + (history_average * 0.35)))
+  issue_labels = [
+    str(item or "").strip()
+    for item in sample_pool.get("top_issue_labels") or []
+    if str(item or "").strip()
+  ]
+  issues = [
+    {
+      "title": label,
+      "detail": f"真实章节样本池多次出现{label}。",
+      "severity": "warning" if naturalness_score >= 68 else "critical",
+      "evidence": label,
+    }
+    for label in issue_labels[:5]
+  ]
+  rules = [
+    f"处理{label}时，优先保留剧情事实和人物信息，只改表达方式。"
+    for label in issue_labels[:4]
+  ]
+  if not rules:
+    rules = [
+      "去 AI 后仍要保留人物声音、场景推进和信息顺序，不能把正文改成摘要。",
+    ]
+  return {
+    "id": f"humanize-judge-{_candidate_id('humanize-judge', _now_iso(), str(naturalness_score))}",
+    "generated_at": _now_iso(),
+    "status": status,
+    "summary": "已用本地样本池完成去 AI 审查。" if not error else f"模型裁判不可用，已改用本地样本池：{error}",
+    "naturalness_score": naturalness_score,
+    "score": round(naturalness_score / 100, 3),
+    "ai_flavor_score": 100 - naturalness_score,
+    "sample_count": int(sample_pool.get("sample_count") or 0),
+    "history_sample_count": int(history_replay.get("sample_count") or 0),
+    "issues": issues,
+    "distilled_rules": rules,
+    "rewrite_principles": rules[:3],
+    "false_positive_notes": [],
+    "history_replay": history_replay,
+  }
+
+
+def _run_humanize_model_judge(settings: Settings, project_dir: Path, regression_runs: list[dict[str, object]]) -> dict[str, object]:
+  humanize_ab = _latest_humanize_ab_for_review(project_dir, regression_runs)
+  history_replay = _build_humanize_history_replay(settings)
+  sample_pool = humanize_ab.get("project_sample_pool") if isinstance(humanize_ab.get("project_sample_pool"), dict) else {}
+  if not int(sample_pool.get("sample_count") or 0) and not int(history_replay.get("sample_count") or 0):
+    return _heuristic_humanize_model_judge(
+      humanize_ab=humanize_ab,
+      history_replay=history_replay,
+      status="no_samples",
+    )
+
+  payload = {
+    "fixed_ab_summary": {
+      "score": humanize_ab.get("score", 0),
+      "pass_rate": humanize_ab.get("pass_rate", 0),
+      "average_delta": humanize_ab.get("average_delta", 0),
+      "distilled_rules": humanize_ab.get("distilled_rules", []),
+    },
+    "project_sample_pool": sample_pool,
+    "history_replay": history_replay,
+    "existing_project_rules": _load_humanize_evolution_rules(project_dir).get("rules", [])[:8],
+    "judge_dimensions": ["自然度", "人物声音", "叙事张力", "非模板化", "误报风险"],
+  }
+  messages = [
+    {
+      "role": "system",
+      "content": (
+        "你是中文小说去 AI 审美裁判。只输出 JSON 对象，字段为 summary、naturalness_score、"
+        "ai_flavor_score、issues、false_positive_notes、distilled_rules、rewrite_principles、sample_actions。"
+        "naturalness_score 和 ai_flavor_score 是 0 到 100 的整数。issues 每项包含 title、detail、severity、evidence。"
+        "不要按通用作文标准判断，要看人物声音、场景推进、叙事张力和是否残留模型腔。"
+      ),
+    },
+    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+  ]
+  try:
+    content = _invoke_model(
+      settings,
+      messages,
+      task_name="self_evolution_humanize_judge",
+      temperature=0.15,
+      max_tokens=2200,
+    )
+    parsed = _extract_json_object(content)
+    if not isinstance(parsed, dict):
+      raise ValueError("去 AI 裁判结果不是 JSON 对象")
+    distilled_rules = _string_list_from_keys(parsed, "distilled_rules", "rules")[:8]
+    rewrite_principles = _string_list_from_keys(parsed, "rewrite_principles", "principles")[:8]
+    issues = _dict_items_from_value(parsed.get("issues"), limit=8)
+    naturalness_score = _coerce_score_100(parsed.get("naturalness_score") or parsed.get("score"), 0)
+    if naturalness_score <= 0 and not distilled_rules and not issues:
+      raise ValueError("去 AI 裁判结果缺少有效评分和规则")
+    return {
+      "id": f"humanize-judge-{_candidate_id('humanize-judge', _now_iso(), content)}",
+      "generated_at": _now_iso(),
+      "status": "model",
+      "summary": str(parsed.get("summary") or "去 AI 裁判完成。").strip(),
+      "naturalness_score": naturalness_score,
+      "score": round(naturalness_score / 100, 3),
+      "ai_flavor_score": _coerce_score_100(parsed.get("ai_flavor_score"), 100 - naturalness_score),
+      "sample_count": int(sample_pool.get("sample_count") or 0),
+      "history_sample_count": int(history_replay.get("sample_count") or 0),
+      "issues": issues,
+      "distilled_rules": _ordered_unique(distilled_rules),
+      "rewrite_principles": _ordered_unique(rewrite_principles),
+      "false_positive_notes": _string_list_from_keys(parsed, "false_positive_notes", "false_positives")[:6],
+      "sample_actions": _string_list_from_keys(parsed, "sample_actions", "actions")[:8],
+      "history_replay": history_replay,
+    }
+  except Exception as error:
+    return _heuristic_humanize_model_judge(
+      humanize_ab=humanize_ab,
+      history_replay=history_replay,
+      status="model_failed",
+      error=str(error),
+    )
+
+
+def _normalize_humanize_rule(raw: object) -> tuple[str, str] | None:
+  if isinstance(raw, dict):
+    title = _compact_text(str(raw.get("title") or raw.get("label") or raw.get("name") or "去 AI 规则"), 60)
+    content = _compact_text(str(raw.get("content") or raw.get("detail") or raw.get("rule") or raw.get("text") or ""), 260)
+  else:
+    content = _compact_text(str(raw or ""), 260)
+    title = _compact_text(content.split("，", 1)[0].split("。", 1)[0], 60) or "去 AI 规则"
+  if not content:
+    return None
+  return title, content
+
+
+def _update_humanize_evolution_rules(project_dir: Path, judge: dict[str, object]) -> dict[str, object]:
+  store = _load_humanize_evolution_rules(project_dir)
+  existing_items = store.get("rules") if isinstance(store.get("rules"), list) else []
+  by_id: dict[str, dict[str, object]] = {
+    str(item.get("id")): item
+    for item in existing_items
+    if isinstance(item, dict) and str(item.get("id") or "").strip()
+  }
+  raw_rules: list[object] = []
+  raw_rules.extend(judge.get("distilled_rules") if isinstance(judge.get("distilled_rules"), list) else [])
+  raw_rules.extend(judge.get("rewrite_principles") if isinstance(judge.get("rewrite_principles"), list) else [])
+  inserted = 0
+  refreshed = 0
+  confidence = 0.84 if judge.get("status") == "model" else 0.64
+  confidence += max(0.0, min(float(judge.get("score") or 0), 1.0)) * 0.1
+  confidence = round(min(confidence, 0.94), 3)
+  for raw in raw_rules:
+    normalized = _normalize_humanize_rule(raw)
+    if normalized is None:
+      continue
+    title, content = normalized
+    rule_id = f"humanize-{_candidate_id('humanize-rule', title, content)}"
+    if rule_id in by_id:
+      item = by_id[rule_id]
+      item["last_seen_at"] = _now_iso()
+      item["seen_count"] = int(item.get("seen_count") or 1) + 1
+      item["confidence"] = max(float(item.get("confidence") or 0), confidence)
+      item["source"] = judge.get("status", item.get("source", "model"))
+      refreshed += 1
+      continue
+    by_id[rule_id] = {
+      "id": rule_id,
+      "title": title,
+      "content": content,
+      "status": "active",
+      "confidence": confidence,
+      "source": judge.get("status", "model"),
+      "created_at": _now_iso(),
+      "last_seen_at": _now_iso(),
+      "seen_count": 1,
+      "metadata": {
+        "judge_id": judge.get("id", ""),
+        "naturalness_score": judge.get("naturalness_score", 0),
+        "sample_count": judge.get("sample_count", 0),
+        "history_sample_count": judge.get("history_sample_count", 0),
+      },
+    }
+    inserted += 1
+
+  items = sorted(
+    by_id.values(),
+    key=lambda item: (
+      float(item.get("confidence") or 0),
+      int(item.get("seen_count") or 1),
+      str(item.get("last_seen_at") or item.get("created_at") or ""),
+    ),
+    reverse=True,
+  )[:80]
+  store["rules"] = items
+  _save_humanize_evolution_rules(project_dir, store)
+  return {
+    "inserted": inserted,
+    "refreshed": refreshed,
+    "total": len(items),
+    "active_rules": [item for item in items if isinstance(item, dict) and item.get("status") == "active"][:8],
+  }
+
+
+def _latest_humanize_judge(project_dir: Path) -> dict[str, object]:
+  for review in _latest_jsonl_items(_model_review_path(project_dir), 20):
+    if not isinstance(review, dict):
+      continue
+    judge = review.get("humanize_model_judge")
+    if isinstance(judge, dict):
+      return judge
+  return {}
+
+
+def _humanize_patrol_signature(project_sample_pool: dict[str, object], history_replay: dict[str, object]) -> str:
+  samples = []
+  for item in project_sample_pool.get("samples") or []:
+    if not isinstance(item, dict):
+      continue
+    samples.append(
+      {
+        "chapter_path": item.get("chapter_path", ""),
+        "signature": item.get("signature", ""),
+        "score": item.get("score", 0),
+        "issues": [
+          str(issue.get("label") or issue.get("code") or "")
+          for issue in item.get("top_issues") or []
+          if isinstance(issue, dict)
+        ][:5],
+      }
+    )
+  history = []
+  for item in history_replay.get("samples") or []:
+    if not isinstance(item, dict):
+      continue
+    excerpt = str(item.get("text_excerpt") or "")
+    history.append(
+      {
+        "timestamp": item.get("timestamp", ""),
+        "task": item.get("task", ""),
+        "score": item.get("score", 0),
+        "text": hashlib.sha1(excerpt.encode("utf-8")).hexdigest()[:12] if excerpt else "",
+      }
+    )
+  raw = json.dumps({"samples": samples, "history": history}, ensure_ascii=False, sort_keys=True)
+  return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_humanize_patrol_signal(settings: Settings, project_dir: Path) -> dict[str, object]:
+  project_sample_pool = _build_project_humanize_sample_pool(project_dir)
+  history_replay = _build_humanize_history_replay(settings)
+  rule_store = _load_humanize_evolution_rules(project_dir)
+  active_rule_count = sum(
+    1
+    for item in rule_store.get("rules") or []
+    if isinstance(item, dict) and str(item.get("status") or "active") == "active"
+  )
+  latest_judge = _latest_humanize_judge(project_dir)
+  project_average = _coerce_score_100(project_sample_pool.get("average_score"), 100)
+  history_average = _coerce_score_100(history_replay.get("average_score"), 0)
+  latest_judge_score = _coerce_score_ratio(
+    latest_judge.get("score") or latest_judge.get("naturalness_score"),
+    0.0,
+  ) if latest_judge else 0.0
+  project_sample_count = int(project_sample_pool.get("sample_count") or 0)
+  history_sample_count = int(history_replay.get("sample_count") or 0)
+  status = "good"
+  if (
+    project_sample_count > 0 and project_average < 78
+    or history_sample_count > 0 and history_average < 78
+    or latest_judge_score and latest_judge_score < 0.68
+  ):
+    status = "risk"
+  elif project_sample_count > 0 or history_sample_count > 0 or latest_judge_score and latest_judge_score < 0.82:
+    status = "watch"
+  top_issue_labels = [
+    str(item or "").strip()
+    for item in project_sample_pool.get("top_issue_labels") or []
+    if str(item or "").strip()
+  ]
+  return {
+    "generated_at": _now_iso(),
+    "status": status,
+    "signature": _humanize_patrol_signature(project_sample_pool, history_replay),
+    "project_sample_count": project_sample_count,
+    "project_risk_count": int(project_sample_pool.get("risk_count") or 0),
+    "project_average_score": project_average,
+    "project_top_issue_labels": top_issue_labels[:6],
+    "history_sample_count": history_sample_count,
+    "history_average_score": history_average,
+    "active_rule_count": active_rule_count,
+    "latest_judge_score": round(latest_judge_score, 3),
+    "latest_judge_status": latest_judge.get("status", "") if latest_judge else "",
+  }
+
+
+def _humanize_patrol_decision(
+  signal: dict[str, object],
+  state: dict[str, object],
+  *,
+  force: bool,
+) -> dict[str, object]:
+  if force:
+    return {"should_run": True, "reason": "force"}
+  project_sample_count = int(signal.get("project_sample_count") or 0)
+  history_sample_count = int(signal.get("history_sample_count") or 0)
+  if project_sample_count <= 0 and history_sample_count <= 0:
+    return {"should_run": False, "status": "skipped", "reason": "no_signal"}
+
+  last_review_at = _parse_datetime(state.get("last_review_at"))
+  now = datetime.now(timezone.utc)
+  if last_review_at is not None:
+    cooldown_until = last_review_at + timedelta(hours=_HUMANIZE_PATROL_COOLDOWN_HOURS)
+    if now < cooldown_until:
+      return {
+        "should_run": False,
+        "status": "waiting",
+        "reason": "cooldown",
+        "next_review_at": cooldown_until.isoformat(),
+      }
+
+  previous_signature = str(state.get("last_signature") or "")
+  current_signature = str(signal.get("signature") or "")
+  if previous_signature and previous_signature == current_signature:
+    stale_until = (
+      last_review_at + timedelta(hours=_HUMANIZE_PATROL_STALE_RECHECK_HOURS)
+      if last_review_at is not None
+      else None
+    )
+    if stale_until is None or now < stale_until:
+      return {"should_run": False, "status": "skipped", "reason": "unchanged"}
+    if str(signal.get("status") or "") == "good":
+      return {"should_run": False, "status": "skipped", "reason": "unchanged"}
+    return {"should_run": True, "reason": "stale_recheck"}
+
+  active_rule_count = int(signal.get("active_rule_count") or 0)
+  project_average = _coerce_score_100(signal.get("project_average_score"), 100)
+  history_average = _coerce_score_100(signal.get("history_average_score"), 0)
+  latest_judge_score = _coerce_score_ratio(signal.get("latest_judge_score"), 0.0)
+  if active_rule_count <= 0:
+    return {"should_run": True, "reason": "no_active_rules"}
+  if project_sample_count > 0 and project_average < 92:
+    return {"should_run": True, "reason": "project_samples"}
+  if history_sample_count > 0 and history_average and history_average < 90:
+    return {"should_run": True, "reason": "history_replay"}
+  if latest_judge_score and latest_judge_score < 0.72:
+    return {"should_run": True, "reason": "weak_latest_judge"}
+  return {"should_run": True, "reason": "new_signal"}
+
+
+def _humanize_patrol_review_summary(judge: dict[str, object], trigger: str) -> dict[str, object]:
+  issue_titles = [
+    _compact_text(str(item.get("title") or item.get("label") or ""), 70)
+    for item in judge.get("issues") or []
+    if isinstance(item, dict) and str(item.get("title") or item.get("label") or "").strip()
+  ]
+  rules = [
+    _compact_text(str(item or ""), 120)
+    for item in judge.get("distilled_rules") or []
+    if str(item or "").strip()
+  ]
+  return {
+    "failure_causes": issue_titles[:5] or [str(judge.get("summary") or "去 AI 智能巡检完成。")],
+    "improvement_suggestions": rules[:6] or ["继续观察真实章节样本池和历史去 AI 输出。"],
+    "trigger": trigger,
+  }
+
+
+def run_self_evolution_humanize_patrol(
+  settings: Settings,
+  project_dir: Path,
+  *,
+  reason: str = "heartbeat",
+  force: bool = False,
+) -> dict[str, object]:
+  resolved_project_dir = Path(project_dir).expanduser().resolve()
+  state = _load_humanize_patrol(resolved_project_dir)
+  signal = _build_humanize_patrol_signal(settings, resolved_project_dir)
+  decision = _humanize_patrol_decision(signal, state, force=force)
+  state["last_check_at"] = _now_iso()
+  state["last_signal"] = signal
+  state["last_reason"] = str(decision.get("reason") or reason)
+  if not decision.get("should_run"):
+    state["last_status"] = str(decision.get("status") or "skipped")
+    _save_humanize_patrol(resolved_project_dir, state)
+    return {
+      "status": state["last_status"],
+      "reason": decision.get("reason", ""),
+      "next_review_at": decision.get("next_review_at", ""),
+      "signal": signal,
+    }
+  if not force and model_runtime_should_defer_background(settings):
+    state["last_status"] = "deferred"
+    _save_humanize_patrol(resolved_project_dir, state)
+    return {
+      "status": "deferred",
+      "reason": decision.get("reason", ""),
+      "signal": signal,
+    }
+
+  trigger = str(decision.get("reason") or reason)
+  regression_runs = _latest_jsonl_items(_writing_regression_path(resolved_project_dir), 4)
+  try:
+    judge = _run_humanize_model_judge(settings, resolved_project_dir, regression_runs)
+    rule_update = _update_humanize_evolution_rules(resolved_project_dir, judge)
+    summary = _humanize_patrol_review_summary(judge, trigger)
+    review = {
+      "id": f"model-review-humanize-patrol-{_candidate_id(reason, trigger, str(signal.get('signature') or ''))}",
+      "generated_at": _now_iso(),
+      "status": "humanize_patrol",
+      "summary": str(judge.get("summary") or "去 AI 智能巡检完成。"),
+      "failure_causes": summary["failure_causes"],
+      "improvement_suggestions": _ordered_unique(
+        [
+          *summary["improvement_suggestions"],
+          "去 AI 智能巡检已更新项目规则，后续去 AI 改稿会读取这些规则。",
+        ]
+      )[:8],
+      "skill_actions": [],
+      "capability_actions": [],
+      "risk_notes": [],
+      "cross_review": {
+        "enabled": False,
+        "status": "not_configured",
+        "reviewer_count": 1,
+        "summary": "本次只执行去 AI 智能巡检。",
+      },
+      "humanize_model_judge": judge,
+      "humanize_rule_update": rule_update,
+      "humanize_patrol": {
+        "reason": reason,
+        "trigger": trigger,
+        "signal": signal,
+      },
+    }
+    _append_jsonl(_model_review_path(resolved_project_dir), review)
+    state.update(
+      {
+        "last_review_at": review["generated_at"],
+        "last_signature": str(signal.get("signature") or ""),
+        "last_status": "completed",
+        "last_reason": trigger,
+        "last_signal": signal,
+      }
+    )
+    _save_humanize_patrol(resolved_project_dir, state)
+    append_app_log(settings, f"去 AI 智能巡检完成：{trigger}")
+    return {
+      "status": "completed",
+      "reason": reason,
+      "trigger": trigger,
+      "signal": signal,
+      "review": review,
+      "humanize_model_judge": judge,
+      "humanize_rule_update": rule_update,
+    }
+  except Exception as error:
+    state["last_status"] = "failed"
+    state["last_error"] = str(error)
+    _save_humanize_patrol(resolved_project_dir, state)
+    append_app_log(settings, f"去 AI 智能巡检失败：{error}", level="WARNING")
+    return {
+      "status": "failed",
+      "reason": reason,
+      "trigger": trigger,
+      "signal": signal,
+      "error": str(error),
+    }
+
+
 def run_writing_regression_suite(settings: Settings, project_dir: Path) -> dict[str, object]:
   resolved_project_dir = Path(project_dir).expanduser().resolve()
   state = get_self_evolution_state(settings, resolved_project_dir)
@@ -1193,6 +2574,7 @@ def run_writing_regression_suite(settings: Settings, project_dir: Path) -> dict[
     "status": _score_status(average_score),
     "cases": cases,
     "golden_evaluator_benchmark": _run_golden_evaluator_benchmark(),
+    "humanize_ab_benchmark": _run_humanize_ab_benchmark(chapter_content, resolved_project_dir),
   }
   _append_jsonl(_writing_regression_path(resolved_project_dir), run)
   return run
@@ -1214,6 +2596,12 @@ def _heuristic_model_review(
     failure_causes.append("最近任务包含失败步骤，需要检查输入条件、章节选择和工具调用顺序。")
   if latest_regression and float(latest_regression.get("average_score") or 0) < 0.7:
     failure_causes.append("写作回归评分偏低，样本章、蓝图、资料链路至少有一项不足。")
+  latest_humanize_ab = latest_regression.get("humanize_ab_benchmark") if isinstance(latest_regression, dict) else {}
+  if isinstance(latest_humanize_ab, dict) and float(latest_humanize_ab.get("score") or 0) < 0.78:
+    failure_causes.append("去 AI A/B 回归未达到稳定区，需要继续强化小说正文去痕规则。")
+    for item in latest_humanize_ab.get("distilled_rules") or []:
+      if str(item or "").strip():
+        suggestions.append(str(item).strip())
   if not failure_causes:
     failure_causes.append("最近没有明显失败信号，主要继续观察调用规则是否稳定复用。")
   if any(item.get("kind") == "skill" and item.get("status") == "pending" for item in candidates):
@@ -1355,6 +2743,17 @@ def run_self_evolution_model_review(settings: Settings, project_dir: Path) -> di
       status="model_failed",
       error=str(error),
     )
+  humanize_judge = _run_humanize_model_judge(settings, resolved_project_dir, regression_runs)
+  humanize_rule_update = _update_humanize_evolution_rules(resolved_project_dir, humanize_judge)
+  review["humanize_model_judge"] = humanize_judge
+  review["humanize_rule_update"] = humanize_rule_update
+  if humanize_rule_update.get("inserted") or humanize_rule_update.get("refreshed"):
+    review["improvement_suggestions"] = _ordered_unique(
+      [
+        *(review.get("improvement_suggestions") if isinstance(review.get("improvement_suggestions"), list) else []),
+        "去 AI 自学习规则已更新，后续去 AI 改稿会读取这些项目规则。",
+      ]
+    )[:8]
   try:
     cross_content = _invoke_optional_reviewer_model(settings, review_messages)
     review = _merge_cross_review(review, cross_content)
@@ -1419,6 +2818,7 @@ def _self_evolution_dashboard(
   regression_runs: list[dict[str, object]],
   model_reviews: list[dict[str, object]],
   failure_cases: list[dict[str, object]],
+  humanize_patrol: dict[str, object],
 ) -> dict[str, object]:
   candidate_items = candidates.get("items") if isinstance(candidates.get("items"), list) else []
   rule_items = capability_rules.get("rules") if isinstance(capability_rules.get("rules"), list) else []
@@ -1455,6 +2855,16 @@ def _self_evolution_dashboard(
   latest_regression = regression_runs[0] if regression_runs else {}
   previous_regression = regression_runs[1] if len(regression_runs) > 1 else latest_regression
   regression_delta = float(latest_regression.get("average_score") or 0) - float(previous_regression.get("average_score") or 0)
+  latest_humanize_ab = (
+    latest_regression.get("humanize_ab_benchmark")
+    if isinstance(latest_regression.get("humanize_ab_benchmark"), dict)
+    else {}
+  )
+  latest_humanize_judge = (
+    model_reviews[0].get("humanize_model_judge")
+    if model_reviews and isinstance(model_reviews[0], dict) and isinstance(model_reviews[0].get("humanize_model_judge"), dict)
+    else {}
+  )
   failing_actions: dict[str, int] = {}
   for item in evaluations:
     if not isinstance(item, dict) or int(item.get("failure_count") or 0) <= 0:
@@ -1498,6 +2908,13 @@ def _self_evolution_dashboard(
     "writing_score_delta": round(latest_score - previous_score, 3),
     "latest_regression_score": round(float(latest_regression.get("average_score") or 0), 3),
     "regression_score_delta": round(regression_delta, 3),
+    "latest_humanize_ab_score": round(float(latest_humanize_ab.get("score") or 0), 3),
+    "latest_humanize_ab_status": latest_humanize_ab.get("status", ""),
+    "latest_humanize_judge_score": round(float(latest_humanize_judge.get("score") or 0), 3),
+    "latest_humanize_judge_status": latest_humanize_judge.get("status", ""),
+    "latest_humanize_patrol_status": humanize_patrol.get("last_status", ""),
+    "latest_humanize_patrol_reason": humanize_patrol.get("last_reason", ""),
+    "latest_humanize_patrol_checked_at": humanize_patrol.get("last_check_at", ""),
     "recent_failure_count": sum(int(item.get("failure_count") or 0) for item in evaluations[:10] if isinstance(item, dict)),
     "failing_actions": sorted(
       [{"action": action, "count": count} for action, count in failing_actions.items()],
@@ -1523,6 +2940,22 @@ def _self_evolution_dashboard(
         for item in regression_runs[:20]
         if isinstance(item, dict)
       ],
+      "humanize_ab_scores": [
+        {
+          "generated_at": item.get("generated_at", ""),
+          "score": round(float(item.get("humanize_ab_benchmark", {}).get("score") or 0), 3),
+        }
+        for item in regression_runs[:20]
+        if isinstance(item, dict) and isinstance(item.get("humanize_ab_benchmark"), dict)
+      ],
+      "humanize_judge_scores": [
+        {
+          "generated_at": item.get("generated_at", ""),
+          "score": round(float(item.get("humanize_model_judge", {}).get("score") or 0), 3),
+        }
+        for item in model_reviews[:20]
+        if isinstance(item, dict) and isinstance(item.get("humanize_model_judge"), dict)
+      ],
       "quality_dimensions": quality_trends,
     },
     "failure_case_count": len(failure_cases),
@@ -1535,7 +2968,7 @@ def _self_evolution_dashboard(
   }
 
 
-def get_self_evolution_state(settings: Settings, project_dir: Path) -> dict[str, object]:
+def get_self_evolution_state(settings: Settings, project_dir: Path, project_detail: object | None = None) -> dict[str, object]:
   candidates = _load_candidates(project_dir)
   capability_rules = _load_capability_rules(project_dir)
   drafts = _load_drafts(project_dir)
@@ -1545,6 +2978,18 @@ def get_self_evolution_state(settings: Settings, project_dir: Path) -> dict[str,
   failure_cases = _latest_jsonl_items(_failure_case_path(project_dir), 20)
   schedule = _load_schedule(project_dir)
   skill_usage = get_skill_usage_state(settings)
+  style_xp_evolution = load_project_style_xp_state(project_dir)
+  humanize_evolution_rules = _load_humanize_evolution_rules(project_dir)
+  humanize_patrol = _load_humanize_patrol(project_dir)
+  narrative_state = (
+    refresh_project_narrative_state_chapter_cards(
+      project_dir,
+      project_detail,
+      auto_stage_drafts=True,
+    )
+    if project_detail is not None
+    else load_project_narrative_state(project_dir)
+  )
   return {
     "candidates": candidates,
     "capability_rules": capability_rules,
@@ -1555,6 +3000,10 @@ def get_self_evolution_state(settings: Settings, project_dir: Path) -> dict[str,
     "failure_cases": failure_cases,
     "schedule": schedule,
     "skill_usage": skill_usage,
+    "humanize_evolution_rules": humanize_evolution_rules,
+    "humanize_review_patrol": humanize_patrol,
+    "style_xp_evolution": style_xp_evolution,
+    "narrative_state": narrative_state,
     "dashboard": _self_evolution_dashboard(
       candidates=candidates,
       capability_rules=capability_rules,
@@ -1564,6 +3013,7 @@ def get_self_evolution_state(settings: Settings, project_dir: Path) -> dict[str,
       regression_runs=regression_runs,
       model_reviews=model_reviews,
       failure_cases=failure_cases,
+      humanize_patrol=humanize_patrol,
     ),
   }
 

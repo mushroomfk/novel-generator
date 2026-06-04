@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 
 from novel_backend.app import LOCAL_ORIGIN_PATTERN, create_app
 from novel_backend.config import reset_settings_cache
+from novel_backend.models import AGENT_MESSAGE_CONTENT_MAX_LENGTH
 
 
 class AppCorsTestCase(unittest.TestCase):
@@ -40,7 +41,7 @@ class AppValidationErrorTestCase(unittest.TestCase):
             [
               {
                 "loc": ("body", "messages", 0, "content"),
-                "msg": "String should have at most 6000 characters",
+                "msg": f"String should have at most {AGENT_MESSAGE_CONTENT_MAX_LENGTH} characters",
                 "type": "string_too_long",
               }
             ]

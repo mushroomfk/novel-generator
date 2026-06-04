@@ -15,6 +15,7 @@ from novel_backend.models import (
   ProjectDreamRunRequest,
   ArchitectureStepRequest,
   ArchitectureWorkspace,
+  ChapterUpdateRequest,
   ChapterWorkflowRequest,
   ChapterWorkflowResult,
   ChapterWorkflowScene,
@@ -23,6 +24,7 @@ from novel_backend.models import (
   KnowledgeImportRequest,
   ModelConfig,
   ModelRuntimeConfig,
+  ObsidianVaultConfig,
   ProjectMemoryEntry,
   ProjectMemoryEntryInput,
   ProjectMemoryUpdateRequest,
@@ -30,15 +32,31 @@ from novel_backend.models import (
 from novel_backend.services.config_service import initialize_app_storage, save_config
 from novel_backend.services.continuity_guard_service import build_continuity_guard_context
 from novel_backend.services.generation_service import (
+  _CONTINUATION_BRIEF_SYSTEM_PROMPT,
+  _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT,
+  _CONTINUATION_CANON_SYSTEM_PROMPT,
+  _CONTINUATION_REWRITE_SYSTEM_PROMPT,
+  _CONTINUATION_WRITE_SYSTEM_PROMPT,
+  _CONTINUITY_CHECK_SYSTEM_PROMPT,
   _continuation_segment_targets,
+  _generate_architecture_step,
   _generate_continuation_candidates,
+  _generate_continuation_brief,
   _judge_continuation,
   _run_continuation_pipeline,
   architecture_step_stream,
   architecture_stream,
   chapter_workflow_stream,
 )
-from novel_backend.services.project_service import create_project, get_project_detail, import_project_knowledge, run_project_dream, update_project_memory
+from novel_backend.services.project_service import (
+  create_project,
+  get_project_detail,
+  import_project_knowledge,
+  run_project_dream,
+  update_chapter_content,
+  update_project_memory,
+  update_project_obsidian_config,
+)
 
 
 def decode_sse_event(chunk: str) -> tuple[str, object]:
@@ -687,6 +705,102 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertEqual(_continuation_segment_targets(15_000), [5_000, 5_000, 5_000])
     self.assertEqual(_continuation_segment_targets(30_000), [5_000, 5_000, 5_000, 5_000, 5_000, 5_000])
 
+  def test_continuation_prompts_treat_continuity_contract_as_constraint(self) -> None:
+    prompts = {
+      "canon": _CONTINUATION_CANON_SYSTEM_PROMPT,
+      "brief": _CONTINUATION_BRIEF_SYSTEM_PROMPT,
+      "check": _CONTINUITY_CHECK_SYSTEM_PROMPT,
+      "judge": _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT,
+      "rewrite": _CONTINUATION_REWRITE_SYSTEM_PROMPT,
+      "write": _CONTINUATION_WRITE_SYSTEM_PROMPT,
+    }
+
+    for name, prompt in prompts.items():
+      self.assertIn("章节连续性合同", prompt, name)
+    self.assertIn("must_keep / blocked_changes", _CONTINUATION_CANON_SYSTEM_PROMPT)
+    self.assertIn("issues", _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT)
+    self.assertIn("warning", _CONTINUITY_CHECK_SYSTEM_PROMPT)
+    self.assertIn("优先满足", _CONTINUATION_WRITE_SYSTEM_PROMPT)
+
+  def test_continuation_brief_uses_previous_chapter_for_obsidian_context(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="批量续写资料",
+        genre="悬疑",
+        target_chapters=3,
+        target_words=36000,
+      ),
+    )
+    update_chapter_content(
+      self.settings,
+      project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追在章末走进白石会馆，听见旧船队账册被合上。\n"),
+    )
+    vault_dir = Path(self._temp_dir.name) / "brief-vault"
+    vault_dir.mkdir()
+    for index in range(9):
+      (vault_dir / f"00无关-{index}.md").write_text(
+        f"""---
+type: note
+status: canonical
+---
+# 无关笔记 {index}
+
+这份笔记记录别的城市。
+""",
+        encoding="utf-8",
+      )
+    (vault_dir / "白石会馆.md").write_text(
+      """---
+type: location
+status: canonical
+---
+# 白石会馆
+
+白石会馆掌握旧船队暗账。
+""",
+      encoding="utf-8",
+    )
+    update_project_obsidian_config(
+      self.settings,
+      project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    captured_prompts: list[str] = []
+
+    def fake_model(_settings, messages, **_kwargs):
+      captured_prompts.append("\n\n".join(str(item.get("content") or "") for item in messages))
+      return json.dumps(
+        {
+          "summary": "承接白石会馆。",
+          "last_state": ["林追已经进入白石会馆"],
+          "active_characters": ["林追"],
+          "open_threads": ["旧船队暗账"],
+          "next_beat": "让暗账产生新的行动压力。",
+          "hard_constraints": ["白石会馆掌握旧船队暗账"],
+          "avoid_conflicts": [],
+          "next_action": "继续写第二章。",
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.generation_service._invoke_model", side_effect=fake_model):
+      plan = _generate_continuation_brief(
+        self.settings,
+        project_id=project.id,
+        chapter_id="chapter-002",
+        instruction="继续写下一章。",
+        target_words=1200,
+      )
+
+    self.assertIn("白石会馆", plan["guard_context"].query)
+    self.assertIn("白石会馆掌握旧船队暗账", plan["bundle"].context_text)
+    self.assertIn("白石会馆掌握旧船队暗账", plan["evidence_text"])
+    self.assertTrue(captured_prompts)
+    self.assertIn("白石会馆掌握旧船队暗账", captured_prompts[0])
+
   def test_run_continuation_pipeline_splits_oversized_target(self) -> None:
     project = create_project(
       self.settings,
@@ -1174,6 +1288,69 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertIn("role：创意总监", content)
     self.assertIn("陈小雨：", content)
     self.assertNotIn('"headline"', content)
+
+  def test_architecture_step_compacts_irrelevant_workspace_and_caps_output_tokens(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model_name="demo-model",
+        max_tokens=8192,
+      ),
+    )
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="世界设定性能",
+        genre="悬疑幻想",
+        target_chapters=24,
+        target_words=240000,
+      ),
+    )
+    oversized_blueprint = "第一章从港口旧案开始。" + ("很长的章节蓝图。" * 800) + "蓝图尾部不该进入世界设定提示。"
+
+    with patch(
+      "novel_backend.services.generation_service._request_chat_completion",
+      return_value={
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "headline": "世界设定已生成。",
+                  "summary": "保留港口、潮汐和旧秩序压力。",
+                  "content": "潮汐窗口决定隐秘航线是否开启，港务会用表层秩序掩盖旧船队失踪案。",
+                  "checklist": ["确认潮汐规则", "保留港务会压力"],
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      },
+    ) as mocked_request:
+      result = _generate_architecture_step(
+        self.settings,
+        ArchitectureStepRequest(
+          project_id=project.id,
+          step="world_building",
+          guidance="生成世界设定。",
+          workspace=ArchitectureWorkspace(
+            core_seed="铜钥匙牵出港口旧案。",
+            character_design="林追追查真相，港务会封锁证据。",
+            blueprint=oversized_blueprint,
+          ),
+        ),
+        "task-world-building",
+      )
+
+    sent_payload = mocked_request.call_args.args[2]
+    sent_prompt = "\n\n".join(str(item.get("content") or "") for item in sent_payload["messages"])
+    self.assertEqual(result.step, "world_building")
+    self.assertEqual(sent_payload["max_tokens"], 2200)
+    self.assertIn("第一章从港口旧案开始。", sent_prompt)
+    self.assertNotIn("蓝图尾部不该进入世界设定提示", sent_prompt)
 
   def test_continuity_guard_prefers_manual_memory_and_recent_chapters(self) -> None:
     project = create_project(

@@ -45,11 +45,14 @@ const props = defineProps({
 
 const emit = defineEmits([
   'create-project',
+  'import-existing-novel',
+  'import-project',
   'select',
   'select-chapter',
   'select-discussion-thread',
   'toggle-chapters',
   'open-project-folder',
+  'export-project-migration',
   'request-rename-project',
   'request-delete-project',
 ]);
@@ -80,7 +83,7 @@ function resolveMenuPlacement(triggerElement) {
 
   const triggerRect = triggerElement.getBoundingClientRect();
   const containerRect = scrollContainer.getBoundingClientRect();
-  const estimatedMenuHeight = 136;
+  const estimatedMenuHeight = 176;
   const spaceBelow = containerRect.bottom - triggerRect.bottom;
   const spaceAbove = triggerRect.top - containerRect.top;
 
@@ -175,14 +178,32 @@ onBeforeUnmount(() => {
         <span class="count">{{ projects.length }}</span>
       </div>
 
-      <button
-        class="header-action"
-        data-testid="open-create-project-button"
-        type="button"
-        @click="emit('create-project')"
-      >
-        新建
-      </button>
+      <div class="panel-header-actions">
+        <button
+          class="header-action header-action-primary"
+          data-testid="import-existing-novel-button"
+          type="button"
+          @click="emit('import-existing-novel')"
+        >
+          旧稿
+        </button>
+        <button
+          class="header-action"
+          data-testid="import-project-button"
+          type="button"
+          @click="emit('import-project')"
+        >
+          迁移包
+        </button>
+        <button
+          class="header-action"
+          data-testid="open-create-project-button"
+          type="button"
+          @click="emit('create-project')"
+        >
+          新建
+        </button>
+      </div>
     </div>
 
     <div
@@ -239,6 +260,15 @@ onBeforeUnmount(() => {
                 @click.stop="emitProjectAction('open-project-folder', project)"
               >
                 打开文件夹
+              </button>
+              <button
+                :disabled="projectActionPendingId === project.id"
+                class="project-menu-item"
+                data-testid="project-export-migration-button"
+                type="button"
+                @click.stop="emitProjectAction('export-project-migration', project)"
+              >
+                导出迁移包
               </button>
               <button
                 :disabled="projectActionPendingId === project.id"
@@ -388,6 +418,13 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
 .eyebrow {
   margin: 0;
   font-size: 11px;
@@ -419,6 +456,16 @@ onBeforeUnmount(() => {
 .header-action:hover {
   background: #e9eef7;
   color: #1d4ed8;
+}
+
+.header-action-primary {
+  background: #1d4ed8;
+  color: #ffffff;
+}
+
+.header-action-primary:hover {
+  background: #1e40af;
+  color: #ffffff;
 }
 
 .empty {

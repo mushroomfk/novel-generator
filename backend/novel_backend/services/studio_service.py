@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -58,6 +60,7 @@ from novel_backend.services.humanize_service import (
   build_humanize_fallback_changes,
   build_humanize_prompt_block,
   build_humanize_quality_report,
+  validate_humanize_revision_length,
 )
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.project_service import (
@@ -208,6 +211,8 @@ _STYLE_NARRATIVE_CALIBRATE_SYSTEM_PROMPT = """
 4. instruction 和 analysis 只做必要微调，主要更新 narrative_* 字段。
 """.strip()
 
+_BRAINSTORM_CHAPTER_NUMBER_PATTERN = re.compile(r"第\s*([0-9零一二三四五六七八九十百两]+)\s*章")
+
 
 def _documents_map(project_detail) -> dict[str, str]:
   return project_documents_map(project_detail)
@@ -254,6 +259,8 @@ def _apply_preset_and_style(
   style_task_type: str = "chapter",
   style_query: str = "",
   xp_name: str = "",
+  project_id: str = "",
+  chapter_id: str = "",
 ) -> str:
   return build_prompt_support(
     settings,
@@ -262,6 +269,126 @@ def _apply_preset_and_style(
     style_task_type=style_task_type,
     style_query=style_query,
     xp_name=xp_name,
+    project_id=project_id,
+    chapter_id=chapter_id,
+  )
+
+
+def _brainstorm_cn_number_to_int(value: str) -> int:
+  stripped = str(value or "").strip()
+  if not stripped:
+    return 0
+  if stripped.isdigit():
+    return int(stripped)
+
+  digit_map = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+  }
+  unit_map = {"十": 10, "百": 100}
+  total = 0
+  current = 0
+  for char in stripped:
+    if char in digit_map:
+      current = digit_map[char]
+      continue
+    if char in unit_map:
+      total += (current or 1) * unit_map[char]
+      current = 0
+  return total + current
+
+
+def _brainstorm_latest_user_text(payload: BrainstormRequest) -> str:
+  for item in reversed(payload.messages):
+    content = str(getattr(item, "content", "") or "").strip()
+    if str(getattr(item, "role", "") or "") == "user" and content:
+      return content
+  return payload.extra_context.strip()
+
+
+def _brainstorm_recent_discussion_text(payload: BrainstormRequest, limit: int = 6) -> str:
+  parts = [
+    str(getattr(item, "content", "") or "").strip()
+    for item in payload.messages[-limit:]
+    if str(getattr(item, "content", "") or "").strip()
+  ]
+  return "\n".join(parts).strip()
+
+
+def _brainstorm_chapter_index_from_text(text: str) -> int:
+  matches = list(_BRAINSTORM_CHAPTER_NUMBER_PATTERN.finditer(str(text or "")))
+  if not matches:
+    return 0
+  return _brainstorm_cn_number_to_int(matches[-1].group(1))
+
+
+def _resolve_brainstorm_chapter_id(project_detail, payload: BrainstormRequest) -> str:
+  requested_id = payload.chapter_id.strip()
+  if requested_id:
+    chapter = next(
+      (item for item in getattr(project_detail, "chapters", []) if str(getattr(item, "id", "") or "") == requested_id),
+      None,
+    )
+    if chapter is not None:
+      return requested_id
+
+  chapter_index = _brainstorm_chapter_index_from_text(
+    "\n".join(
+      item
+      for item in [
+        payload.extra_context.strip(),
+        _brainstorm_recent_discussion_text(payload),
+      ]
+      if item
+    )
+  )
+  if chapter_index <= 0:
+    return ""
+  chapter = next(
+    (
+      item
+      for item in getattr(project_detail, "chapters", [])
+      if int(getattr(item, "index", 0) or 0) == chapter_index
+    ),
+    None,
+  )
+  return str(getattr(chapter, "id", "") or "").strip()
+
+
+def _build_brainstorm_context_bundle(
+  settings: Settings,
+  payload: BrainstormRequest,
+  *,
+  chapter_id: str,
+):
+  discussion_text = _brainstorm_recent_discussion_text(payload)
+  task_instruction = _brainstorm_latest_user_text(payload)
+  knowledge_query = "\n\n".join(
+    item
+    for item in [
+      discussion_text,
+      payload.extra_context.strip(),
+    ]
+    if item
+  )
+  return build_project_context_bundle(
+    settings,
+    payload.project_id,
+    include_blueprint=payload.include_blueprint,
+    include_character_state=payload.include_character_state,
+    chapter_id=chapter_id,
+    knowledge_query=knowledge_query,
+    task_pack_kind="continuation" if chapter_id else "",
+    task_instruction=task_instruction,
   )
 
 
@@ -540,34 +667,12 @@ def _parse_style_result(text: str, task_id: str) -> StyleAnalysisResult:
 
 
 def _brainstorm_messages(settings: Settings, payload: BrainstormRequest) -> list[dict[str, str]]:
-  bundle = build_project_context_bundle(
-    settings,
-    payload.project_id,
-    include_blueprint=payload.include_blueprint,
-    include_character_state=payload.include_character_state,
-    knowledge_query=payload.extra_context,
-  )
+  bundle = _build_brainstorm_context_bundle(settings, payload, chapter_id=payload.chapter_id.strip())
+  resolved_chapter_id = _resolve_brainstorm_chapter_id(bundle.project_detail, payload)
+  if resolved_chapter_id and resolved_chapter_id != str(getattr(bundle.chapter, "id", "") or "").strip():
+    bundle = _build_brainstorm_context_bundle(settings, payload, chapter_id=resolved_chapter_id)
   project_detail = bundle.project_detail
-  documents = bundle.documents
-  context_lines = [f"作品：{project_detail.name}", f"类型：{project_detail.genre}"]
-  if payload.include_core_seed:
-    context_lines.append(f"核心种子：{_compact_text(documents.get('core_seed', ''), 260) or '无'}")
-  if payload.include_characters:
-    context_lines.append(f"人物设定：{_compact_text(documents.get('character_design', ''), 320) or '无'}")
-  if payload.include_world_building:
-    context_lines.append(f"世界设定：{_compact_text(documents.get('world_building', ''), 320) or '无'}")
-  if payload.include_plot:
-    context_lines.append(f"情节骨架：{_compact_text(documents.get('plot_structure', ''), 320) or '无'}")
-  if payload.include_blueprint:
-    context_lines.append(f"章节蓝图：{_compact_text(documents.get('blueprint', ''), 320) or '无'}")
-  if payload.include_character_state:
-    context_lines.append(f"人物状态：{_compact_text(documents.get('character_state', ''), 320) or '无'}")
-  memory_line = next(
-    (line for line in bundle.context_lines if str(line).startswith("项目记忆：")),
-    "",
-  )
-  if memory_line and not memory_line.endswith("无"):
-    context_lines.append(memory_line)
+  context_lines = [bundle.context_text]
   dream_text = build_project_dream_prompt_block(project_detail)
   if dream_text:
     context_lines.append(dream_text)
@@ -581,7 +686,12 @@ def _brainstorm_messages(settings: Settings, payload: BrainstormRequest) -> list
     messages.append({"role": "system", "content": active_skill_prompt})
   for item in payload.messages:
     messages.append({"role": item.role, "content": item.content})
-  support = build_prompt_support(settings, task_key="brainstorm")
+  support = build_prompt_support(
+    settings,
+    task_key="brainstorm",
+    project_id=payload.project_id,
+    chapter_id=str(getattr(bundle.chapter, "id", "") or "").strip(),
+  )
   if support:
     messages.append({"role": "system", "content": f"额外要求：{support}"})
   return messages
@@ -677,6 +787,7 @@ def _blueprint_messages(settings: Settings, payload: BlueprintGenerateRequest) -
     style_task_type="blueprint",
     style_query=payload.instruction or documents.get("blueprint", ""),
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
   )
   dream_text = build_project_dream_prompt_block(project_detail)
   dream_block = f"{dream_text}\n\n" if dream_text else ""
@@ -721,6 +832,8 @@ def _chapter_generate_messages(settings: Settings, payload: ChapterGenerateReque
     style_task_type="chapter",
     style_query=f"{chapter.title} {payload.instruction}",
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
   )
   return [
     {"role": "system", "content": _CHAPTER_GENERATE_SYSTEM_PROMPT},
@@ -770,6 +883,8 @@ def _chapter_rewrite_messages(settings: Settings, payload: ChapterRewriteRequest
     style_task_type="chapter",
     style_query=f"{chapter.title} {payload.instruction}",
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
   )
   return [
     {"role": "system", "content": _CHAPTER_REWRITE_SYSTEM_PROMPT},
@@ -796,8 +911,16 @@ def _chapter_humanize_messages(settings: Settings, payload: ChapterRewriteReques
     style_task_type="chapter",
     style_query=f"{chapter.title} {payload.instruction}",
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
   )
   prompt_block = build_humanize_prompt_block(chapter.content.strip())
+  try:
+    from novel_backend.services.self_evolution_service import build_project_humanize_evolution_context
+
+    evolution_rules = build_project_humanize_evolution_context(Path(project_detail.path))
+  except Exception:
+    evolution_rules = ""
   return [
     {"role": "system", "content": _CHAPTER_HUMANIZE_SYSTEM_PROMPT},
     {
@@ -806,6 +929,7 @@ def _chapter_humanize_messages(settings: Settings, payload: ChapterRewriteReques
         f"{context_text}\n\n"
         f"请处理《{project_detail.name}》第 {chapter.index} 章《{chapter.title}》的正文。\n"
         f"{prompt_block}\n"
+        f"{evolution_rules}\n"
         f"用户补充：{payload.instruction.strip() or '无'}\n"
         f"原正文：\n{chapter.content.strip()}\n\n"
         f"如果这一章改完后确实需要更新滚动摘要或人物状态，再写入对应字段。\n"
@@ -833,6 +957,7 @@ def _continue_messages(settings: Settings, payload: ContinueProjectRequest) -> l
     style_task_type="blueprint",
     style_query=payload.instruction or documents.get("blueprint", ""),
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
   )
   dream_text = build_project_dream_prompt_block(project_detail)
   dream_block = f"{dream_text}\n\n" if dream_text else ""
@@ -1002,6 +1127,8 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     style_task_type="chapter",
     style_query=payload.instruction,
     xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
   )
   candidate_mode = load_config(settings).model_runtime.chapter_candidate_mode
   pipeline = _run_continuation_pipeline(
@@ -1042,6 +1169,7 @@ def _rewrite_chapter(settings: Settings, payload: ChapterRewriteRequest, task_id
     raise HTTPException(status_code=404, detail="章节不存在")
   updates: dict[str, object] = {"original": chapter.content.strip()}
   if mode == "humanize":
+    validate_humanize_revision_length(chapter.content.strip(), result.revised)
     quality_report = build_humanize_quality_report(chapter.content.strip(), result.revised)
     updates["quality_report"] = quality_report
     if not result.changes:

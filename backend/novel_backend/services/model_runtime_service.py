@@ -92,6 +92,7 @@ class ModelRuntimeManager:
     self._waiting: list[ModelRuntimeTask] = []
     self._active: list[ModelRuntimeTask] = []
     self._sequence = 0
+    self._foreground_session_count = 0
     self._last_foreground_finished_at = time.monotonic()
     self._cooldown_until: dict[str, float] = {}
     self._cooldown_reason: dict[str, str] = {}
@@ -203,6 +204,20 @@ class ModelRuntimeManager:
         return True
       return self._idle_seconds_locked() < config.background_requires_idle_seconds
 
+  @contextmanager
+  def foreground_session(self):
+    with self._condition:
+      self._foreground_session_count += 1
+      self._condition.notify_all()
+    try:
+      yield
+    finally:
+      with self._condition:
+        self._foreground_session_count = max(0, self._foreground_session_count - 1)
+        if self._foreground_session_count == 0 and not self._foreground_active_locked() and not self._foreground_waiting_locked():
+          self._last_foreground_finished_at = time.monotonic()
+        self._condition.notify_all()
+
   def state(self, settings: Settings | None = None) -> dict[str, object]:
     config = load_config(settings).model_runtime if settings is not None else ModelRuntimeConfig()
     with self._condition:
@@ -263,7 +278,7 @@ class ModelRuntimeManager:
     return sum(1 for item in self._active if item.lane == lane)
 
   def _foreground_active_locked(self) -> bool:
-    return any(item.lane == "chat" and not item.background for item in self._active)
+    return self._foreground_session_count > 0 or any(item.lane == "chat" and not item.background for item in self._active)
 
   def _foreground_waiting_locked(self) -> bool:
     return any(item.lane == "chat" and not item.background for item in self._waiting)
@@ -315,6 +330,12 @@ def model_runtime_slot(
     raise
   else:
     _MANAGER.release(settings, task, status="completed")
+
+
+@contextmanager
+def model_runtime_foreground_session():
+  with _MANAGER.foreground_session():
+    yield
 
 
 def get_model_runtime_state(settings: Settings) -> dict[str, object]:

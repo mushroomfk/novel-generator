@@ -1,4 +1,4 @@
-function arrayBufferToBase64(buffer) {
+export function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
   let binary = '';

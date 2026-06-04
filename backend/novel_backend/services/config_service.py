@@ -13,6 +13,7 @@ from novel_backend.models import (
   ModelRuntimeConfig,
   ReviewModelConfig,
 )
+from novel_backend.services.skill_registry import default_skill_behavior_payloads, merge_skill_behavior
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
 
 
@@ -210,44 +211,7 @@ def initialize_app_storage(settings: Settings) -> None:
       ],
     )
 
-  default_skill_behaviors: dict[str, dict[str, str]] = {
-    "chapter-scenes": {
-      "panel": "chapter-workflow",
-      "mode": "scenes",
-      "input_label": "拆场要求",
-      "submit_label": "开始拆场",
-    },
-    "chapter-diagnose": {
-      "panel": "chapter-workflow",
-      "mode": "diagnose",
-      "input_label": "诊断要求",
-      "submit_label": "开始诊断",
-    },
-    "chapter-draft": {
-      "panel": "chapter-workflow",
-      "mode": "draft",
-      "input_label": "续写要求",
-      "submit_label": "开始续写",
-    },
-    "chapter-finalize": {
-      "panel": "chapter-rewrite",
-      "mode": "finalize",
-      "input_label": "改稿要求",
-      "submit_label": "开始定稿",
-    },
-    "chapter-polish": {
-      "panel": "chapter-rewrite",
-      "mode": "polish",
-      "input_label": "改稿要求",
-      "submit_label": "开始润色",
-    },
-    "chapter-humanize": {
-      "panel": "chapter-rewrite",
-      "mode": "humanize",
-      "input_label": "改稿要求",
-      "submit_label": "开始去 AI",
-    },
-  }
+  default_skill_behaviors = default_skill_behavior_payloads()
 
   default_skills = [
     {
@@ -539,6 +503,22 @@ def initialize_app_storage(settings: Settings) -> None:
       "requires_chapter": False,
     },
     {
+      "id": "obsidian-vault",
+      "badge": "Ob",
+      "name": "Obsidian 知识库",
+      "description": "把已有 Vault 作为可选设定来源，同步双链、标签和正式笔记。",
+      "category": "工具",
+      "scenes": ["资料", "知识图谱", "设定"],
+      "accent": "olive",
+      "section_id": "styles-and-tools",
+      "section_title": "风格与工具",
+      "section_description": "把文风、提示词、项目文件和运行记录都收进当前技能区。",
+      "section_order": 3,
+      "order": 42,
+      "requires_project": True,
+      "requires_chapter": False,
+    },
+    {
       "id": "web-research",
       "badge": "考",
       "name": "联网考据",
@@ -646,8 +626,10 @@ def initialize_app_storage(settings: Settings) -> None:
     section_dir.mkdir(parents=True, exist_ok=True)
     path = section_dir / f"{skill_payload['id']}.json"
     existing_payload = read_json(path, None)
-    if isinstance(existing_payload, dict) and behavior and "behavior" not in existing_payload:
-      atomic_write_json(path, {**existing_payload, "behavior": behavior})
+    if isinstance(existing_payload, dict) and behavior:
+      merged_behavior = merge_skill_behavior(str(skill_payload["id"]), existing_payload.get("behavior")).model_dump()
+      if existing_payload.get("behavior") != merged_behavior:
+        atomic_write_json(path, {**existing_payload, "behavior": merged_behavior})
       continue
     if not path.exists():
       atomic_write_json(path, skill_payload)

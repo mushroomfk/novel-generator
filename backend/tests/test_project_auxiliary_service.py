@@ -104,3 +104,22 @@ class ProjectAuxiliaryServiceTestCase(unittest.TestCase):
     self.assertEqual(task_state["retry_count"], 1)
     self.assertIn("模型总览生成失败", task_state["last_error"])
     self.assertTrue(task_state["next_run_at"])
+
+  def test_humanize_review_auxiliary_task_runs_patrol(self) -> None:
+    summary = self.create_demo_project()
+    enqueue_project_auxiliary_tasks(
+      self.settings,
+      summary.id,
+      tasks=["humanize_review"],
+      reason="chapter_update:chapter-001",
+    )
+
+    with patch(
+      "novel_backend.services.project_auxiliary_service.run_self_evolution_humanize_patrol",
+      return_value={"status": "completed"},
+    ) as patrol:
+      result = run_project_auxiliary_tasks(self.settings, summary.id, force=True)
+
+    self.assertEqual(result["ran"][0]["task"], "humanize_review")
+    self.assertEqual(result["ran"][0]["status"], "completed")
+    patrol.assert_called_once()

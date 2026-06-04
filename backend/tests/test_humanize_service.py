@@ -6,6 +6,7 @@ from novel_backend.services.humanize_service import (
   analyze_humanize_text,
   build_humanize_prompt_block,
   build_humanize_quality_report,
+  validate_humanize_revision_length,
 )
 
 
@@ -88,7 +89,38 @@ class HumanizeServiceTestCase(unittest.TestCase):
     self.assertIn("参考内置中文去痕规则", prompt_block)
     self.assertIn("优先处理这些问题", prompt_block)
     self.assertIn("AI连接词和套话", prompt_block)
+    self.assertIn("小说叙事去 AI 规则", prompt_block)
+    self.assertIn("人物对白", prompt_block)
     self.assertIn("交付前自检", prompt_block)
+
+  def test_analyze_humanize_text_detects_novel_specific_ai_flavor(self) -> None:
+    text = (
+      "他推开铁门。"
+      "他看见灯影。"
+      "他听见脚步。"
+      "他握紧铜钥匙。"
+      "他感到一种说不清的恐惧。"
+      "空气仿佛凝固。"
+      "这个眼神意味着真正的危险。"
+      "故事才刚刚开始。"
+    )
+    profile = analyze_humanize_text(text)
+
+    labels = [item.label for item in profile.issues]
+    self.assertIn("套版画面词", labels)
+    self.assertIn("抽象情绪直说", labels)
+    self.assertIn("潜台词解释", labels)
+    self.assertIn("句首主语重复", labels)
+    self.assertLess(profile.score, 70)
+
+  def test_validate_humanize_revision_length_rejects_summary_like_result(self) -> None:
+    original = "# 第一章 雨夜靠港\n" + (
+      "林追沿着码头往前走，雨水顺着仓库铁皮滴下来。他没有立刻进门，只把铜钥匙握在掌心。\n" * 40
+    )
+    revised = "# 第一章 雨夜靠港\n林追到了仓库，拿着钥匙继续调查。"
+
+    with self.assertRaisesRegex(RuntimeError, "明显短于原文"):
+      validate_humanize_revision_length(original, revised)
 
   def test_regression_cases_show_score_improvement(self) -> None:
     for case in REGRESSION_CASES:

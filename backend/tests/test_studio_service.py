@@ -26,6 +26,7 @@ from novel_backend.models import (
   CreateProjectRequest,
   EmbeddingConfig,
   ModelConfig,
+  ObsidianVaultConfig,
   ProjectDreamRunRequest,
   PromptPresetCreateRequest,
   PromptPresetUpdateRequest,
@@ -50,6 +51,7 @@ from novel_backend.services.project_service import (
   get_project_detail,
   run_project_dream,
   update_chapter_content,
+  update_project_obsidian_config,
 )
 from novel_backend.services.config_service import save_config
 from novel_backend.services.style_service import (
@@ -259,6 +261,98 @@ class StudioServiceTestCase(unittest.TestCase):
     )
     self.assertIn("当前启用用户技能", sent_prompt)
     self.assertIn(created.skill.name, sent_prompt)
+
+  def test_brainstorm_stream_uses_chapter_context_and_project_style_xp_support(self) -> None:
+    vault_dir = Path(self._temp_dir.name) / "vault-brainstorm-style-xp"
+    vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    style_path = self.project_dir / ".gaoxia" / "learning" / "style_xp_evolution.json"
+    style_path.parent.mkdir(parents=True, exist_ok=True)
+    style_path.write_text(
+      json.dumps(
+        {
+          "schema_version": 1,
+          "updated_at": "2026-06-03T00:00:00+00:00",
+          "active_version": 1,
+          "rules": [
+            {
+              "id": "style-visible-causality",
+              "kind": "style",
+              "signal": "manual-test-style",
+              "status": "active",
+              "content": "动作停顿之间保留可见因果。",
+              "rationale": "第 1 章和第 2 章都用动作承接信息。",
+              "confidence": 0.82,
+              "evidence_count": 2,
+              "source_chapter_ids": ["chapter-001", "chapter-002"],
+            },
+            {
+              "id": "xp-ending-pressure",
+              "kind": "xp",
+              "signal": "manual-test-xp",
+              "status": "active",
+              "content": "生成后确认线索压力留到章尾。",
+              "rationale": "第 1 章和第 2 章都在章尾保留压力。",
+              "confidence": 0.76,
+              "evidence_count": 2,
+              "source_chapter_ids": ["chapter-001", "chapter-002"],
+            },
+          ],
+          "observations": [],
+        },
+        ensure_ascii=False,
+        indent=2,
+      ),
+      encoding="utf-8",
+    )
+
+    with patch(
+      "novel_backend.services.generation_service._request_chat_completion",
+      return_value={
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "reply": "先把这一章的主冲突压实，再决定下一步揭示顺序。",
+                  "suggestions": ["主冲突是哪一个选择", "章尾压力要落在哪个信息点"],
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      },
+    ) as mocked_request:
+      asyncio.run(
+        collect_stream(
+          brainstorm_stream(
+            self.settings,
+            BrainstormRequest(
+              project_id=self.project.id,
+              chapter_id="chapter-003",
+              messages=[BrainstormMessage(role="user", content="第 3 章下一步该怎么推？")],
+              include_blueprint=True,
+              include_character_state=True,
+            ),
+          )
+        )
+      )
+
+    sent_prompt = "\n\n".join(
+      str(item.get("content") or "")
+      for item in mocked_request.call_args.args[2]["messages"]
+    )
+    self.assertIn("Obsidian 待审软约束", sent_prompt)
+    self.assertIn("[文风]", sent_prompt)
+    self.assertIn("[XP]", sent_prompt)
+    self.assertIn("系统学习版文风 / XP", sent_prompt)
+    self.assertIn("动作停顿之间保留可见因果", sent_prompt)
+    self.assertIn("生成后确认线索压力留到章尾", sent_prompt)
 
   def test_character_replica_stream_returns_structured_result(self) -> None:
     with patch(
@@ -490,6 +584,58 @@ class StudioServiceTestCase(unittest.TestCase):
     )
     self.assertIn("参考内置中文去痕规则", sent_prompt)
     self.assertIn("优先处理这些问题", sent_prompt)
+
+  def test_chapter_humanize_stream_rejects_summary_like_revision(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(
+        content="# 第一章 雨夜靠港\n"
+        + (
+          "林追沿着码头往前走，雨水顺着仓库铁皮滴下来。他没有立刻进门，只把铜钥匙握在掌心。\n"
+          * 40
+        ),
+      ),
+    )
+
+    with patch(
+      "novel_backend.services.generation_service._request_chat_completion",
+      return_value={
+        "choices": [
+          {
+            "message": {
+              "content": json.dumps(
+                {
+                  "headline": "已处理。",
+                  "summary": "把章节缩成摘要。",
+                  "revised": "# 第一章 雨夜靠港\n林追到了仓库，拿着钥匙继续调查。",
+                  "changes": ["删减冗余信息"],
+                },
+                ensure_ascii=False,
+              )
+            }
+          }
+        ]
+      },
+    ):
+      events = asyncio.run(
+        collect_stream(
+          chapter_rewrite_stream(
+            self.settings,
+            ChapterRewriteRequest(
+              project_id=self.project.id,
+              chapter_id="chapter-001",
+            ),
+            "humanize",
+          )
+        )
+      )
+
+    error_event = next(item for item in events if item[0] == "error")
+    done_event = next(item for item in events if item[0] == "done")
+    self.assertIn("明显短于原文", error_event[1]["message"])
+    self.assertEqual(done_event[1]["status"], "failed")
 
   def test_batch_generate_stream_writes_chapters(self) -> None:
     save_style(

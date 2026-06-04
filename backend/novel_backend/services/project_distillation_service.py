@@ -10,6 +10,7 @@ from novel_backend.models import (
   ProjectDistillationReport,
   TaskDistillationPack,
 )
+from novel_backend.services.obsidian_service import scoped_obsidian_note_records_for_chapter, select_obsidian_notes_for_query
 from novel_backend.utils.jsonfile import atomic_write_json, read_json
 
 _ARCHITECTURE_PATTERN = re.compile(r"(架构|蓝图|大纲|整书规划|整本规划|世界观|人物设定|情节骨架)")
@@ -47,11 +48,24 @@ def project_distillation_path(project_dir: Path) -> Path:
 
 
 def build_project_distillation_signature(project_detail) -> str:
-  raw_parts: list[str] = []
+  raw_parts: list[str] = ["distillation_scope::chapter_safe_v2"]
   for item in getattr(project_detail.story_overview, "documents", []) or []:
     raw_parts.append(f"doc::{item.key}::{(item.content or '').strip()}")
   for item in getattr(project_detail.story_overview, "materials", []) or []:
     raw_parts.append(f"material::{item.title}::{(item.preview or '').strip()}::{item.updated_at or ''}")
+  obsidian = getattr(project_detail.story_overview, "obsidian", None)
+  for item in getattr(obsidian, "notes", []) or []:
+    raw_parts.append(
+      "obsidian::"
+      f"{item.title}::{item.relative_path}::{(item.preview or '').strip()}::{item.updated_at or ''}::"
+      f"relations={','.join(getattr(item, 'graph_relations', []) or [])}::"
+      f"links={','.join(getattr(item, 'resolved_links', []) or [])}::"
+      f"backlinks={','.join(getattr(item, 'backlinks', []) or [])}::"
+      f"unresolved={','.join(getattr(item, 'unresolved_links', []) or [])}::"
+      f"ambiguous={','.join(getattr(item, 'ambiguous_links', []) or [])}::"
+      f"external_refs={','.join(getattr(item, 'external_references', []) or [])}::"
+      f"external_links={','.join(getattr(item, 'external_links', []) or [])}"
+    )
   for item in getattr(project_detail.story_overview, "memory_entries", []) or []:
     raw_parts.append(
       f"memory::{item.id}::{item.category}::{item.title}::{(item.content or '').strip()}::{item.source}"
@@ -168,15 +182,62 @@ def _entity_notes(entities, prefix: str, *, limit: int = 8) -> list[str]:
   return _unique_lines(lines, limit=limit)
 
 
-def _material_notes(project_detail) -> list[str]:
-  return _unique_lines(
-    [
-      f"{item.title}｜{_compact_text(item.preview, 100)}"
-      for item in getattr(project_detail.story_overview, "materials", [])[:8]
-      if item.title or item.preview
-    ],
-    limit=6,
-  )
+def _material_notes(project_detail, query: str = "", chapter_index: int = 0) -> list[str]:
+  notes = [
+    f"{item.title}｜{_compact_text(item.preview, 100)}"
+    for item in getattr(project_detail.story_overview, "materials", [])[:8]
+    if item.title or item.preview
+  ]
+  obsidian = getattr(project_detail.story_overview, "obsidian", None)
+  obsidian_notes = list(getattr(obsidian, "notes", []) or [])
+  if chapter_index > 0:
+    project_path = str(getattr(project_detail, "path", "") or "").strip()
+    if project_path:
+      try:
+        obsidian_notes = [
+          record.summary
+          for record in scoped_obsidian_note_records_for_chapter(Path(project_path), chapter_index)
+        ]
+      except Exception:
+        pass
+  if query.strip():
+    obsidian_notes = list(select_obsidian_notes_for_query(
+      obsidian_notes,
+      query,
+      limit=8,
+      chapter_index=chapter_index,
+    ))
+  elif chapter_index > 0:
+    obsidian_notes = list(select_obsidian_notes_for_query(obsidian_notes, "", limit=8, chapter_index=chapter_index))
+  obsidian_material_notes: list[str] = []
+  for item in obsidian_notes[:8]:
+    if not (getattr(item, "title", "") or getattr(item, "preview", "")):
+      continue
+    parts = [f"Obsidian:{item.title}｜{_compact_text(item.preview, 100)}"]
+    external_references = [
+      _compact_text(str(reference), 80)
+      for reference in list(getattr(item, "external_references", []) or [])[:2]
+      if str(reference or "").strip()
+    ]
+    if external_references:
+      parts.append(f"考据来源：{' / '.join(external_references)}")
+    if getattr(item, "resolved_links", []) or getattr(item, "backlinks", []):
+      parts.append(
+        f"关联 {len(getattr(item, 'resolved_links', []) or [])} / 被引用 {len(getattr(item, 'backlinks', []) or [])}"
+      )
+    obsidian_material_notes.append("｜".join(parts))
+  notes.extend(obsidian_material_notes)
+  return _unique_lines(notes, limit=8)
+
+
+def _non_obsidian_material_notes(notes: list[str]) -> list[str]:
+  return [item for item in notes if not str(item or "").strip().startswith("Obsidian:")]
+
+
+def _material_notes_for_pack(profile: DistilledSourceProfile, kind: str) -> list[str]:
+  if kind == "architecture":
+    return profile.material_notes
+  return _non_obsidian_material_notes(profile.material_notes)
 
 
 def _narrative_rules(project_detail) -> list[str]:
@@ -273,10 +334,11 @@ def _build_pack(kind: str, project_detail, profile: DistilledSourceProfile) -> T
   open_threads = _first_matching_memory(project_detail, ("auto-open-threads",))
 
   if kind == "continuation":
+    material_notes = _material_notes_for_pack(profile, kind)
     return TaskDistillationPack(
       kind=kind,
       summary="用于在不推翻既有事实和文风的前提下继续写正文。",
-      must_keep=_unique_lines(profile.narrative_rules[:3] + profile.core_conflicts[:3] + profile.material_notes[:2], limit=6),
+      must_keep=_unique_lines(profile.narrative_rules[:3] + profile.core_conflicts[:3] + material_notes[:2], limit=6),
       execution_focus=_unique_lines(
         [
           f"最近正文位置：第 {latest_chapter.index} 章《{latest_chapter.title}》之后继续承接。" if latest_chapter else "当前还没有稳定正文，需要先沿着蓝图立住开篇。",
@@ -292,10 +354,11 @@ def _build_pack(kind: str, project_detail, profile: DistilledSourceProfile) -> T
     )
 
   if kind == "architecture":
+    material_notes = _material_notes_for_pack(profile, kind)
     return TaskDistillationPack(
       kind=kind,
       summary="用于补齐或重整整书架构，同时保留资料库和已写正文的硬事实。",
-      must_keep=_unique_lines(profile.material_notes[:3] + profile.core_conflicts[:4], limit=6),
+      must_keep=_unique_lines(material_notes[:3] + profile.core_conflicts[:4], limit=6),
       execution_focus=_unique_lines(
         [
           f"目标规模：{project_detail.target_chapters} 章，约 {project_detail.target_words} 字。",
@@ -311,10 +374,11 @@ def _build_pack(kind: str, project_detail, profile: DistilledSourceProfile) -> T
     )
 
   if kind == "imitation":
+    material_notes = _material_notes_for_pack(profile, kind)
     return TaskDistillationPack(
       kind=kind,
       summary="用于模仿原作品或原资料的叙述方式，不默认继承全部剧情事实。",
-      must_keep=_unique_lines(profile.style_traits + profile.material_notes[:2], limit=6),
+      must_keep=_unique_lines(profile.style_traits + material_notes[:2], limit=6),
       execution_focus=_unique_lines(
         [
           "重点复用句法、视角、节奏和常见意象，不是照搬原剧情。",
@@ -376,6 +440,39 @@ def select_task_pack(project_detail, kind: str) -> TaskDistillationPack | None:
   return None
 
 
+def _pack_with_scoped_material_notes(
+  pack: TaskDistillationPack | None,
+  material_notes: list[str],
+  *,
+  chapter_index: int = 0,
+) -> TaskDistillationPack | None:
+  if pack is None or chapter_index <= 0:
+    return pack
+  kept = [
+    item
+    for item in list(pack.must_keep or [])
+    if not str(item or "").strip().startswith("Obsidian:")
+  ]
+  return pack.model_copy(
+    update={
+      "must_keep": _unique_lines(kept + material_notes[:3], limit=6),
+    }
+  )
+
+
+def _profile_summary_for_scope(
+  report: ProjectDistillationReport,
+  material_notes: list[str],
+  *,
+  chapter_index: int = 0,
+  allow_obsidian_summary: bool = True,
+) -> str:
+  summary = str(report.source_profile.summary or "").strip()
+  if (chapter_index > 0 or not allow_obsidian_summary) and summary.startswith("Obsidian:"):
+    return material_notes[0] if material_notes else ""
+  return summary
+
+
 def resolve_task_pack_kind(*, kind: str = "", instruction: str = "", rewrite_mode: str = "") -> str:
   normalized_kind = kind.strip().lower()
   if normalized_kind in {"continuation", "architecture", "imitation", "persona"}:
@@ -395,24 +492,39 @@ def resolve_task_pack_kind(*, kind: str = "", instruction: str = "", rewrite_mod
   return "continuation"
 
 
-def build_distillation_review_text(project_detail, *, kind: str = "", instruction: str = "") -> str:
+def build_distillation_review_text(project_detail, *, kind: str = "", instruction: str = "", chapter_index: int = 0) -> str:
   report = getattr(project_detail.story_overview, "distillation_report", None)
   if report is None or report.is_stale:
     return ""
 
   pack_kind = resolve_task_pack_kind(kind=kind, instruction=instruction)
   pack = select_task_pack(project_detail, pack_kind)
+  if chapter_index > 0:
+    material_notes = _material_notes(project_detail, query=instruction, chapter_index=chapter_index)
+  elif pack_kind == "architecture":
+    material_notes = _material_notes(project_detail, query=instruction) if instruction.strip() else report.source_profile.material_notes
+  else:
+    material_notes = _non_obsidian_material_notes(
+      _material_notes(project_detail, query=instruction) if instruction.strip() else report.source_profile.material_notes
+    )
+  pack = _pack_with_scoped_material_notes(pack, material_notes, chapter_index=chapter_index)
+  profile_summary = _profile_summary_for_scope(
+    report,
+    material_notes,
+    chapter_index=chapter_index,
+    allow_obsidian_summary=pack_kind == "architecture",
+  )
   lines: list[str] = []
-  if report.source_profile.summary:
-    lines.append(f"统一摘要：{_compact_text(report.source_profile.summary, 220)}")
+  if profile_summary:
+    lines.append(f"统一摘要：{_compact_text(profile_summary, 220)}")
   if report.source_profile.narrative_rules:
     lines.append("已确认规则：\n" + "\n".join(f"- {item}" for item in report.source_profile.narrative_rules[:4]))
   if report.source_profile.character_notes:
     lines.append("参考人物：\n" + "\n".join(f"- {item}" for item in report.source_profile.character_notes[:4]))
   if report.source_profile.event_notes:
     lines.append("参考事件：\n" + "\n".join(f"- {item}" for item in report.source_profile.event_notes[:4]))
-  if report.source_profile.material_notes:
-    lines.append("资料库要点：\n" + "\n".join(f"- {item}" for item in report.source_profile.material_notes[:4]))
+  if material_notes:
+    lines.append("资料库要点：\n" + "\n".join(f"- {item}" for item in material_notes[:4]))
   if pack is not None:
     lines.append(f"任务包：{pack.kind}｜{pack.summary}")
     if pack.must_keep:
@@ -424,24 +536,46 @@ def build_distillation_review_text(project_detail, *, kind: str = "", instructio
   return "\n\n".join(lines).strip()
 
 
-def build_task_distillation_prompt_block(project_detail, *, kind: str = "") -> str:
+def build_task_distillation_prompt_block(
+  project_detail,
+  *,
+  kind: str = "",
+  query: str = "",
+  chapter_index: int = 0,
+) -> str:
   report = getattr(project_detail.story_overview, "distillation_report", None)
   if report is None or report.is_stale:
     return ""
+  pack_kind = resolve_task_pack_kind(kind=kind, instruction=query)
+  if chapter_index > 0:
+    material_notes = _material_notes(project_detail, query=query, chapter_index=chapter_index)
+  elif pack_kind == "architecture":
+    material_notes = _material_notes(project_detail, query=query) if query.strip() else report.source_profile.material_notes
+  else:
+    material_notes = _non_obsidian_material_notes(
+      _material_notes(project_detail, query=query) if query.strip() else report.source_profile.material_notes
+    )
 
   lines: list[str] = []
-  if report.source_profile.summary:
-    lines.append(f"统一蒸馏摘要：{_compact_text(report.source_profile.summary, 220)}")
+  profile_summary = _profile_summary_for_scope(
+    report,
+    material_notes,
+    chapter_index=chapter_index,
+    allow_obsidian_summary=pack_kind == "architecture",
+  )
+  if profile_summary:
+    lines.append(f"统一蒸馏摘要：{_compact_text(profile_summary, 220)}")
   if report.source_profile.narrative_rules:
     lines.append("统一蒸馏规则：\n" + "\n".join(f"- {item}" for item in report.source_profile.narrative_rules[:4]))
   if report.source_profile.character_notes:
     lines.append("统一蒸馏人物：\n" + "\n".join(f"- {item}" for item in report.source_profile.character_notes[:4]))
   if report.source_profile.event_notes:
     lines.append("统一蒸馏事件：\n" + "\n".join(f"- {item}" for item in report.source_profile.event_notes[:4]))
-  if report.source_profile.material_notes:
-    lines.append("统一蒸馏资料：\n" + "\n".join(f"- {item}" for item in report.source_profile.material_notes[:3]))
+  if material_notes:
+    lines.append("统一蒸馏资料：\n" + "\n".join(f"- {item}" for item in material_notes[:3]))
 
-  pack = select_task_pack(project_detail, kind) if kind else None
+  pack = select_task_pack(project_detail, pack_kind) if pack_kind else None
+  pack = _pack_with_scoped_material_notes(pack, material_notes, chapter_index=chapter_index)
   if pack is not None:
     lines.append(f"{pack.kind} 任务包：{pack.summary}")
     if pack.must_keep:

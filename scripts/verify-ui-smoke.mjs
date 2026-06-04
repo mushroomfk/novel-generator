@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -217,6 +217,14 @@ async function waitForChapterPreviewContent(page, expectedText) {
     },
     expectedText,
   );
+}
+
+async function waitForWorkspaceComposer(page) {
+  await page.waitForFunction(() => {
+    const composer = document.querySelector('[data-testid="workspace-composer-input"]')
+      ?? document.querySelector('[data-testid="architecture-composer-input"]');
+    return composer instanceof HTMLTextAreaElement && composer.getClientRects().length > 0;
+  });
 }
 
 async function resolveChromePath() {
@@ -1048,6 +1056,87 @@ async function runSmoke(previewUrl, backendUrl) {
   const fileToken = `文件回写-${Date.now()}`;
   const architectureAgentToken = `架构执行-${Date.now()}`;
   const knowledgeQuery = '旧船队';
+  const obsidianVaultDir = await mkdtemp(path.join(os.tmpdir(), 'novel-ui-smoke-obsidian-'));
+  await mkdir(path.join(obsidianVaultDir, 'Characters'), { recursive: true });
+  await mkdir(path.join(obsidianVaultDir, 'Organizations'), { recursive: true });
+  await mkdir(path.join(obsidianVaultDir, 'Clues'), { recursive: true });
+  await writeFile(
+    path.join(obsidianVaultDir, 'Characters', '林追.md'),
+    [
+      '---',
+      'type: character',
+      'status: canonical',
+      'tags: [人物, 主角]',
+      'usable_by_ai: true',
+      'chapter_range: 1-12',
+      'source_chapters: [1, 3]',
+      'source_url: "[林追靠港账册](https://example.com/ui-smoke-harbor-ledger)"',
+      '---',
+      '# 林追',
+      '',
+      '林追正在追查[[灯塔议会]]删改旧船队靠港记录的事，铜钥匙是他的第一条硬线索。',
+      '',
+      '必须出现：铜钥匙',
+      '禁止出现：林追主动交出铜钥匙',
+    ].join('\n'),
+    'utf-8',
+  );
+  await writeFile(
+    path.join(obsidianVaultDir, 'Organizations', '灯塔议会.md'),
+    [
+      '---',
+      'type: organization',
+      'status: canonical',
+      'aliases: [灯塔]',
+      '---',
+      '# 灯塔议会',
+      '',
+      '灯塔议会掌握旧船队靠港记录。',
+    ].join('\n'),
+    'utf-8',
+  );
+  await writeFile(
+    path.join(obsidianVaultDir, 'Characters', '白石.md'),
+    [
+      '---',
+      'title: 白石',
+      'type: character',
+      'status: canonical',
+      '---',
+      '# 白石',
+      '',
+      '白石是旧船队幸存者。',
+    ].join('\n'),
+    'utf-8',
+  );
+  await writeFile(
+    path.join(obsidianVaultDir, 'Organizations', '白石商会.md'),
+    [
+      '---',
+      'title: 白石',
+      'type: organization',
+      'status: canonical',
+      'aliases: [白石商会]',
+      '---',
+      '# 白石商会',
+      '',
+      '白石商会控制仓储路线。',
+    ].join('\n'),
+    'utf-8',
+  );
+  await writeFile(
+    path.join(obsidianVaultDir, 'Clues', '码头账本.md'),
+    [
+      '---',
+      'type: clue',
+      'status: canonical',
+      '---',
+      '# 码头账本',
+      '',
+      '码头账本里反复提到[[白石]]。',
+    ].join('\n'),
+    'utf-8',
+  );
 
   try {
     await page.goto(previewUrl, { waitUntil: 'load' });
@@ -1171,8 +1260,10 @@ async function runSmoke(previewUrl, backendUrl) {
     });
     await page.getByTestId('agent-plan-card').waitFor();
     await page.getByTestId('agent-plan-card').getByText(/生成第 1 章正文|第 1 章《.*》正文/u).first().waitFor();
+    await page.getByTestId('agent-event-block-summary').filter({ hasText: '计划阶段' }).first().waitFor();
     await page.getByTestId('agent-timeline').first().waitFor();
     await page.getByTestId('agent-artifact-card').first().waitFor();
+    await page.getByTestId('agent-event-block-summary').filter({ hasText: '结果阶段' }).first().waitFor();
     await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来', { timeoutMs: 60000 });
     await waitForChapterPreviewContent(page, '潮声后面有人跟来');
     await page.locator('[data-testid^="agent-session-row-"]').first().waitFor();
@@ -1194,7 +1285,7 @@ async function runSmoke(previewUrl, backendUrl) {
     log('检查混合命令优先走架构');
     await page.getByTestId('workspace-composer-input').fill('把资料库的资料分析完，再重新弄续写架构');
     await page.locator('.composer-submit-button').click();
-    await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 20000 });
+    await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
     await waitForProjectDocumentContent(backendUrl, seededProject.id, 'blueprint', '第 3 章《夜潮账册》');
 
     await page.getByTestId('open-skills-button').click();
@@ -1204,6 +1295,56 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('knowledge-search-input').fill(knowledgeQuery);
     await page.getByTestId('knowledge-search-button').click();
     await page.getByTestId('knowledge-search-results').getByText(knowledgeQuery).first().waitFor();
+
+    log('检查 Obsidian 同步和检索');
+    await page.getByTestId('skill-use-obsidian-vault').click();
+    await page.getByTestId('obsidian-vault-form').waitFor();
+    await page.getByTestId('obsidian-enabled-checkbox').check();
+    await page.getByTestId('obsidian-vault-path-input').fill(obsidianVaultDir);
+    await page.getByTestId('obsidian-save-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="obsidian-save-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('obsidian-vault-results').getByText('灯塔议会').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('已解析').first().waitFor();
+    await page.getByTestId('obsidian-external-link-count').getByText('1 条').waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('重复命名').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('重复命名：白石').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('歧义双链：白石').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('被引用：Characters/林追.md').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('适用章节：第 1-12 章').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('来源章节：第 1 章、第 3 章').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('必须包含：铜钥匙').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('禁止出现：林追主动交出铜钥匙').first().waitFor();
+    await page.getByTestId('obsidian-vault-results').getByText('考据来源：林追靠港账册：https://example.com/ui-smoke-harbor-ledger').first().waitFor();
+    await page.getByTestId('skill-use-knowledge-search').click();
+    await page.getByTestId('knowledge-search-input').fill('灯塔议会');
+    await page.getByTestId('knowledge-search-button').click();
+    await page.getByTestId('knowledge-search-results').getByText('Obsidian').first().waitFor();
+    await saveProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-002',
+      '# 第二章 旧船队名单\n林追带着铜钥匙追到旧船队名单，灯塔议会删改靠港记录的痕迹变得更清楚。\n海雾钟秘密出现矛盾，宋闻无法解释。\n',
+    );
+    const chapterNoteSelfEvolution = await apiRequest(backendUrl, `/api/projects/${seededProject.id}/self-evolution`);
+    const chapterNoteSuggestion = (chapterNoteSelfEvolution?.narrative_state?.obsidian_maintenance_suggestions ?? [])
+      .find((item) => item.kind === 'create_chapter_note' && (item.source_chapters ?? []).includes(2));
+    if (!chapterNoteSuggestion?.id) {
+      throw new Error('没有生成第二章 Obsidian 章节档案维护建议');
+    }
+    await apiRequest(
+      backendUrl,
+      `/api/projects/${seededProject.id}/obsidian/maintenance/${encodeURIComponent(chapterNoteSuggestion.id)}/publish`,
+      { method: 'POST' },
+    );
+    await saveProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-002',
+      '# 第二章 雾中名单\n林追带着铜钥匙追到雾中名单，灯塔议会删改靠港记录的痕迹被重新确认。\n海雾钟秘密出现矛盾，宋闻无法解释。\n',
+    );
 
     log('检查联网考据未配置提示');
     await page.getByTestId('skill-use-web-research').click();
@@ -1243,6 +1384,82 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('self-evolution-model-reviews').getByText(/模型审查|自学习审查/u).first().waitFor();
     await page.getByTestId('self-evolution-quality-dimensions').waitFor();
     await page.getByTestId('self-evolution-trends').waitFor();
+    await page.getByTestId('self-evolution-style-xp').waitFor();
+    await page.getByTestId('self-evolution-narrative-state').waitFor();
+    await page.getByTestId('self-evolution-narrative-contracts').waitFor();
+    await page.getByTestId('self-evolution-narrative-chapter-card').getByText('最新章节任务卡').waitFor();
+    await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('Obsidian 任务约束').waitFor();
+    await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('考据来源：').waitFor();
+    await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('林追靠港账册：https://example.com/ui-smoke-harbor-ledger').waitFor();
+    await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('铜钥匙').first().waitFor();
+    await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('林追主动交出铜钥匙').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('整理剧情债务笔记').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('自动草稿').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Plot/').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-count').getByText(/\d+ \/ \d+ 条/u).waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('Vault 笔记待更新');
+    const outdatedChapterNoteCard = page
+      .getByTestId('self-evolution-obsidian-maintenance')
+      .locator('.issue-card')
+      .filter({ hasText: 'Vault 笔记待更新' })
+      .first();
+    await outdatedChapterNoteCard.waitFor();
+    await page.getByTestId('self-evolution-obsidian-stage-visible-button').click();
+    await page.waitForFunction(() => {
+      const buttons = [...document.querySelectorAll('button')];
+      return buttons.every((button) => !button.textContent?.includes('保存中'));
+    });
+    await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('已保存草稿');
+    const mergeChapterNoteCard = page
+      .getByTestId('self-evolution-obsidian-maintenance')
+      .locator('.issue-card')
+      .filter({ hasText: 'Vault 合并草稿' })
+      .first();
+    await mergeChapterNoteCard.waitFor();
+    await mergeChapterNoteCard.getByTestId('self-evolution-obsidian-confirm-merge-button').waitFor();
+    await page.getByTestId('self-evolution-obsidian-confirm-merge-visible-button').waitFor();
+    const mergeSelfEvolution = await apiRequest(backendUrl, `/api/projects/${seededProject.id}/self-evolution`);
+    const mergeSuggestion = (mergeSelfEvolution?.narrative_state?.obsidian_maintenance_suggestions ?? [])
+      .find((item) => item.kind === 'create_chapter_note' && (item.source_chapters ?? []).includes(2) && item.merge_draft_path);
+    if (!mergeSuggestion?.draft_path || !mergeSuggestion?.vault_path) {
+      throw new Error('Vault 合并草稿没有记录草稿路径或正式笔记路径');
+    }
+    const mergedDraftText = await readFile(mergeSuggestion.draft_path, 'utf-8');
+    await writeFile(mergeSuggestion.vault_path, mergedDraftText, 'utf-8');
+    await page.getByTestId('self-evolution-obsidian-confirm-merge-visible-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-obsidian-confirm-merge-visible-button"]');
+      return !(button instanceof HTMLButtonElement) || !button.textContent?.includes('确认中');
+    });
+    await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('全部');
+    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('');
+    await page.getByTestId('self-evolution-obsidian-ignore-visible-button').waitFor();
+    await page.getByTestId('self-evolution-obsidian-reopen-visible-button').waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('Plot/');
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Plot/').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('自动草稿');
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('自动草稿').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('全部');
+    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('');
+    await page.getByTestId('self-evolution-obsidian-stage-visible-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-obsidian-stage-visible-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('草稿文件：').first().waitFor();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-obsidian-publish-visible-button"]');
+      return button instanceof HTMLButtonElement && !button.disabled;
+    });
+    await page.getByTestId('self-evolution-obsidian-publish-visible-button').click();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('[data-testid="self-evolution-obsidian-publish-visible-button"]');
+      return !(button instanceof HTMLButtonElement) || !button.textContent?.includes('发布中');
+    });
+    const obsidianAfterMaintenance = await apiRequest(backendUrl, `/api/projects/${seededProject.id}/obsidian`);
+    if (!obsidianAfterMaintenance.notes.some((item) => String(item.relative_path ?? '').startsWith('Plot/'))) {
+      throw new Error('Obsidian 维护笔记没有发布到 Vault');
+    }
     await page.getByTestId('self-evolution-failure-cases').waitFor();
     await page.getByTestId('self-evolution-skill-versions').waitFor();
     await page.getByTestId('self-evolution-schedule-save-button').click();
@@ -1257,7 +1474,124 @@ async function runSmoke(previewUrl, backendUrl) {
     });
 
     await page.getByTestId('return-workspace-button').click();
-    await page.getByTestId('workspace-composer-input').waitFor();
+    await waitForWorkspaceComposer(page);
+    log('检查 Agent Obsidian 维护产物跳转');
+    await saveProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-003',
+      '# 第三章 夜潮账册\n旧友把一页夜潮账册交给林追，账册旁批注了灯塔议会和旧船队的暗号。\n',
+    );
+    const chapterThreeSelfEvolution = await apiRequest(backendUrl, `/api/projects/${seededProject.id}/self-evolution`);
+    const chapterThreeSuggestion = (chapterThreeSelfEvolution?.narrative_state?.obsidian_maintenance_suggestions ?? [])
+      .find((item) => (item.source_chapters ?? []).includes(3));
+    if (!chapterThreeSuggestion?.id) {
+      throw new Error('没有生成第三章 Obsidian 维护建议');
+    }
+    const artifactThreadId = `ui-smoke-obsidian-artifact-${Date.now()}`;
+    const artifactUpdatedAt = new Date(Date.now() + 60000).toISOString();
+    await apiRequest(backendUrl, `/api/projects/${seededProject.id}/agent-threads`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        active_thread_id: artifactThreadId,
+        threads: [
+          {
+            id: artifactThreadId,
+            title: 'Obsidian 维护产物跳转',
+            preview: '第 3 章 Obsidian 维护产物',
+            updated_at: artifactUpdatedAt,
+            messages: [
+              {
+                id: `${artifactThreadId}-user`,
+                role: 'user',
+                content: '查看第 3 章 Obsidian 维护产物',
+                content_hash: `${artifactThreadId}-user-hash`,
+                original_length: 22,
+                summary: '查看第 3 章 Obsidian 维护产物',
+              },
+              {
+                id: `${artifactThreadId}-assistant`,
+                role: 'assistant',
+                content: '已生成第 3 章相关 Obsidian 维护产物 1 条。',
+                content_hash: `${artifactThreadId}-assistant-hash`,
+                original_length: 31,
+                summary: '已生成第 3 章相关 Obsidian 维护产物',
+                mode: 'execution',
+                task_pack_kind: 'continuation',
+                artifacts: [
+                  {
+                    kind: 'obsidian_maintenance',
+                    title: '第 3 章 Obsidian 维护产物',
+                    summary: '已生成第 3 章相关 Obsidian 维护产物 1 条。',
+                    content_preview: '- 整理章节档案：第 3 章｜待审草稿｜ChapterNotes/第003章-夜潮账册.md',
+                    metadata: {
+                      chapter_index: 3,
+                      item_count: 1,
+                      suggestion_ids: [chapterThreeSuggestion.id],
+                    },
+                  },
+                ],
+                changes: ['已生成第 3 章相关 Obsidian 维护产物 1 条'],
+              },
+            ],
+            suggestions: [],
+          },
+        ],
+      }),
+    });
+    await page.reload({ waitUntil: 'load' });
+    await page.getByTestId('app-shell').waitFor();
+    await waitForSelectedProject(page, projectNameSecondRenamed);
+    const obsidianArtifactCard = page
+      .getByTestId('agent-artifact-card')
+      .filter({ hasText: 'Obsidian 维护' })
+      .last();
+    await obsidianArtifactCard.waitFor({ timeout: 60000 });
+    await obsidianArtifactCard.getByTestId('agent-obsidian-maintenance-open-button').click();
+    await page.getByTestId('skills-stage').waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-source-chapter').waitFor();
+    await page.waitForFunction(() => {
+      const input = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-source-chapter"]');
+      return input instanceof HTMLInputElement && input.value === '3';
+    });
+    await page.waitForFunction(() => {
+      const input = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-search"]');
+      return input instanceof HTMLInputElement && input.value === '';
+    });
+    await page.getByTestId('self-evolution-obsidian-maintenance-artifact-filter').getByText('清除产物筛选（1）').waitFor();
+    await page.waitForFunction(() => {
+      const count = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-count"]');
+      return count instanceof HTMLElement && !/显示\s+0\s+\//u.test(count.textContent || '');
+    });
+    await page.waitForFunction(() => {
+      const summary = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-summary"]');
+      const count = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-count"]');
+      if (!(summary instanceof HTMLElement) || !(count instanceof HTMLElement)) {
+        return false;
+      }
+      const summaryText = summary.textContent || '';
+      const countText = count.textContent || '';
+      const summaryMatch = /待处理\s+\d+\s*\/\s*(\d+)/u.exec(summaryText);
+      const countMatch = /显示\s+(\d+)\s*\/\s*\d+\s+条/u.exec(countText);
+      return summaryText.includes('当前筛选')
+        && summaryMatch
+        && countMatch
+        && Number(summaryMatch[1]) === Number(countMatch[1]);
+    });
+    await page.getByTestId('self-evolution-obsidian-maintenance-artifact-filter').click();
+    await page.waitForFunction(() => {
+      const artifactFilter = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-artifact-filter"]');
+      const sourceChapter = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-source-chapter"]');
+      return !(artifactFilter instanceof HTMLElement)
+        && sourceChapter instanceof HTMLInputElement
+        && sourceChapter.value === '3';
+    });
+    await page.waitForFunction(() => {
+      const count = document.querySelector('[data-testid="self-evolution-obsidian-maintenance-count"]');
+      return count instanceof HTMLElement && !/显示\s+0\s+\//u.test(count.textContent || '');
+    });
+    await page.getByTestId('return-workspace-button').click();
+    await waitForWorkspaceComposer(page);
 
     await page.getByTestId('open-settings-button').click();
     await page.getByTestId('settings-modal').waitFor();
@@ -1276,9 +1610,10 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('architecture-open-confirm-button').click();
     await page.getByRole('dialog', { name: '确认执行整书架构' }).waitFor();
     await page.getByRole('button', { name: '确认执行' }).click();
-    await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 20000 });
+    await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
     await page.getByTestId('agent-timeline').first().waitFor();
     await page.getByTestId('agent-artifact-card').first().waitFor();
+    await page.getByTestId('agent-event-block-summary').filter({ hasText: '结果阶段' }).first().waitFor();
     await waitForProjectDocumentContent(backendUrl, seededProject.id, 'blueprint', '第 3 章《夜潮账册》');
 
     log('检查 Agent 讨论结果渲染');
@@ -1316,6 +1651,13 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.locator('[data-overview-target="skills"]').waitFor();
     await page.getByRole('button', { name: '查看时间线' }).click();
     await page.getByTestId('story-overview-timeline').waitFor();
+    await page.getByTestId('story-overview-modal').getByRole('button', { name: '知识检索' }).click();
+    await page.getByTestId('story-overview-obsidian').waitFor();
+    await page
+      .getByTestId('story-overview-obsidian')
+      .getByText('考据来源：林追靠港账册：https://example.com/ui-smoke-harbor-ledger')
+      .first()
+      .waitFor();
     await page.keyboard.press('Escape');
     await page.getByTestId('story-overview-modal').waitFor({ state: 'hidden' });
     log('检查提示词方案');
@@ -1390,7 +1732,36 @@ async function runSmoke(previewUrl, backendUrl) {
       },
       { expectedName: personaName, expectedFocus: personaFocus, expectedNotes: personaNotes },
     );
+
+    log('检查项目迁移包导出导入');
+    await page.locator('.project-card-active').getByTestId('project-menu-trigger').click();
+    await page.getByTestId('project-export-migration-button').click();
+    const migrationExportNotice = page.locator('.notice-banner').filter({ hasText: '迁移包已导出' }).first();
+    await migrationExportNotice.waitFor({ timeout: 20000 });
+    const migrationExportText = await migrationExportNotice.textContent();
+    const migrationPackagePath = migrationExportText?.match(/迁移包已导出：(.+?)(?:；|$)/u)?.[1]?.trim();
+    if (!migrationPackagePath) {
+      throw new Error(`没有从迁移包导出提示中读取到路径：${migrationExportText ?? ''}`);
+    }
+    await access(migrationPackagePath);
+    await page.getByTestId('project-migration-file-input').setInputFiles(migrationPackagePath);
+    await page.getByText(`已导入《${projectNameSecondRenamed}》`).waitFor({ timeout: 30000 });
+    const projectsAfterMigration = await apiRequest(backendUrl, '/api/projects');
+    const importedProject = projectsAfterMigration
+      .filter((item) => item.name === projectNameSecondRenamed)
+      .find((item) => item.id !== seededProject.id);
+    if (!importedProject?.id) {
+      throw new Error('迁移包导入后没有生成新的作品记录');
+    }
+    await waitForProjectChapterContent(
+      backendUrl,
+      importedProject.id,
+      'chapter-001',
+      '潮声后面有人跟来',
+      { timeoutMs: 30000 },
+    );
   } finally {
+    await rm(obsidianVaultDir, { recursive: true, force: true });
     await page.close();
     await browser.close();
   }

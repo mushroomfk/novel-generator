@@ -100,6 +100,36 @@ _ARCHITECTURE_STEP_REQUIREMENTS = {
   "global_summary": "输出滚动摘要，浓缩已定设定和目前推进状态，长度控制在 120 到 220 字。",
 }
 
+_ARCHITECTURE_STEP_DEPENDENCIES = {
+  "core_seed": ("character_design", "world_building", "plot_structure"),
+  "character_design": ("core_seed", "world_building", "plot_structure"),
+  "world_building": ("core_seed", "character_design", "plot_structure"),
+  "plot_structure": ("core_seed", "character_design", "world_building", "blueprint"),
+  "character_state": ("core_seed", "character_design", "world_building", "plot_structure", "blueprint"),
+  "blueprint": ("core_seed", "character_design", "world_building", "plot_structure", "character_state"),
+  "global_summary": ("core_seed", "character_design", "world_building", "plot_structure", "character_state", "blueprint"),
+}
+
+_ARCHITECTURE_STEP_CONTEXT_LIMITS = {
+  "core_seed": 9000,
+  "character_design": 9800,
+  "world_building": 9800,
+  "plot_structure": 10_500,
+  "character_state": 9800,
+  "blueprint": 12_000,
+  "global_summary": 8200,
+}
+
+_ARCHITECTURE_STEP_MAX_TOKENS = {
+  "core_seed": 1400,
+  "character_design": 2200,
+  "world_building": 2200,
+  "plot_structure": 2400,
+  "character_state": 1800,
+  "blueprint": 6000,
+  "global_summary": 1000,
+}
+
 _ARCHITECTURE_STEP_SYSTEM_PROMPT = """
 你是中文长篇小说总编辑，负责分步骤生成整本架构。
 
@@ -126,6 +156,7 @@ _CONTINUATION_CANON_SYSTEM_PROMPT = """
 6. blocked_changes 写 2 到 5 条，明确哪些东西绝对不能改。
 7. 如果证据互相冲突，优先服从当前章节和最近正文，再指出冲突点。
 8. 所有结论都要贴着输入里的证据块，不要凭空补设定。
+9. 如果输入里包含“章节连续性合同”，必须把其中的章节合同、剧情债务、人物弧线、Obsidian 必写 / 禁写和写作判定规则转成 must_keep / blocked_changes。
 """.strip()
 
 _CONTINUATION_BRIEF_SYSTEM_PROMPT = """
@@ -138,7 +169,7 @@ _CONTINUATION_BRIEF_SYSTEM_PROMPT = """
 4. active_characters 只写眼前会影响下一小段的人物，不要扩成全书人物表。
 5. open_threads 只写还没有收住、会影响下一段的线索。
 6. next_beat 只写下一小段怎么自然推进，不要重排整章大纲。
-7. hard_constraints 写必须服从的硬事实，优先级为：手动记忆、当前章节和上一章末尾、导入资料和自动记忆。
+7. hard_constraints 写必须服从的硬事实，优先级为：章节连续性合同、手动记忆、当前章节和上一章末尾、导入资料和自动记忆。
 8. avoid_conflicts 写续写时必须避开的冲突点。
 9. 只依据输入里的项目记忆、章节、导入资料和检索证据；名著常识只能辅助表达，不能当硬证据。
 """.strip()
@@ -168,6 +199,7 @@ _CONTINUITY_CHECK_SYSTEM_PROMPT = """
 7. 只有存在 critical 硬冲突时，passed 才能为 false，并给出 rewrite_focus。
 8. 没有硬冲突时 passed 为 true，rewrite_focus 可以为空数组。
 9. 判断依据只来自输入里的项目记忆、章节、导入资料和检索证据。
+10. 如果正文缺少章节连续性合同里的明确合同项、剧情债务、人物检查或 Obsidian 必写词，给 warning；如果正文推翻合同里的保护项或禁写项，给 critical。
 """.strip()
 
 _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT = """
@@ -182,6 +214,7 @@ _CONTINUATION_CANON_JUDGE_SYSTEM_PROMPT = """
 6. rewrite_focus 给 2 到 5 条，只写真正需要返工的位置。
 7. 重点检查人名、关系、事件结果、时间地点连续性、信息揭示顺序。
 8. 如果没有严重问题，passed 设为 true，rewrite_focus 可以为空数组。
+9. 如果输入里有章节连续性合同，必须检查正文是否满足合同项；缺失明确合同项要进入 issues 和 rewrite_focus。
 """.strip()
 
 _CONTINUATION_VOICE_JUDGE_SYSTEM_PROMPT = """
@@ -220,7 +253,7 @@ _CONTINUATION_REWRITE_SYSTEM_PROMPT = """
 2. JSON 字段固定为：headline、summary、content、next_action。
 3. content 必须是可直接保存的完整正文，第一行使用 Markdown 标题。
 4. 只修复返工指出的问题，不要擅自改掉已经成立的好段落。
-5. 必须沿用输入里给出的连续性证据、人物关系和承接简报。
+5. 必须沿用输入里给出的章节连续性合同、连续性证据、人物关系和承接简报。
 """.strip()
 
 _CONTINUATION_WRITE_SYSTEM_PROMPT = """
@@ -232,6 +265,7 @@ _CONTINUATION_WRITE_SYSTEM_PROMPT = """
 3. 必须承接已经给出的证据、人物关系、承接简报和文风约束。
 4. 不要擅自改人名、关系、事件结果和时间顺序。
 5. 结尾要留下能继续推进的压力，不要用总结句收尾。
+6. 如果输入里包含“章节连续性合同”，正文必须优先满足合同里的明确义务项，并避开保护项和禁写项。
 """.strip()
 
 _CONTINUATION_CANDIDATE_VARIANTS = [
@@ -449,6 +483,13 @@ def _string_list_from_keys(payload: dict[str, object], *keys: str) -> list[str]:
 _compact_text = compact_text
 
 
+def _query_tail(text: str, limit: int = 900) -> str:
+  normalized = " ".join(str(text or "").split())
+  if len(normalized) <= limit:
+    return normalized
+  return normalized[-limit:].lstrip()
+
+
 def _request_chat_completion(endpoint: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
   return request_json(
     endpoint,
@@ -664,11 +705,100 @@ def _architecture_document_map(project_detail, workspace: ArchitectureWorkspace)
   return project_documents_map(project_detail, overrides=overrides)
 
 
-def _architecture_workspace_snapshot_text(documents: dict[str, str]) -> str:
+def _architecture_workspace_snapshot_text(documents: dict[str, str], focus_step: str = "") -> str:
   lines = []
+  dependencies = set(_ARCHITECTURE_STEP_DEPENDENCIES.get(focus_step, ()))
   for key, label in _ARCHITECTURE_STEP_LABELS.items():
-    lines.append(f"{label}：{compact_text(documents.get(key, ''), 520) or '无'}")
+    if key == focus_step:
+      limit = 260
+    elif key in dependencies:
+      limit = 420
+    else:
+      limit = 140
+    lines.append(f"{label}：{compact_text(documents.get(key, ''), limit) or '无'}")
   return "\n".join(lines)
+
+
+def _architecture_context_line_limit(line: str, focus_step: str) -> int:
+  label = line.split("：", 1)[0].strip()
+  step_labels = {
+    "core_seed": "核心种子",
+    "character_design": "人物设定",
+    "world_building": "世界设定",
+    "plot_structure": "情节骨架",
+    "character_state": "人物状态",
+    "blueprint": "章节蓝图",
+    "global_summary": "滚动摘要",
+  }
+  focus_label = step_labels.get(focus_step, "")
+  dependency_labels = {
+    step_labels[key]
+    for key in _ARCHITECTURE_STEP_DEPENDENCIES.get(focus_step, ())
+    if key in step_labels
+  }
+  if label in {"作品", "类型", "目标章节数", "目标字数"}:
+    return 180
+  if label == focus_label:
+    return 520
+  if label in dependency_labels:
+    return 420
+  if label in set(step_labels.values()):
+    return 240
+  if label == "项目记忆":
+    return 1200
+  if label in {"参考人物", "参考事件"}:
+    return 900
+  if label == "参考资料":
+    return 1300
+  if label == "Obsidian 设定笔记":
+    return 1500
+  if label in {"本章 Obsidian 设定检查清单", "本章 Obsidian 写作约束"}:
+    return 900
+  if label == "任务蒸馏":
+    return 1400
+  if label == "检索线索":
+    return 1300
+  return 360
+
+
+def _architecture_step_context_text(bundle: ProjectContextBundle, payload: ArchitectureStepRequest) -> str:
+  limit = _ARCHITECTURE_STEP_CONTEXT_LIMITS.get(payload.step, 9500)
+  if len(bundle.context_text) <= limit:
+    return bundle.context_text
+  compacted_lines = [
+    compact_text(line, _architecture_context_line_limit(line, payload.step))
+    for line in bundle.context_lines
+    if str(line or "").strip()
+  ]
+  compacted = "\n".join(item for item in compacted_lines if item).strip()
+  if len(compacted) <= limit:
+    return compacted
+  return compact_text(compacted, limit)
+
+
+def _architecture_current_content_text(content: str, step: str) -> str:
+  limits = {
+    "blueprint": 5000,
+    "plot_structure": 2600,
+    "character_design": 2400,
+    "world_building": 2200,
+    "character_state": 2200,
+    "core_seed": 1800,
+    "global_summary": 900,
+  }
+  text = str(content or "").strip()
+  if not text:
+    return "无"
+  limit = limits.get(step, 2200)
+  if len(text) <= limit:
+    return text
+  return compact_text(text, limit)
+
+
+def _architecture_step_max_tokens(settings: Settings, step: str) -> int:
+  configured_limit = int(load_config(settings).model.max_tokens or 8192)
+  step_limit = _ARCHITECTURE_STEP_MAX_TOKENS.get(step, configured_limit)
+  return max(256, min(configured_limit, step_limit))
 
 
 def _architecture_step_context(
@@ -709,13 +839,14 @@ def _architecture_step_context(
   ) or "无"
   dream_text = build_project_dream_prompt_block(project_detail)
   dream_block = f"{dream_text}\n" if dream_text else ""
-  workspace_text = _architecture_workspace_snapshot_text(documents)
+  workspace_text = _architecture_workspace_snapshot_text(documents, payload.step)
+  compact_context_text = _architecture_step_context_text(bundle, payload)
   context_text = (
     f"当前模式：{'续写扩展' if payload.mode == 'continue' else '初始架构'}\n"
     f"当前章节数：{project_detail.target_chapters}\n"
     f"目标章节数：{target_chapters}\n"
     f"当前步骤：{_ARCHITECTURE_STEP_LABELS[payload.step]}\n"
-    f"{bundle.context_text}\n"
+    f"{compact_context_text}\n"
     f"本次任务架构工作区（优先参考这里的步骤间最新内容）：\n{workspace_text}\n"
     f"{dream_block}"
     f"相关检索：\n{knowledge_text}"
@@ -730,6 +861,7 @@ def _build_architecture_step_messages(
 ) -> list[dict[str, str]]:
   project_detail, documents, target_chapters, context_text = _architecture_step_context(settings, payload, context_snapshot)
   current_content = documents.get(payload.step, "")
+  current_content_text = _architecture_current_content_text(current_content, payload.step)
   messages = [{"role": "system", "content": _ARCHITECTURE_STEP_SYSTEM_PROMPT}]
   support = build_prompt_support(settings, task_key="architecture")
   if support:
@@ -741,7 +873,7 @@ def _build_architecture_step_messages(
         f"{context_text}\n\n"
         f"这一步只处理：{_ARCHITECTURE_STEP_LABELS[payload.step]}。\n"
         f"步骤要求：{_ARCHITECTURE_STEP_REQUIREMENTS[payload.step]}\n"
-        f"当前已有草稿：\n{current_content or '无'}\n\n"
+        f"当前已有草稿：\n{current_content_text}\n\n"
         f"用户补充：{payload.guidance.strip() or '无'}\n"
         f"如果当前模式是续写扩展，请把内容写成能从 {project_detail.target_chapters} 章扩到 {target_chapters} 章的版本。"
       ).strip(),
@@ -800,6 +932,7 @@ def _generate_architecture_step(
     settings,
     _build_architecture_step_messages(settings, payload, context_snapshot),
     task_name=f"architecture_step:{payload.step}:{payload.mode}",
+    max_tokens=_architecture_step_max_tokens(settings, payload.step),
   )
   result = _parse_architecture_step_payload(content, payload, task_id)
   if payload.mode == "continue":
@@ -824,8 +957,47 @@ def _continuation_query(
     key_items,
     scene_location,
     time_constraint,
+    _query_tail(str(getattr(chapter, "content", "") or ""), 900) if chapter is not None else "",
   ]
   return " ".join(item.strip() for item in pieces if item and item.strip())
+
+
+def _continuation_context_query(
+  settings: Settings,
+  project_id: str,
+  chapter_id: str,
+  instruction: str,
+  *,
+  characters_involved: str = "",
+  key_items: str = "",
+  scene_location: str = "",
+  time_constraint: str = "",
+) -> str:
+  try:
+    project_detail = get_project_detail(
+      settings,
+      project_id,
+      allow_model_overview=False,
+      use_model_overview_cache=False,
+    )
+  except Exception:
+    return _continuation_query(
+      None,
+      instruction,
+      characters_involved=characters_involved,
+      key_items=key_items,
+      scene_location=scene_location,
+      time_constraint=time_constraint,
+    )
+  chapter = next((item for item in getattr(project_detail, "chapters", []) if item.id == chapter_id), None)
+  return _continuation_query(
+    chapter,
+    instruction,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
 
 
 def _format_evidence_blocks(evidence_hits: list[dict[str, object]], limit: int = 6) -> str:
@@ -1116,15 +1288,25 @@ def _generate_continuation_brief(
   scene_location: str = "",
   time_constraint: str = "",
 ) -> dict[str, object]:
+  context_query = _continuation_context_query(
+    settings,
+    project_id,
+    chapter_id,
+    instruction,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
   bundle = build_project_context_bundle(
     settings,
     project_id,
     include_blueprint=True,
     include_character_state=True,
     chapter_id=chapter_id,
-    knowledge_query=instruction,
+    knowledge_query=context_query,
     task_pack_kind="continuation",
-    task_instruction=instruction,
+    task_instruction=context_query,
   )
   chapter = bundle.chapter
   if chapter is None:
@@ -1307,15 +1489,25 @@ def _generate_continuation_plan(
   scene_location: str = "",
   time_constraint: str = "",
 ) -> dict[str, object]:
+  context_query = _continuation_context_query(
+    settings,
+    project_id,
+    chapter_id,
+    instruction,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
   bundle = build_project_context_bundle(
     settings,
     project_id,
     include_blueprint=True,
     include_character_state=True,
     chapter_id=chapter_id,
-    knowledge_query=instruction,
+    knowledge_query=context_query,
     task_pack_kind="continuation",
-    task_instruction=instruction,
+    task_instruction=context_query,
   )
   chapter = bundle.chapter
   if chapter is None:
@@ -1335,6 +1527,7 @@ def _generate_continuation_plan(
     evidence_query,
     limit=8,
     candidate_limit=24,
+    chapter_index=int(getattr(chapter, "index", 0) or 0),
   )
   evidence_text = _format_evidence_blocks(evidence_hits)
   canon_messages, scene_messages = _continuation_plan_messages(
@@ -2269,7 +2462,12 @@ def _build_chapter_workflow_messages(settings: Settings, payload: ChapterWorkflo
       "content": _CHAPTER_WORKFLOW_SYSTEM_PROMPT,
     },
   ]
-  support = build_prompt_support(settings, task_key="chapter")
+  support = build_prompt_support(
+    settings,
+    task_key="chapter",
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
+  )
   if support:
     messages.append({"role": "system", "content": f"额外要求：{support}"})
   messages.append(
@@ -2366,7 +2564,12 @@ def _generate_chapter_workflow(
   mode = _normalize_workflow_mode(payload.mode)
   normalized_payload = payload.model_copy(update={"mode": mode})
   if mode == "draft":
-    support = build_prompt_support(settings, task_key="chapter")
+    support = build_prompt_support(
+      settings,
+      task_key="chapter",
+      project_id=normalized_payload.project_id,
+      chapter_id=normalized_payload.chapter_id,
+    )
     pipeline = _run_continuation_pipeline(
       settings,
       project_id=normalized_payload.project_id,

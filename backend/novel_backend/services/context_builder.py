@@ -3,11 +3,20 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from novel_backend.config import Settings
+from novel_backend.services.log_service import append_app_log
+from novel_backend.services.obsidian_service import (
+  obsidian_note_available_for_chapter,
+  scoped_obsidian_note_records_for_chapter,
+  select_obsidian_notes_for_query,
+)
 from novel_backend.services.preset_service import get_active_prompt_instruction, list_xp_presets
 from novel_backend.services.project_distillation_service import build_task_distillation_prompt_block, resolve_task_pack_kind
+from novel_backend.services.project_narrative_state_service import build_project_narrative_state_prompt
 from novel_backend.services.project_service import get_project_detail, search_project_knowledge
+from novel_backend.services.project_style_xp_evolution_service import build_project_style_xp_prompt
 from novel_backend.services.style_service import build_style_reference_text
 
 
@@ -155,6 +164,13 @@ def compact_text(text: str, limit: int = 260) -> str:
   if len(normalized) <= limit:
     return normalized
   return f"{normalized[:limit].rstrip()}…"
+
+
+def _tail_text(text: str, limit: int = 700) -> str:
+  normalized = " ".join(str(text or "").split())
+  if len(normalized) <= limit:
+    return normalized
+  return normalized[-limit:].lstrip()
 
 
 def _int_attr(source: object, name: str, default: int = 0) -> int:
@@ -507,6 +523,9 @@ def build_prompt_support(
   style_task_type: str = "chapter",
   style_query: str = "",
   xp_name: str = "",
+  project_id: str = "",
+  chapter_id: str = "",
+  chapter_index: int = 0,
 ) -> str:
   blocks: list[str] = []
   preset_text = get_active_prompt_instruction(settings, task_key)
@@ -520,6 +539,39 @@ def build_prompt_support(
   xp_text = _xp_instruction(settings, xp_name)
   if xp_text:
     blocks.append(f"XP 预设：{xp_text}")
+
+  if project_id.strip():
+    try:
+      project_detail = get_project_detail(
+        settings,
+        project_id.strip(),
+        allow_model_overview=False,
+        use_model_overview_cache=False,
+      )
+      try:
+        resolved_chapter_index = int(chapter_index or 0)
+      except (TypeError, ValueError):
+        resolved_chapter_index = 0
+      if resolved_chapter_index <= 0 and chapter_id.strip():
+        chapter = next(
+          (
+            item
+            for item in getattr(project_detail, "chapters", []) or []
+            if str(getattr(item, "id", "") or "") == chapter_id.strip()
+          ),
+          None,
+        )
+        resolved_chapter_index = _int_attr(chapter, "index", 0)
+      learned_text = build_project_style_xp_prompt(
+        Path(project_detail.path),
+        task_key=task_key,
+        project_detail=project_detail,
+        chapter_index=resolved_chapter_index,
+      )
+      if learned_text:
+        blocks.append(learned_text)
+    except Exception as error:
+      append_app_log(settings, f"style/xp prompt support failed for {project_id.strip()}: {error}")
 
   return "\n\n".join(blocks).strip()
 
@@ -606,6 +658,402 @@ def _reference_material_lines(project_detail, limit: int = 4) -> list[str]:
   return lines
 
 
+def _obsidian_notes_for_scope(project_detail, chapter_index: int = 0) -> list[object]:
+  obsidian = getattr(project_detail.story_overview, "obsidian", None)
+  notes = list(getattr(obsidian, "notes", []) or [])
+  if chapter_index <= 0:
+    return notes
+  project_path = str(getattr(project_detail, "path", "") or "").strip()
+  if project_path:
+    try:
+      return [
+        record.summary
+        for record in scoped_obsidian_note_records_for_chapter(Path(project_path), chapter_index)
+      ]
+    except Exception:
+      pass
+  return [item for item in notes if obsidian_note_available_for_chapter(item, chapter_index)]
+
+
+def _obsidian_note_source_map(project_detail, chapter_index: int = 0) -> dict[str, object]:
+  notes = _obsidian_notes_for_scope(project_detail, chapter_index)
+  return {
+    str(getattr(item, "source_key", "") or "").strip(): item
+    for item in notes
+    if str(getattr(item, "source_key", "") or "").strip()
+  }
+
+
+def _filter_obsidian_knowledge_hits_for_chapter(
+  project_detail,
+  hits: list[object],
+  chapter_index: int = 0,
+) -> list[object]:
+  if chapter_index <= 0:
+    return hits
+  note_by_source_key = _obsidian_note_source_map(project_detail, chapter_index)
+  filtered: list[object] = []
+  for hit in hits:
+    source = str(getattr(hit, "source", "") or "").strip()
+    if source != "Obsidian":
+      filtered.append(hit)
+      continue
+    source_key = str(getattr(hit, "source_key", "") or "").strip()
+    note = note_by_source_key.get(source_key)
+    if note is None:
+      continue
+    if obsidian_note_available_for_chapter(note, chapter_index):
+      safe_preview = compact_text(str(getattr(note, "preview", "") or "").strip(), 180)
+      if not safe_preview:
+        safe_preview = f"Obsidian 笔记：{str(getattr(note, 'title', '') or '').strip() or source_key}"
+      if hasattr(hit, "model_copy"):
+        filtered.append(hit.model_copy(update={"preview": safe_preview}))
+      else:
+        filtered.append(hit)
+  return filtered
+
+
+def _obsidian_chapter_scope_text(item: object) -> str:
+  chapter_start = _int_attr(item, "chapter_start", 0)
+  chapter_end = _int_attr(item, "chapter_end", 0)
+  reveal_after = _int_attr(item, "reveal_after_chapter", 0)
+  parts: list[str] = []
+  if chapter_start and chapter_end:
+    if chapter_start == chapter_end:
+      parts.append(f"适用章节：第 {chapter_start} 章")
+    else:
+      parts.append(f"适用章节：第 {chapter_start}-{chapter_end} 章")
+  elif chapter_start:
+    parts.append(f"适用章节：第 {chapter_start} 章起")
+  elif chapter_end:
+    parts.append(f"适用章节：第 {chapter_end} 章前")
+  if reveal_after:
+    parts.append(f"剧透边界：第 {reveal_after} 章后可用")
+  return "；".join(parts)
+
+
+def _obsidian_lookup_key(value: str) -> str:
+  normalized = str(value or "").strip().replace("\\", "/").lower()
+  if normalized.endswith(".md"):
+    normalized = normalized[:-3]
+  return normalized
+
+
+def _obsidian_visible_note_lookup(notes: list[object]) -> dict[str, object]:
+  lookup: dict[str, object] = {}
+  for note in notes:
+    relative_path = str(getattr(note, "relative_path", "") or "").strip()
+    title = str(getattr(note, "title", "") or "").strip()
+    aliases = [str(value).strip() for value in list(getattr(note, "aliases", []) or []) if str(value).strip()]
+    labels = [
+      relative_path,
+      Path(relative_path).with_suffix("").as_posix() if relative_path else "",
+      Path(relative_path).stem if relative_path else "",
+      title,
+      *aliases,
+    ]
+    for label in labels:
+      key = _obsidian_lookup_key(label)
+      if key and key not in lookup:
+        lookup[key] = note
+  return lookup
+
+
+def _obsidian_relation_target(value: str) -> tuple[str, str]:
+  if "->" not in value:
+    return "", ""
+  label, target = value.split("->", 1)
+  return label.strip(), target.strip()
+
+
+def _obsidian_note_display_label(note: object | None, fallback: str = "") -> str:
+  if note is None:
+    return str(fallback or "").strip()
+  title = str(getattr(note, "title", "") or "").strip()
+  if title:
+    return title
+  relative_path = str(getattr(note, "relative_path", "") or "").strip()
+  return Path(relative_path).stem if relative_path else str(fallback or "").strip()
+
+
+def _obsidian_relation_label_for_context(label: str, visible_lookup: dict[str, object]) -> str:
+  cleaned = str(label or "").strip()
+  if not cleaned:
+    return ""
+  for separator in ("：", ":"):
+    if separator not in cleaned:
+      continue
+    prefix, tail = cleaned.rsplit(separator, 1)
+    tail = tail.strip()
+    target_note = visible_lookup.get(_obsidian_lookup_key(tail))
+    if target_note is None:
+      continue
+    return f"{prefix.strip()}{separator}{_obsidian_note_display_label(target_note, tail)}"
+
+  target_note = visible_lookup.get(_obsidian_lookup_key(cleaned))
+  if target_note is not None:
+    return _obsidian_note_display_label(target_note, cleaned)
+  return cleaned
+
+
+def _obsidian_relation_line_for_context(
+  relation: str,
+  visible_lookup: dict[str, object],
+  *,
+  require_visible_target: bool,
+) -> str:
+  label, target = _obsidian_relation_target(relation)
+  if not label or not target:
+    return ""
+  target_note = visible_lookup.get(_obsidian_lookup_key(target))
+  if target_note is None:
+    return "" if require_visible_target else relation
+  display_label = _obsidian_relation_label_for_context(label, visible_lookup)
+  display_target = _obsidian_note_display_label(target_note, target)
+  if not display_label or not display_target:
+    return ""
+  return f"{display_label} -> {display_target}"
+
+
+def _obsidian_embedded_preview_lines(item: object, visible_lookup: dict[str, object], limit: int = 2) -> list[str]:
+  lines: list[str] = []
+  seen: set[str] = set()
+  for raw_link in list(getattr(item, "embedded_links", []) or []):
+    target_note = visible_lookup.get(_obsidian_lookup_key(str(raw_link or "")))
+    if target_note is None:
+      continue
+    path = str(getattr(target_note, "relative_path", "") or "").strip()
+    key = path or _obsidian_lookup_key(str(raw_link or ""))
+    if not key or key in seen:
+      continue
+    seen.add(key)
+    label = _obsidian_note_display_label(target_note, str(raw_link or ""))
+    preview = str(getattr(target_note, "preview", "") or "").strip() or str(getattr(target_note, "summary", "") or "").strip()
+    if preview:
+      lines.append(f"{label}：{compact_text(preview, 80)}")
+    elif label:
+      lines.append(label)
+    if len(lines) >= limit:
+      break
+  return lines
+
+
+def _obsidian_external_reference_lines(item: object, limit: int = 2) -> list[str]:
+  lines: list[str] = []
+  seen: set[str] = set()
+  references = list(getattr(item, "external_references", []) or [])
+  if not references:
+    references = list(getattr(item, "external_links", []) or [])
+  for raw_reference in references:
+    reference = str(raw_reference or "").strip()
+    if not reference or reference in seen:
+      continue
+    seen.add(reference)
+    lines.append(compact_text(reference, 120))
+    if len(lines) >= limit:
+      break
+  return lines
+
+
+def _chapter_safe_obsidian_relation_lines(
+  item: object,
+  visible_lookup: dict[str, object],
+  chapter_index: int,
+  limit: int,
+) -> list[str]:
+  relations = [
+    str(value).strip()
+    for value in list(getattr(item, "graph_relations", []) or [])
+    if str(value).strip()
+  ]
+  if chapter_index <= 0:
+    lines = [
+      _obsidian_relation_line_for_context(relation, visible_lookup, require_visible_target=False)
+      for relation in relations
+    ]
+    return [line for line in lines if line][:limit]
+
+  safe_relations: list[str] = []
+  for relation in relations:
+    line = _obsidian_relation_line_for_context(relation, visible_lookup, require_visible_target=True)
+    if not line:
+      continue
+    safe_relations.append(line)
+    if len(safe_relations) >= limit:
+      break
+  return safe_relations
+
+
+def _select_obsidian_notes_for_context(notes: list[object], query: str, limit: int, chapter_index: int = 0) -> list[object]:
+  return select_obsidian_notes_for_query(notes, query, limit=limit, chapter_index=chapter_index)
+
+
+def _obsidian_notes_for_context(
+  project_detail,
+  query: str = "",
+  limit: int = 8,
+  chapter_index: int = 0,
+) -> list[object]:
+  notes = _obsidian_notes_for_scope(project_detail, chapter_index)
+  return _select_obsidian_notes_for_context(notes, query, limit, chapter_index=chapter_index)
+
+
+def _reference_obsidian_lines(project_detail, query: str = "", limit: int = 8, chapter_index: int = 0) -> list[str]:
+  notes = _obsidian_notes_for_scope(project_detail, chapter_index)
+  selected_notes = _obsidian_notes_for_context(project_detail, query, limit, chapter_index=chapter_index)
+  available_notes = [item for item in notes if obsidian_note_available_for_chapter(item, chapter_index)]
+  visible_lookup = _obsidian_visible_note_lookup(available_notes)
+  note_by_path = {
+    str(getattr(item, "relative_path", "") or "").strip(): item
+    for item in available_notes
+    if str(getattr(item, "relative_path", "") or "").strip()
+  }
+
+  def note_label(path: str) -> str:
+    note = note_by_path.get(path)
+    if note is None:
+      return ""
+    return str(getattr(note, "title", "") or "").strip() or Path(path).stem or path
+
+  lines: list[str] = []
+  for item in selected_notes:
+    title = str(getattr(item, "title", "") or "").strip()
+    if not title:
+      continue
+    preview = str(getattr(item, "preview", "") or "").strip()
+    note_type = str(getattr(item, "note_type", "") or "").strip()
+    status = str(getattr(item, "status", "") or "").strip()
+    chapter_scope = _obsidian_chapter_scope_text(item)
+    links = list(getattr(item, "links", []) or [])[:3]
+    resolved = [
+      label
+      for label in (note_label(str(path)) for path in list(getattr(item, "resolved_links", []) or []))
+      if label
+    ][:3]
+    relations = _chapter_safe_obsidian_relation_lines(item, visible_lookup, chapter_index, 3)
+    embedded_previews = _obsidian_embedded_preview_lines(item, visible_lookup, 2)
+    external_references = _obsidian_external_reference_lines(item, 2)
+    backlinks = [
+      label
+      for label in (note_label(str(path)) for path in list(getattr(item, "backlinks", []) or []))
+      if label
+    ][:3]
+    unresolved = list(getattr(item, "unresolved_links", []) or [])[:2]
+    ambiguous = list(getattr(item, "ambiguous_links", []) or [])[:2]
+    meta = " / ".join(part for part in [note_type, status, chapter_scope] if part)
+    related_parts = []
+    if resolved:
+      related_parts.append(f"关联笔记：{' / '.join(resolved)}")
+    elif links and chapter_index <= 0:
+      related_parts.append(f"双链：{' / '.join(links)}")
+    if relations:
+      related_parts.append(f"关系：{' / '.join(relations)}")
+    if embedded_previews:
+      related_parts.append(f"嵌入预览：{' / '.join(embedded_previews)}")
+    if external_references:
+      related_parts.append(f"考据来源：{' / '.join(external_references)}")
+    if backlinks:
+      related_parts.append(f"被引用：{' / '.join(backlinks)}")
+    if unresolved:
+      related_parts.append(f"未解析：{' / '.join(unresolved)}")
+    if ambiguous:
+      related_parts.append(f"歧义：{' / '.join(ambiguous)}")
+    related = f"；{'；'.join(related_parts)}" if related_parts else ""
+    suffix = compact_text(preview, 100) if preview else "已同步笔记"
+    lines.append(f"- {title}" + (f"（{meta}）" if meta else "") + f"：{suffix}{related}")
+  return lines
+
+
+def _obsidian_constraint_lines(project_detail, query: str = "", limit: int = 8, chapter_index: int = 0) -> list[str]:
+  lines: list[str] = []
+  for item in _obsidian_notes_for_context(project_detail, query, limit, chapter_index=chapter_index):
+    title = str(getattr(item, "title", "") or "").strip()
+    if not title:
+      continue
+    path = str(getattr(item, "relative_path", "") or "").strip()
+    label = f"{title}（{path}）" if path else title
+    required = [str(value).strip() for value in list(getattr(item, "required_phrases", []) or []) if str(value).strip()]
+    forbidden = [str(value).strip() for value in list(getattr(item, "forbidden_phrases", []) or []) if str(value).strip()]
+    if required:
+      lines.append(f"- 必须包含｜{label}：{' / '.join(required[:8])}")
+    if forbidden:
+      lines.append(f"- 禁止出现｜{label}：{' / '.join(forbidden[:8])}")
+    if len(lines) >= limit * 2:
+      break
+  return lines
+
+
+def _obsidian_chapter_checklist_lines(project_detail, query: str = "", limit: int = 6, chapter_index: int = 0) -> list[str]:
+  notes = _obsidian_notes_for_scope(project_detail, chapter_index)
+  selected_notes = _obsidian_notes_for_context(project_detail, query, limit, chapter_index=chapter_index)
+  available_notes = [item for item in notes if obsidian_note_available_for_chapter(item, chapter_index)]
+  visible_lookup = _obsidian_visible_note_lookup(available_notes)
+  note_by_path = {
+    str(getattr(item, "relative_path", "") or "").strip(): item
+    for item in available_notes
+    if str(getattr(item, "relative_path", "") or "").strip()
+  }
+
+  def note_label(path: str) -> str:
+    note = note_by_path.get(path)
+    if note is None:
+      return ""
+    return str(getattr(note, "title", "") or "").strip() or Path(path).stem or path
+
+  lines: list[str] = []
+  for item in selected_notes[:limit]:
+    title = str(getattr(item, "title", "") or "").strip()
+    path = str(getattr(item, "relative_path", "") or "").strip()
+    if not title and not path:
+      continue
+    label = f"{title or Path(path).stem}（{path}）" if path else title
+    required = [str(value).strip() for value in list(getattr(item, "required_phrases", []) or []) if str(value).strip()]
+    forbidden = [str(value).strip() for value in list(getattr(item, "forbidden_phrases", []) or []) if str(value).strip()]
+    chapter_scope = _obsidian_chapter_scope_text(item)
+    resolved = [
+      label
+      for label in (note_label(str(path_value)) for path_value in list(getattr(item, "resolved_links", []) or []))
+      if label
+    ][:3]
+    relations = _chapter_safe_obsidian_relation_lines(item, visible_lookup, chapter_index, 4)
+    embedded_previews = _obsidian_embedded_preview_lines(item, visible_lookup, 2)
+    external_references = _obsidian_external_reference_lines(item, 2)
+    backlinks = [
+      label
+      for label in (note_label(str(path_value)) for path_value in list(getattr(item, "backlinks", []) or []))
+      if label
+    ][:3]
+    ambiguous = [str(value).strip() for value in list(getattr(item, "ambiguous_links", []) or []) if str(value).strip()]
+    unresolved = [str(value).strip() for value in list(getattr(item, "unresolved_links", []) or []) if str(value).strip()]
+
+    parts = [f"来源｜{label}"]
+    if chapter_scope:
+      parts.append(chapter_scope)
+    if required:
+      parts.append(f"必须出现：{' / '.join(required[:6])}")
+    if forbidden:
+      parts.append(f"禁止出现：{' / '.join(forbidden[:6])}")
+    if resolved:
+      parts.append(f"关联笔记：{' / '.join(resolved)}")
+    if relations:
+      parts.append(f"关系：{' / '.join(relations)}")
+    if embedded_previews:
+      parts.append(f"嵌入预览：{' / '.join(embedded_previews)}")
+    if external_references:
+      parts.append(f"考据来源：{' / '.join(external_references)}")
+    if backlinks:
+      parts.append(f"反向关联：{' / '.join(backlinks)}")
+    graph_warnings: list[str] = []
+    if ambiguous:
+      graph_warnings.append(f"歧义双链 {' / '.join(ambiguous[:4])}")
+    if unresolved:
+      graph_warnings.append(f"未解析双链 {' / '.join(unresolved[:4])}")
+    if graph_warnings:
+      parts.append(f"图谱注意：{'；'.join(graph_warnings)}")
+    lines.append("- " + "；".join(parts))
+  return lines
+
+
 def build_project_context_bundle(
   settings: Settings,
   project_id: str,
@@ -625,9 +1073,24 @@ def build_project_context_bundle(
     instruction=task_instruction,
     rewrite_mode=rewrite_mode,
   )
-  project_detail = get_project_detail(settings, project_id, allow_model_overview=False)
+  project_detail = get_project_detail(
+    settings,
+    project_id,
+    allow_model_overview=False,
+    use_model_overview_cache=False,
+  )
   documents = project_documents_map(project_detail, overrides=override_documents)
   chapter = next((item for item in project_detail.chapters if item.id == chapter_id), None) if chapter_id else None
+  target_chapter_index = _int_attr(chapter, "index", 0) if chapter is not None else 0
+  previous_chapter = None
+  if chapter is not None:
+    previous_chapter = next(
+      (
+        item for item in project_detail.chapters
+        if item.index == chapter.index - 1 and item.exists and item.content.strip()
+      ),
+      None,
+    )
   lightweight_knowledge = resolved_task_pack_kind == "architecture"
   knowledge_hits = (
     search_project_knowledge(
@@ -637,10 +1100,12 @@ def build_project_context_bundle(
       knowledge_limit,
       ensure_current=not lightweight_knowledge,
       include_semantic=not lightweight_knowledge,
+      chapter_index=target_chapter_index,
     )
     if knowledge_query.strip()
     else []
   )
+  knowledge_hits = _filter_obsidian_knowledge_hits_for_chapter(project_detail, knowledge_hits, target_chapter_index)
   knowledge_text = "\n".join(
     f"- {item.section}：{item.preview}"
     for item in knowledge_hits
@@ -669,23 +1134,54 @@ def build_project_context_bundle(
 
   context_lines.append(f"滚动摘要：{compact_text(documents.get('global_summary', ''), 320) or '无'}")
   context_lines.append(f"项目记忆：\n{memory_text}")
+  if chapter is not None:
+    try:
+      narrative_state_text = build_project_narrative_state_prompt(Path(project_detail.path), project_detail, chapter.id)
+      if narrative_state_text:
+        context_lines.append(narrative_state_text)
+    except Exception as error:
+      append_app_log(settings, f"narrative state context failed for {project_id}/{chapter.id}: {error}")
   reference_character_text = "\n".join(_reference_character_lines(project_detail)) or "无"
   reference_event_text = "\n".join(_reference_event_lines(project_detail)) or "无"
   reference_material_text = "\n".join(_reference_material_lines(project_detail)) or "无"
+  obsidian_context_query = " ".join(
+    part
+    for part in [
+      knowledge_query,
+      task_instruction,
+      str(getattr(chapter, "title", "") or "") if chapter is not None else "",
+      _tail_text(str(getattr(chapter, "content", "") or ""), 700) if chapter is not None else "",
+      _tail_text(str(getattr(previous_chapter, "content", "") or ""), 700) if previous_chapter is not None else "",
+    ]
+    if part
+  )
+  reference_obsidian_text = "\n".join(_reference_obsidian_lines(
+    project_detail,
+    query=obsidian_context_query,
+    chapter_index=target_chapter_index,
+  )) or "无"
+  obsidian_checklist_text = "\n".join(_obsidian_chapter_checklist_lines(
+    project_detail,
+    query=obsidian_context_query,
+    chapter_index=target_chapter_index,
+  )) or ""
+  obsidian_constraint_text = "\n".join(_obsidian_constraint_lines(
+    project_detail,
+    query=obsidian_context_query,
+    chapter_index=target_chapter_index,
+  )) or ""
   context_lines.append(f"参考人物：\n{reference_character_text}")
   context_lines.append(f"参考事件：\n{reference_event_text}")
   context_lines.append(f"参考资料：\n{reference_material_text}")
+  context_lines.append(f"Obsidian 设定笔记：\n{reference_obsidian_text}")
+  if obsidian_checklist_text:
+    context_lines.append(f"本章 Obsidian 设定检查清单：\n{obsidian_checklist_text}")
+  if obsidian_constraint_text:
+    context_lines.append(f"本章 Obsidian 写作约束：\n{obsidian_constraint_text}")
   if getattr(project_detail.story_overview, "materials", []):
     context_lines.append("原作承接提醒：如果上传资料里已经给出人物、关系、事件或结尾状态，后续架构和正文都必须沿着这些事实往后接，不能另起一套。")
 
   if chapter is not None:
-    previous_chapter = next(
-      (
-        item for item in project_detail.chapters
-        if item.index == chapter.index - 1 and item.exists and item.content.strip()
-      ),
-      None,
-    )
     chapter_content = _fit_text_to_budget(
       label="当前章节正文",
       text=chapter.content.strip() or "无",
@@ -701,7 +1197,12 @@ def build_project_context_bundle(
       ]
     )
 
-  distillation_text = build_task_distillation_prompt_block(project_detail, kind=resolved_task_pack_kind)
+  distillation_text = build_task_distillation_prompt_block(
+    project_detail,
+    kind=resolved_task_pack_kind,
+    query=obsidian_context_query,
+    chapter_index=target_chapter_index,
+  )
   if distillation_text:
     context_lines.append(f"任务蒸馏：\n{distillation_text}")
 

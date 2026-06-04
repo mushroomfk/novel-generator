@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,37 @@ class SkillServiceTestCase(unittest.TestCase):
     chapter_scenes = next(item for section in catalog.sections for item in section.items if item.id == "chapter-scenes")
     self.assertEqual(chapter_scenes.behavior.panel, "chapter-workflow")
     self.assertEqual(chapter_scenes.behavior.mode, "scenes")
+    self.assertEqual(chapter_scenes.behavior.agent_action_kind, "chapter_workflow")
+    self.assertEqual(chapter_scenes.behavior.agent_action_mode, "scenes")
+    self.assertFalse(chapter_scenes.behavior.agent_requires_confirmation)
+
+    chapter_draft = next(item for section in catalog.sections for item in section.items if item.id == "chapter-draft")
+    self.assertEqual(chapter_draft.behavior.agent_action_kind, "chapter_workflow")
+    self.assertEqual(chapter_draft.behavior.agent_action_mode, "draft")
+    self.assertTrue(chapter_draft.behavior.agent_requires_confirmation)
+
+    chapter_humanize = next(item for section in catalog.sections for item in section.items if item.id == "chapter-humanize")
+    self.assertEqual(chapter_humanize.behavior.agent_action_kind, "rewrite_chapter")
+    self.assertEqual(chapter_humanize.behavior.agent_action_mode, "humanize")
+    self.assertTrue(chapter_humanize.behavior.agent_requires_confirmation)
+
+  def test_list_skill_catalog_merges_legacy_behavior_metadata(self) -> None:
+    skill_path = self.settings.data_dir / "skills" / "chapter-workflow" / "chapter-draft.json"
+    payload = json.loads(skill_path.read_text(encoding="utf-8"))
+    payload["behavior"] = {
+      "panel": "chapter-workflow",
+      "mode": "draft",
+      "input_label": "续写要求",
+      "submit_label": "开始续写",
+    }
+    skill_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    catalog = list_skill_catalog(self.settings)
+    chapter_draft = next(item for section in catalog.sections for item in section.items if item.id == "chapter-draft")
+
+    self.assertEqual(chapter_draft.behavior.agent_action_kind, "chapter_workflow")
+    self.assertEqual(chapter_draft.behavior.agent_action_mode, "draft")
+    self.assertTrue(chapter_draft.behavior.agent_requires_confirmation)
 
   def test_list_skill_catalog_reads_custom_markdown_skill(self) -> None:
     skill_path = self.settings.data_dir / "skills" / "user-skills" / "user-harbor-rewrite" / "SKILL.md"

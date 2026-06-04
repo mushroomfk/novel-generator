@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$Python = Join-Path $RootDir ".venv\Scripts\python.exe"
 $PyInstaller = Join-Path $RootDir ".venv\Scripts\pyinstaller.exe"
 
 if (-not (Test-Path $PyInstaller)) {
@@ -22,15 +23,25 @@ $EntryPoint = Join-Path $RootDir "backend\novel_backend\main.py"
 try {
   New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir, $SpecDir | Out-Null
 
-  & $PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --name novel-backend `
-    $EntryPoint `
-    --distpath $DistDir `
-    --workpath $WorkDir `
-    --specpath $SpecDir
+  $PyInstallerArgs = @(
+    "--noconfirm",
+    "--clean",
+    "--onefile",
+    "--name", "novel-backend",
+    "--distpath", $DistDir,
+    "--workpath", $WorkDir,
+    "--specpath", $SpecDir
+  )
+
+  if (Test-Path $Python) {
+    & $Python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('liteparse') else 1)" *> $null
+    if ($LASTEXITCODE -eq 0) {
+      $PyInstallerArgs += @("--collect-binaries", "liteparse", "--collect-datas", "liteparse")
+    }
+  }
+
+  $PyInstallerArgs += $EntryPoint
+  & $PyInstaller @PyInstallerArgs
 
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -1,41 +1,89 @@
 export const filterOptions = ['全部', '灵感', '人物', '章节', '续写', '风格', '工具'];
 
 const defaultSkillBehaviorById = {
+  brainstorm: {
+    panel: 'brainstorm',
+    agent_action_kind: 'brainstorm',
+    agent_requires_confirmation: false,
+  },
+  blueprint: {
+    panel: 'blueprint',
+    agent_action_kind: 'generate_architecture',
+    agent_requires_confirmation: true,
+  },
+  'continue-project': {
+    panel: 'continue-project',
+    agent_action_kind: 'continue_project',
+    agent_requires_confirmation: true,
+  },
+  consistency: {
+    panel: 'consistency',
+    agent_action_kind: 'consistency_check',
+    agent_requires_confirmation: false,
+  },
+  'knowledge-search': {
+    panel: 'knowledge-search',
+    agent_action_kind: 'review_knowledge',
+    agent_requires_confirmation: false,
+  },
   'chapter-scenes': {
     panel: 'chapter-workflow',
     mode: 'scenes',
     input_label: '拆场要求',
     submit_label: '开始拆场',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'scenes',
+    agent_requires_confirmation: false,
   },
   'chapter-diagnose': {
     panel: 'chapter-workflow',
     mode: 'diagnose',
     input_label: '诊断要求',
     submit_label: '开始诊断',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'diagnose',
+    agent_requires_confirmation: false,
+  },
+  'chapter-generate': {
+    panel: 'chapter-generate',
+    agent_action_kind: 'chapter_generate',
+    agent_requires_confirmation: true,
   },
   'chapter-draft': {
     panel: 'chapter-workflow',
     mode: 'draft',
     input_label: '续写要求',
     submit_label: '开始续写',
+    agent_action_kind: 'chapter_workflow',
+    agent_action_mode: 'draft',
+    agent_requires_confirmation: true,
   },
   'chapter-finalize': {
     panel: 'chapter-rewrite',
     mode: 'finalize',
     input_label: '改稿要求',
     submit_label: '开始定稿',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'finalize',
+    agent_requires_confirmation: true,
   },
   'chapter-polish': {
     panel: 'chapter-rewrite',
     mode: 'polish',
     input_label: '改稿要求',
     submit_label: '开始润色',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'polish',
+    agent_requires_confirmation: true,
   },
   'chapter-humanize': {
     panel: 'chapter-rewrite',
     mode: 'humanize',
     input_label: '改稿要求',
     submit_label: '开始去 AI',
+    agent_action_kind: 'rewrite_chapter',
+    agent_action_mode: 'humanize',
+    agent_requires_confirmation: true,
   },
 };
 
@@ -223,6 +271,15 @@ export const skillSections = [
         description: '直接在技能区里导入资料、检索设定和正文片段。',
         category: '工具',
         scenes: ['资料', '检索', '设定'],
+        accent: 'olive',
+      },
+      {
+        id: 'obsidian-vault',
+        badge: 'Ob',
+        name: 'Obsidian 知识库',
+        description: '把已有 Vault 作为可选设定来源，同步双链、标签和正式笔记。',
+        category: '工具',
+        scenes: ['资料', '知识图谱', '设定'],
         accent: 'olive',
       },
       {

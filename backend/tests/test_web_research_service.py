@@ -92,13 +92,14 @@ class WebResearchServiceTestCase(unittest.TestCase):
     with (
       patch.dict("os.environ", {"DASHSCOPE_API_KEY": "", "NOVEL_MODEL_API_KEY": ""}, clear=False),
       patch("novel_backend.services.web_research_service._request_json", side_effect=fake_request),
-      patch("novel_backend.services.web_research_service.search_project_knowledge", return_value=local_hits),
+      patch("novel_backend.services.web_research_service.search_project_knowledge", return_value=local_hits) as mocked_search,
     ):
-      result = research_historical_reference(self.settings, "demo", "鸿门宴", limit=6)
+      result = research_historical_reference(self.settings, "demo", "鸿门宴", limit=6, chapter_index=58)
 
     self.assertEqual(result.provider, "aliyun-bailian")
     self.assertIn("宴席暗杀", result.answer)
     self.assertEqual(result.local_hits, local_hits)
+    mocked_search.assert_called_once_with(self.settings, "demo", "鸿门宴", limit=4, chapter_index=58)
     self.assertEqual(result.sources[0].title, "鸿门宴资料")
     self.assertEqual(result.sources[0].provider, "aliyun-bailian")
     self.assertEqual(
@@ -108,6 +109,7 @@ class WebResearchServiceTestCase(unittest.TestCase):
     self.assertEqual(captured_requests[0]["headers"]["Authorization"], "Bearer dashscope-key")
     payload = captured_requests[0]["payload"]
     self.assertEqual(payload["model"], "qwen3.6-plus")
+    self.assertIn("目标章节：第 58 章", payload["input"])
     self.assertIn({"type": "web_search"}, payload["tools"])
     self.assertIn({"type": "web_extractor"}, payload["tools"])
 

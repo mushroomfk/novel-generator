@@ -37,6 +37,20 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(classify_model_error("模型请求失败: 404 model not found").kind, "model_not_found")
     self.assertEqual(classify_model_error("invalid model name").kind, "model_not_found")
 
+  def test_classifies_aliyun_arrearage_as_billing_error(self) -> None:
+    error = (
+      "模型请求失败: 400 {'error': {'message': 'Access denied, please make sure your account is in good standing. "
+      "For details, see: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment', "
+      "'type': 'Arrearage', 'code': 'Arrearage'}}"
+    )
+
+    classified = classify_model_error(error)
+
+    self.assertEqual(classified.kind, "billing")
+    self.assertEqual(classified.title, "模型额度不可用")
+    self.assertFalse(classified.retryable)
+    self.assertEqual(classify_model_error("模型请求失败: 403 Arrearage").kind, "billing")
+
   def test_classifies_ssl_eof_as_network_connection(self) -> None:
     error = "模型请求失败: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
 

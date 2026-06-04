@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import AgentActionTimeline from './AgentActionTimeline.vue';
 import AgentArtifactSummary from './AgentArtifactSummary.vue';
+import AgentEventBlockSummary from './AgentEventBlockSummary.vue';
 import AgentPlanCard from './AgentPlanCard.vue';
 import ProjectWorkspaceSidebar from './ProjectWorkspaceSidebar.vue';
 import {
@@ -48,16 +49,19 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['project-detail-updated', 'discussion-thread-state-updated', 'open-model-settings', 'focus-chapter']);
+const emit = defineEmits(['project-detail-updated', 'discussion-thread-state-updated', 'open-model-settings', 'focus-chapter', 'open-skill']);
 
 const DISCUSSION_THREAD_STORE_KEY = 'novel-agent-threads-v2';
 const MAX_DISCUSSION_THREADS = 20;
 const AGENT_REQUEST_MESSAGE_LIMIT = 50;
 const AGENT_REQUEST_MESSAGE_CONTENT_LIMIT = 6000;
+const AGENT_REQUEST_CURRENT_USER_CONTENT_LIMIT = 1000000;
 const AGENT_REQUEST_OMITTED_MARKER = '\n\n[中间较长历史已省略]\n\n';
 const AGENT_THREAD_SUMMARY_LIMIT = 500;
 
 const composerText = ref('');
+const composerActiveSkillId = ref('');
+const composerActiveSkillPrompt = ref('');
 const composerFileInput = ref(null);
 const composerReferences = ref([]);
 const composerReferenceSyncing = ref(false);
@@ -124,16 +128,19 @@ const quickActionSeed = computed(() => ([
   {
     id: 'discuss',
     label: '看现状',
+    skillId: 'brainstorm',
     prompt: '先看当前项目状态，告诉我这本书现在最该推进什么。',
   },
   {
     id: 'architecture',
     label: '完善架构',
+    skillId: 'blueprint',
     prompt: '先看当前状态，帮我完善整书架构。',
   },
   {
     id: 'diagnose',
     label: props.selectedChapter ? '判断本章' : '判断章节',
+    skillId: 'chapter-diagnose',
     prompt: props.selectedChapter
       ? `先看当前状态，判断第 ${props.selectedChapter.index} 章《${props.selectedChapter.title}》现在最该处理什么。`
       : '先看当前状态，判断当前章节现在最该处理什么。',
@@ -141,6 +148,7 @@ const quickActionSeed = computed(() => ([
   {
     id: 'draft',
     label: props.selectedChapter ? '续写本章' : '续写正文',
+    skillId: 'chapter-draft',
     prompt: props.selectedChapter
       ? `先看当前状态，续写第 ${props.selectedChapter.index} 章《${props.selectedChapter.title}》。`
       : '先看当前状态，直接续写当前章节。',
@@ -176,6 +184,22 @@ const discussionSummary = computed(() => {
 });
 
 const hasPendingPlanActions = computed(() => Boolean(pendingPlan.value?.actions?.length));
+
+function openObsidianMaintenanceFromArtifact(artifact) {
+  const metadata = artifact?.metadata && typeof artifact.metadata === 'object' ? artifact.metadata : {};
+  const chapterIndex = Number(metadata.chapter_index ?? 0);
+  const suggestionIds = Array.isArray(metadata.suggestion_ids)
+    ? metadata.suggestion_ids.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : [];
+  emit('open-skill', {
+    skillId: 'self-evolution',
+    source: 'obsidian-maintenance-artifact',
+    obsidianMaintenanceSourceChapter: chapterIndex > 0 ? chapterIndex : 0,
+    obsidianMaintenanceSuggestionIds: suggestionIds,
+    obsidianMaintenanceQuery: '',
+    obsidianMaintenanceStatusFilter: '全部',
+  });
+}
 
 const discussionHasArchitectureExecution = computed(() => (
   discussionHistory.value.some((message) => (
@@ -425,17 +449,26 @@ function buildArchitectureExecutionPlan(guidance) {
   const materials = Array.isArray(props.project?.story_overview?.materials)
     ? props.project.story_overview.materials
     : [];
+  const obsidianCount = props.project?.story_overview?.obsidian?.included_count ?? 0;
+  const knowledgeSourceCount = materials.length + obsidianCount;
   const actions = [];
   const steps = [];
 
-  if (materials.length > 0) {
+  if (knowledgeSourceCount > 0) {
     actions.push({
       kind: 'review_knowledge',
-      label: '分析资料库',
+      label: obsidianCount > 0 ? '分析资料库和 Obsidian' : '分析资料库',
       task_pack_kind: 'architecture',
       instruction,
     });
-    steps.push(`先整理资料库里的 ${materials.length} 份资料`);
+    const sourceLabels = [];
+    if (materials.length > 0) {
+      sourceLabels.push(`资料库 ${materials.length} 份`);
+    }
+    if (obsidianCount > 0) {
+      sourceLabels.push(`Obsidian ${obsidianCount} 份`);
+    }
+    steps.push(`先整理${sourceLabels.join('、')}`);
   }
 
   actions.push({
@@ -449,7 +482,7 @@ function buildArchitectureExecutionPlan(guidance) {
   return {
     id: `plan-architecture-${Date.now()}`,
     title: '执行整书架构',
-    summary: materials.length > 0 ? '先分析资料库，再生成整书架构。' : '按当前讨论结论生成整书架构。',
+    summary: knowledgeSourceCount > 0 ? '先分析资料库和 Obsidian，再生成整书架构。' : '按当前讨论结论生成整书架构。',
     requires_confirmation: true,
     steps,
     actions,
@@ -1493,17 +1526,11 @@ function messageTimelineItems(message) {
     return message.executionTrace;
   }
 
-  if (Array.isArray(message.eventBlocks) && message.eventBlocks.length > 0) {
-    return message.eventBlocks.map((item) => ({
-      step: item.step,
-      actionKind: item.actionKind,
-      title: item.title,
-      status: item.status,
-      summary: item.summary,
-    }));
-  }
-
   return [];
+}
+
+function messageEventBlocks(message) {
+  return Array.isArray(message.eventBlocks) ? message.eventBlocks : [];
 }
 
 function isPendingPlanMessage(message) {
@@ -1527,6 +1554,7 @@ function planStatusLabel(message) {
 }
 
 function setComposerFromSuggestion(value) {
+  clearComposerActiveSkill();
   composerText.value = String(value ?? '').trim();
 }
 
@@ -1541,6 +1569,7 @@ async function handleSuggestionClick(value) {
     return;
   }
 
+  clearComposerActiveSkill();
   composerText.value = text;
   if (!isSkillOptimizationSuggestion(text)) {
     return;
@@ -1555,15 +1584,43 @@ async function handleSuggestionClick(value) {
   await sendConversation({ userContent: text });
 }
 
+function clearComposerActiveSkill() {
+  composerActiveSkillId.value = '';
+  composerActiveSkillPrompt.value = '';
+}
+
+function applyQuickAction(item) {
+  composerText.value = String(item?.prompt ?? '').trim();
+  composerActiveSkillId.value = String(item?.skillId ?? '').trim();
+  composerActiveSkillPrompt.value = composerText.value;
+}
+
+function activeSkillIdsForComposer(userContent) {
+  const skillId = composerActiveSkillId.value.trim();
+  const prompt = composerActiveSkillPrompt.value.trim();
+  const text = String(userContent ?? '').trim();
+  if (!skillId || !prompt || !text.startsWith(prompt)) {
+    return [];
+  }
+  return [skillId];
+}
+
 function buildMessagePayload(messages) {
   const headLength = 1800;
-  const tailLength = AGENT_REQUEST_MESSAGE_CONTENT_LIMIT - headLength - AGENT_REQUEST_OMITTED_MARKER.length;
+  const latestUserIndex = messages.reduce((latestIndex, item, index) => (
+    item?.role === 'user' && String(item.content ?? '').trim() ? index : latestIndex
+  ), -1);
 
   return messages
     .slice(-AGENT_REQUEST_MESSAGE_LIMIT)
-    .map((item) => {
+    .map((item, slicedIndex, slicedMessages) => {
+      const originalIndex = messages.length - slicedMessages.length + slicedIndex;
       const normalizedContent = String(item.content ?? '').trim();
-      const content = normalizedContent.length > AGENT_REQUEST_MESSAGE_CONTENT_LIMIT
+      const contentLimit = originalIndex === latestUserIndex
+        ? AGENT_REQUEST_CURRENT_USER_CONTENT_LIMIT
+        : AGENT_REQUEST_MESSAGE_CONTENT_LIMIT;
+      const tailLength = contentLimit - headLength - AGENT_REQUEST_OMITTED_MARKER.length;
+      const content = normalizedContent.length > contentLimit
         ? `${normalizedContent.slice(0, headLength).trimEnd()}${AGENT_REQUEST_OMITTED_MARKER}${normalizedContent.slice(-tailLength).trimStart()}`
         : normalizedContent;
 
@@ -1646,6 +1703,10 @@ async function sendConversation(options = {}) {
   const defaultUserContent = approvedPlan ? '确认执行。' : '';
   const userContent = String(options.userContent ?? composerText.value ?? defaultUserContent).trim()
     || defaultUserContent;
+  const optionSkillIds = Array.isArray(options.activeSkillIds) ? options.activeSkillIds : null;
+  const activeSkillIds = optionSkillIds
+    ? optionSkillIds.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : activeSkillIdsForComposer(userContent);
   const baseMessages = Array.isArray(options.messages)
     ? options.messages.map((item) => createMessage(item))
     : discussionHistory.value.map((item) => createMessage(item));
@@ -1710,6 +1771,7 @@ async function sendConversation(options = {}) {
       runningThreadId.value = '';
       if (appendUserMessage && userContent) {
         composerText.value = '';
+        clearComposerActiveSkill();
         clearComposerReferences();
       }
       return;
@@ -1717,6 +1779,7 @@ async function sendConversation(options = {}) {
   }
   if (appendUserMessage && userContent) {
     composerText.value = '';
+    clearComposerActiveSkill();
     clearComposerReferences();
   }
 
@@ -1734,6 +1797,7 @@ async function sendConversation(options = {}) {
         key_items: executionOptions.keyItems.trim(),
         scene_location: executionOptions.sceneLocation.trim(),
         time_constraint: executionOptions.timeConstraint.trim(),
+        active_skill_ids: activeSkillIds,
         approved_plan: approvedPlan,
       },
     );
@@ -1866,6 +1930,7 @@ function handleCancelPlan() {
 
 function selectDiscussionThread(threadId) {
   composerText.value = '';
+  clearComposerActiveSkill();
   clearComposerReferences();
   applyDiscussionThread(threadId);
 }
@@ -1874,6 +1939,7 @@ watch(
   () => props.project?.id,
   (projectId) => {
     composerText.value = '';
+    clearComposerActiveSkill();
     clearComposerReferences();
     runtimeError.value = '';
     architectureSessionActive.value = false;
@@ -1926,6 +1992,7 @@ watch(
   () => props.conversationSessionKey,
   () => {
     composerText.value = '';
+    clearComposerActiveSkill();
     clearComposerReferences();
     architectureConfirmOpen.value = false;
     planConfirmOpen.value = false;
@@ -2043,7 +2110,7 @@ onBeforeUnmount(() => {
                 :key="item.id"
                 class="suggestion-button"
                 type="button"
-                @click="composerText = item.prompt"
+                @click="applyQuickAction(item)"
               >
                 {{ item.label }}
               </button>
@@ -2108,9 +2175,15 @@ onBeforeUnmount(() => {
               :items="messageTimelineItems(item)"
             />
 
+            <AgentEventBlockSummary
+              v-if="messageEventBlocks(item).length"
+              :blocks="messageEventBlocks(item)"
+            />
+
             <AgentArtifactSummary
               v-if="item.artifacts?.length"
               :artifacts="item.artifacts"
+              @open-obsidian-maintenance="openObsidianMaintenanceFromArtifact"
             />
 
             <div

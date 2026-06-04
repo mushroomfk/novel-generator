@@ -6,6 +6,8 @@ const props = defineProps({
   },
 });
 
+const emit = defineEmits(['open-obsidian-maintenance']);
+
 function compactText(value, limit = 88) {
   const normalized = String(value ?? '').trim().replace(/\s+/g, ' ');
   if (!normalized) {
@@ -29,6 +31,7 @@ function artifactKindLabel(kind) {
     user_skill: '用户技能',
     learning_review: '经验候选',
     self_evolution_review: '自学习复盘',
+    obsidian_maintenance: 'Obsidian 维护',
   };
 
   return labels[normalized] ?? (normalized || '产物');
@@ -36,6 +39,18 @@ function artifactKindLabel(kind) {
 
 function artifactMeta(item) {
   const metadata = item?.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+  if (item?.kind === 'obsidian_maintenance') {
+    const chapterIndex = Number(metadata.chapter_index ?? 0);
+    const itemCount = Number(metadata.item_count ?? 0);
+    const parts = [];
+    if (chapterIndex > 0) {
+      parts.push(`第 ${chapterIndex} 章`);
+    }
+    if (itemCount > 0) {
+      parts.push(`${itemCount} 条`);
+    }
+    return parts.join(' / ');
+  }
   if (typeof metadata.chapter_index === 'number') {
     return `第 ${metadata.chapter_index} 章`;
   }
@@ -72,6 +87,10 @@ function artifactMeta(item) {
 }
 
 function artifactCopy(item) {
+  if (item?.kind === 'obsidian_maintenance' && item?.contentPreview?.trim()) {
+    return compactText(item.contentPreview, 128);
+  }
+
   if (item?.summary?.trim()) {
     return compactText(item.summary, 88);
   }
@@ -81,6 +100,14 @@ function artifactCopy(item) {
   }
 
   return compactText(item?.contentPreview, 88);
+}
+
+function isObsidianMaintenanceArtifact(item) {
+  return item?.kind === 'obsidian_maintenance';
+}
+
+function openObsidianMaintenance(item) {
+  emit('open-obsidian-maintenance', item);
 }
 </script>
 
@@ -116,6 +143,20 @@ function artifactCopy(item) {
             {{ artifactMeta(item) }}
           </span>
         </div>
+      </div>
+
+      <div
+        v-if="isObsidianMaintenanceArtifact(item)"
+        class="artifact-actions"
+      >
+        <button
+          class="artifact-action-button"
+          data-testid="agent-obsidian-maintenance-open-button"
+          type="button"
+          @click="openObsidianMaintenance(item)"
+        >
+          查看维护队列
+        </button>
       </div>
     </article>
   </section>
@@ -153,6 +194,28 @@ function artifactCopy(item) {
 .artifact-title-block strong {
   color: #1f2328;
   font-size: 14px;
+}
+
+.artifact-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.artifact-action-button {
+  border: 1px solid #b8c4d5;
+  border-radius: 8px;
+  padding: 5px 10px;
+  background: #ffffff;
+  color: #1f3f63;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.artifact-action-button:hover {
+  background: #eef5ff;
+  border-color: #8aa7cc;
 }
 
 .artifact-kind,
