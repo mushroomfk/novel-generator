@@ -9,7 +9,7 @@ from novel_backend.services.model_error_service import is_transient_model_networ
 from novel_backend.services.model_transport_service import prepare_model_request_payload
 
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL_REQUEST_RETRY_DELAYS = (0.8, 1.6)
+DEFAULT_MODEL_REQUEST_RETRY_DELAYS = (0.8, 1.6, 3.2)
 
 
 def request_json_with_retries(

@@ -86,6 +86,27 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(urlopen.call_count, 2)
     sleep.assert_called_once()
 
+  def test_request_json_with_retries_allows_three_transient_ssl_errors(self) -> None:
+    ssl_eof = urllib_error.URLError(
+      "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
+    )
+    with patch(
+      "novel_backend.services.model_http_service.urllib_request.urlopen",
+      side_effect=[ssl_eof, ssl_eof, ssl_eof, _FakeHTTPResponse('{"ok": true}')],
+    ) as urlopen, patch("novel_backend.services.model_http_service.time.sleep") as sleep:
+      payload = request_json_with_retries(
+        "https://example.com/v1/chat/completions",
+        headers={"Authorization": "Bearer test-key"},
+        payload={"model": "demo", "messages": []},
+        error_prefix="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_payload_message="模型返回格式不正确",
+      )
+
+    self.assertEqual(payload, {"ok": True})
+    self.assertEqual(urlopen.call_count, 4)
+    self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.8, 1.6, 3.2])
+
   def test_invoke_model_records_structured_error_history(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
       settings = Settings(data_dir=Path(temp_dir))

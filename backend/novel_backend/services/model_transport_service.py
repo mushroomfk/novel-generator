@@ -8,7 +8,7 @@ import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-_RETRY_DELAYS = (0.8, 2.0)
+_RETRY_DELAYS = (0.8, 2.0, 4.0)
 _RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 _RETRYABLE_TRANSPORT_PATTERNS = (
   "unexpected_eof",
