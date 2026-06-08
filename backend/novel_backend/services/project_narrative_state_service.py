@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from novel_backend.config import Settings
 from novel_backend.services.config_service import load_config
@@ -1419,6 +1419,13 @@ def _obsidian_link_list(values: object, *, limit: int = 8) -> list[str]:
   return [f"[[{item}]]" for item in (_safe_obsidian_link_label(value) for value in _string_list(values, limit=limit)) if item]
 
 
+def _obsidian_link_target_without_suffix(value: object) -> str:
+  raw = str(value or "").replace("\\", "/").strip()
+  if not raw:
+    return ""
+  return PurePosixPath(raw).with_suffix("").as_posix()
+
+
 def _obsidian_note_paths_from_card(chapter_card: dict[str, object], *, limit: int = 8) -> list[str]:
   paths: list[str] = []
   for item in chapter_card.get("obsidian_notes", []) if isinstance(chapter_card.get("obsidian_notes"), list) else []:
@@ -1555,7 +1562,7 @@ def _graph_orphan_maintenance_draft(source_notes: list[object]) -> str:
     return ""
 
   note_paths = [str(getattr(note, "relative_path", "") or "").replace("\\", "/").strip() for note in orphan_notes]
-  note_links = _obsidian_link_list([str(Path(path).with_suffix("")) for path in note_paths], limit=12)
+  note_links = _obsidian_link_list([_obsidian_link_target_without_suffix(path) for path in note_paths], limit=12)
   scope_lines = _obsidian_source_scope_frontmatter_lines(orphan_notes)
   frontmatter = [
     "---",
@@ -1596,7 +1603,7 @@ def _graph_issue_maintenance_draft(issue: object, source_notes: list[object] | N
   if not link:
     return ""
   notes = _string_list(_issue_value(issue, "notes", []), limit=8)
-  note_links = _obsidian_link_list([str(Path(item).with_suffix("")) for item in notes], limit=8)
+  note_links = _obsidian_link_list([_obsidian_link_target_without_suffix(item) for item in notes], limit=8)
   scope_lines = _obsidian_source_scope_frontmatter_lines(source_notes or [])
   frontmatter = [
     "---",
@@ -1912,7 +1919,7 @@ def _chapter_archive_maintenance_draft(project_detail: object, chapter: object, 
     ])
     if not _chapter_note_path_like(item)
   ][:8]
-  source_note_links = _obsidian_link_list([str(Path(path).with_suffix("")) for path in source_note_paths], limit=8)
+  source_note_links = _obsidian_link_list([_obsidian_link_target_without_suffix(path) for path in source_note_paths], limit=8)
   handoff_items = _chapter_archive_handoff_items(
     chapter_card,
     summary_items,

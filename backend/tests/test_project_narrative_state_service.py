@@ -21,6 +21,7 @@ from novel_backend.services.context_builder import build_project_context_bundle
 from novel_backend.services.chapter_auto_repair_service import chapter_review_needs_auto_repair
 from novel_backend.services.project_narrative_state_service import (
   _attach_maintenance_action_status,
+  _obsidian_link_target_without_suffix,
   _obsidian_maintenance_summary,
   _text_content_hash,
   build_project_narrative_state_prompt,
@@ -92,6 +93,12 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
 
   def tearDown(self) -> None:
     self._temp_dir.cleanup()
+
+  def test_obsidian_link_target_uses_vault_slashes_on_windows_paths(self) -> None:
+    self.assertEqual(
+      _obsidian_link_target_without_suffix("Characters\\林追.md"),
+      "Characters/林追",
+    )
 
   def test_saved_chapter_updates_narrative_state_and_context_prompt(self) -> None:
     update_chapter_content(

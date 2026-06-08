@@ -18,6 +18,12 @@
 
 ## 2026-06-09
 
+### Obsidian 图谱草稿 Windows 路径修复
+
+- 修改摘要：修复 Windows 环境下 Obsidian 图谱维护草稿里的 wikilink 会被写成反斜杠路径的问题，例如 `[[Characters\林追]]`；现在统一按 Obsidian Vault 路径写成 `[[Characters/林追]]`，孤立笔记索引、未解析链接图谱草稿和章节档案草稿里的来源笔记链接都会使用正斜杠。
+- 影响范围：Obsidian 图谱维护草稿、孤立笔记整理草稿、章节档案来源笔记 wikilink 和 Windows 后端单测；不改变 Vault 文件路径、frontmatter `source_notes`、图谱关系解析、章节上下文或前端展示结构。
+- 验证结果：GitHub Actions `Windows Desktop Release` run `27164681108` 在修复前失败于 `test_orphan_obsidian_notes_generate_graph_index_draft`，日志显示草稿含 `[[Characters\林追]]` 而不是 `[[Characters/林追]]`；修复后 `.venv/bin/python -m unittest backend.tests.test_project_narrative_state_service.ProjectNarrativeStateServiceTestCase.test_orphan_obsidian_notes_generate_graph_index_draft backend.tests.test_project_narrative_state_service.ProjectNarrativeStateServiceTestCase.test_obsidian_link_target_uses_vault_slashes_on_windows_paths -v` 通过；`npm run backend:test` 通过，419 个后端 unittest 通过。Windows 桌面发布验证需要在当前分支重新触发后确认。
+
 ### 打包配置静态检查
 
 - 修改摘要：新增 `verify:packaging-static`，检查内置 Embedding 模型文件、macOS / Linux 和 Windows sidecar 打包脚本、Windows 发布验证脚本以及 GitHub Actions 工作流关键步骤；`npm run verify`、macOS 桌面发布验证和 Windows 桌面发布验证都会先执行这项检查。桌面发布验证现在还会在打包后的 sidecar 和 `.app` 内 sidecar 上调用 `POST /api/config/test`，确认内置本地 Embedding 能加载并返回 512 维向量，防止内置本地模型或关键打包步骤被遗漏。
