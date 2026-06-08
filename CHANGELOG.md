@@ -18,6 +18,12 @@
 
 ## 2026-06-09
 
+### 长篇项目记忆组合核验测试
+
+- 修改摘要：新增 12 章项目的章节核验回归用例，把安全章节、冲突章节、项目记忆硬规则、身份提前揭示、关键物品归属、人物状态变化、自动修订触发判断和项目记忆变更后的核验过期判定放在同一条后端测试链路里。测试确认安全表述不会被误报，正文同时违反“沈砚不能提前揭示为主谋”“铜钥匙不能交给白石商会”“顾临不能死亡”“林追不会主动暴露身份”时，`项目记忆规则` 维度会给出多个 critical 问题。
+- 影响范围：后端项目服务测试、章节核验项目记忆规则验证证据和长篇连续性回归覆盖；不改变线上章节核验逻辑、项目记忆格式、前端界面、模型配置或打包流程。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_combines_longform_memory_rules_across_multiple_chapters -v` 通过；`npm run backend:test` 通过，420 个后端 unittest 通过；`npm run verify` 通过，包含打包配置静态检查、420 个后端 unittest 和前端生产构建。
+
 ### Obsidian 图谱草稿 Windows 路径修复
 
 - 修改摘要：修复 Windows 环境下 Obsidian 图谱维护草稿里的 wikilink 会被写成反斜杠路径的问题，例如 `[[Characters\林追]]`；现在统一按 Obsidian Vault 路径写成 `[[Characters/林追]]`，孤立笔记索引、未解析链接图谱草稿和章节档案草稿里的来源笔记链接都会使用正斜杠。

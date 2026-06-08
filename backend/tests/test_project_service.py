@@ -1366,6 +1366,138 @@ foreshadows:
     self.assertTrue(any("顾临必须存活" in item.title for item in memory_dimension.issues))
     self.assertTrue(any("顾临" in item.detail and "被杀" in item.detail for item in memory_dimension.issues))
 
+  def test_chapter_review_combines_longform_memory_rules_across_multiple_chapters(self) -> None:
+    summary = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="长篇连续性核验",
+        genre="悬疑",
+        target_chapters=12,
+        target_words=120000,
+      ),
+    )
+    update_story_documents(
+      self.settings,
+      summary.id,
+      StoryDocumentBatchUpdateRequest(
+        documents=[
+          StoryDocumentPatch(key="character_design", content="林追守着铜钥匙追查旧船队。顾临是仍在局内的证人。沈砚的真实身份要留到后段。"),
+          StoryDocumentPatch(key="blueprint", content="第 1-12 章围绕铜钥匙、旧船队旧账和沈砚身份疑云推进，前中段不能提前揭开主谋。"),
+          StoryDocumentPatch(key="global_summary", content="铜钥匙始终是林追手里的关键物品，白石商会只能追索，不能得到。"),
+        ]
+      ),
+    )
+    memory_entries = [
+      ProjectMemoryEntryInput(
+        category="硬规则",
+        title="身份时序",
+        content="沈砚不能被提前揭示为主谋。林追不能被提前揭示为卧底。",
+      ),
+      ProjectMemoryEntryInput(
+        category="硬规则",
+        title="关键物品归属",
+        content="铜钥匙不能被交给白石商会。",
+      ),
+      ProjectMemoryEntryInput(
+        category="硬规则",
+        title="人物状态",
+        content="顾临不能死亡。林追不会主动暴露身份。",
+      ),
+    ]
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(entries=memory_entries),
+    )
+
+    safe_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(
+        content="# 第一章 雾港\n林追在旧码头拿到铜钥匙，只怀疑沈砚和旧账有关，并没有确认谁是主谋。顾临避开追兵后继续留在局内。\n"
+      ),
+    )
+    safe_review_1 = next(item for item in safe_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    safe_dimension_1 = next(item for item in safe_review_1.dimensions if item.id == "project_memory")
+    self.assertFalse(safe_review_1.is_stale)
+    self.assertNotEqual(safe_dimension_1.status, "risk")
+    self.assertFalse(safe_dimension_1.issues)
+
+    safe_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-006",
+      ChapterUpdateRequest(
+        content="# 第六章 暗潮\n白石商会逼林追交出铜钥匙，但他没有把铜钥匙交给白石商会。林追继续隐瞒身份，苏青也没有确认沈砚的真实立场。\n"
+      ),
+    )
+    safe_review_6 = next(item for item in safe_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-006")
+    safe_dimension_6 = next(item for item in safe_review_6.dimensions if item.id == "project_memory")
+    self.assertFalse(safe_review_6.is_stale)
+    self.assertNotEqual(safe_dimension_6.status, "risk")
+    self.assertFalse(safe_dimension_6.issues)
+
+    violated_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-012",
+      ChapterUpdateRequest(
+        content="# 第十二章 盐仓\n顾临在盐仓被杀。林追为了换通行证主动暴露身份。苏青翻出密押日志，确认主谋是沈砚。林追随后把铜钥匙交给白石商会。\n"
+      ),
+    )
+    violated_review = next(item for item in violated_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-012")
+    memory_dimension = next(item for item in violated_review.dimensions if item.id == "project_memory")
+    issue_details = "\n".join(item.detail for item in memory_dimension.issues)
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertGreaterEqual(len(memory_dimension.issues), 4)
+    self.assertIn("沈砚 / 主谋", issue_details)
+    self.assertIn("铜钥匙 / 交给 / 白石商会", issue_details)
+    self.assertIn("顾临", issue_details)
+    self.assertIn("被杀", issue_details)
+    self.assertIn("林追", issue_details)
+    self.assertIn("暴露身份", issue_details)
+
+    review_status = summarize_chapter_review_status(violated_detail, "chapter-012")
+    self.assertGreaterEqual(review_status["critical_issue_count"], 4)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    changed = update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          *memory_entries,
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="新人物边界",
+            content="苏青不能死亡。",
+          ),
+        ]
+      ),
+    )
+    stale_reviews = {
+      item.chapter_id: item
+      for item in changed.story_overview.chapter_reviews
+      if item.chapter_id in {"chapter-001", "chapter-006", "chapter-012"}
+    }
+    self.assertTrue(stale_reviews["chapter-001"].is_stale)
+    self.assertTrue(stale_reviews["chapter-006"].is_stale)
+    self.assertTrue(stale_reviews["chapter-012"].is_stale)
+
+    refreshed, review_error = refresh_chapter_review(
+      self.settings,
+      summary.id,
+      "chapter-012",
+      ChapterReviewRefreshRequest(style_name=""),
+    )
+    self.assertEqual(review_error, "")
+    refreshed_review = next(item for item in refreshed.story_overview.chapter_reviews if item.chapter_id == "chapter-012")
+    refreshed_dimension = next(item for item in refreshed_review.dimensions if item.id == "project_memory")
+    self.assertFalse(refreshed_review.is_stale)
+    self.assertEqual(refreshed_dimension.status, "risk")
+    self.assertGreaterEqual(len(refreshed_dimension.issues), 4)
+
   def test_chapter_review_checks_obsidian_forbidden_phrases_and_staleness(self) -> None:
     summary = self.create_demo_project("Obsidian 章节核验")
     vault_dir = Path(self._temp_dir.name) / "review-vault"
