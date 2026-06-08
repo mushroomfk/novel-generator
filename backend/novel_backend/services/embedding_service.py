@@ -7,6 +7,7 @@ import time
 from novel_backend.config import Settings
 from novel_backend.models import EmbeddingConfig
 from novel_backend.services.config_service import load_config
+from novel_backend.services.local_embedding_service import embed_texts_locally, is_local_embedding_config
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.model_runtime_service import mark_model_runtime_cooldown, model_runtime_slot
 from novel_backend.services.model_transport_service import request_json
@@ -17,6 +18,8 @@ class EmbeddingConfigError(RuntimeError):
 
 
 def _resolve_embedding_api_key(config: EmbeddingConfig) -> str:
+  if is_local_embedding_config(config):
+    return ""
   candidates = [
     config.api_key,
     os.getenv("NOVEL_EMBEDDING_API_KEY", ""),
@@ -35,6 +38,8 @@ def _resolve_embedding_api_key(config: EmbeddingConfig) -> str:
 
 
 def _embedding_ready(config: EmbeddingConfig) -> bool:
+  if is_local_embedding_config(config):
+    return bool(config.model_name.strip())
   try:
     _resolve_embedding_api_key(config)
   except EmbeddingConfigError:
@@ -113,8 +118,6 @@ def embed_texts(settings: Settings, texts: list[str], *, task_name: str = "embed
     return []
 
   config = load_config(settings).embedding
-  api_key = _resolve_embedding_api_key(config)
-  endpoint = _embeddings_endpoint(config.base_url)
   started = time.perf_counter()
   vectors: list[list[float]] = []
   runtime_task = None
@@ -122,15 +125,20 @@ def embed_texts(settings: Settings, texts: list[str], *, task_name: str = "embed
   try:
     with model_runtime_slot(settings, lane="retrieval", task_name=task_name) as task:
       runtime_task = task
-      for batch in _batches(cleaned, config.batch_size):
-        payload: dict[str, object] = {
-          "model": config.model_name,
-          "input": batch,
-        }
-        if config.dimensions is not None:
-          payload["dimensions"] = config.dimensions
-        response_payload = _request_embeddings(endpoint, api_key, payload)
-        vectors.extend(_extract_embedding_vectors(response_payload, len(batch)))
+      if is_local_embedding_config(config):
+        vectors = embed_texts_locally(config, cleaned)
+      else:
+        api_key = _resolve_embedding_api_key(config)
+        endpoint = _embeddings_endpoint(config.base_url)
+        for batch in _batches(cleaned, config.batch_size):
+          payload: dict[str, object] = {
+            "model": config.model_name,
+            "input": batch,
+          }
+          if config.dimensions is not None:
+            payload["dimensions"] = config.dimensions
+          response_payload = _request_embeddings(endpoint, api_key, payload)
+          vectors.extend(_extract_embedding_vectors(response_payload, len(batch)))
 
     elapsed = round(time.perf_counter() - started, 3)
     append_app_log(

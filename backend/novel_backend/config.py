@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Any
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 
 
 def default_data_dir() -> Path:
@@ -37,7 +39,7 @@ class Settings(BaseSettings):
   self_evolution_worker_interval_seconds: int = Field(default=300, ge=30, le=86400)
   auxiliary_worker_enabled: bool = True
   auxiliary_worker_interval_seconds: int = Field(default=180, ge=30, le=86400)
-  cors_origins: list[str] = Field(
+  cors_origins: Annotated[list[str], NoDecode] = Field(
     default_factory=lambda: [
       "http://localhost:1420",
       "http://127.0.0.1:1420",
@@ -48,6 +50,23 @@ class Settings(BaseSettings):
   )
 
   model_config = SettingsConfigDict(env_prefix="NOVEL_", extra="ignore")
+
+  @field_validator("cors_origins", mode="before")
+  @classmethod
+  def parse_cors_origins(cls, value: Any) -> list[str]:
+    if isinstance(value, str):
+      stripped = value.strip()
+      if not stripped:
+        return []
+      if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, list):
+          raise ValueError("NOVEL_CORS_ORIGINS must be a JSON array or a comma-separated list")
+        return [str(item).strip() for item in parsed if str(item).strip()]
+      return [item.strip() for item in stripped.split(",") if item.strip()]
+    if isinstance(value, list):
+      return [str(item).strip() for item in value if str(item).strip()]
+    return value
 
 
 @lru_cache(maxsize=1)

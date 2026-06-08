@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import time
 
 from novel_backend.config import Settings
 from novel_backend.models import (
@@ -10,8 +12,19 @@ from novel_backend.models import (
   ChapterAutoRepairConfig,
   EmbeddingConfig,
   ModelConfig,
+  ModelConfigTestItem,
+  ModelConfigTestRequest,
+  ModelConfigTestResult,
   ModelRuntimeConfig,
   ReviewModelConfig,
+)
+from novel_backend.services.model_error_service import classify_model_error
+from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.local_embedding_service import (
+  assert_local_embedding_model_available,
+  embed_texts_locally,
+  is_local_embedding_config,
+  normalize_local_embedding_model_name,
 )
 from novel_backend.services.skill_registry import default_skill_behavior_payloads, merge_skill_behavior
 from novel_backend.utils.jsonfile import atomic_write_json, atomic_write_text, read_json
@@ -21,69 +34,10 @@ def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
 
 
-def _model_family(model_config: ModelConfig) -> str:
-  base_url = model_config.base_url.strip().lower()
-  model_name = model_config.model_name.strip().lower()
-
-  if "dashscope.aliyuncs.com" in base_url:
-    return "aliyun"
-  if "ark.cn-beijing.volces.com" in base_url:
-    return "volcengine"
-  if "api.openai.com" in base_url:
-    return "openai-compatible"
-
-  if model_name.startswith("qwen"):
-    return "aliyun"
-  if model_name.startswith("doubao-"):
-    return "volcengine"
-  if model_name.startswith("gpt-") or model_name.startswith("text-embedding-"):
-    return "openai-compatible"
-
-  return ""
-
-
 def resolve_embedding_config(
-  model_config: ModelConfig,
+  _model_config: ModelConfig,
   current_embedding: EmbeddingConfig | None = None,
 ) -> EmbeddingConfig:
-  family = _model_family(model_config)
-  retrieval_k = current_embedding.retrieval_k if current_embedding is not None else 6
-  batch_size = current_embedding.batch_size if current_embedding is not None else 8
-  api_key = model_config.api_key.strip() or (current_embedding.api_key.strip() if current_embedding is not None else "")
-
-  if family == "aliyun":
-    return EmbeddingConfig(
-      provider="aliyun-bailian",
-      base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-      api_key=api_key,
-      model_name="text-embedding-v4",
-      dimensions=2048,
-      retrieval_k=retrieval_k,
-      batch_size=batch_size,
-    )
-
-  if family == "volcengine":
-    return EmbeddingConfig(
-      provider="volcengine-ark",
-      base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
-      api_key=api_key,
-      model_name="doubao-embedding-vision",
-      dimensions=None,
-      retrieval_k=retrieval_k,
-      batch_size=batch_size,
-    )
-
-  if family == "openai-compatible":
-    return EmbeddingConfig(
-      provider="openai-compatible",
-      base_url=model_config.base_url.strip() or "https://api.openai.com/v1",
-      api_key=api_key,
-      model_name="text-embedding-3-small",
-      dimensions=None,
-      retrieval_k=retrieval_k,
-      batch_size=batch_size,
-    )
-
   return current_embedding.model_copy() if current_embedding is not None else EmbeddingConfig()
 
 
@@ -680,7 +634,7 @@ def _existing_model_runtime_config(settings: Settings) -> ModelRuntimeConfig:
 def save_config(settings: Settings, config_update: AppConfigUpdateRequest | ModelConfig) -> AppConfig:
   if isinstance(config_update, ModelConfig):
     model_config = config_update
-    embedding_config = resolve_embedding_config(model_config)
+    embedding_config = resolve_embedding_config(model_config, load_config(settings).embedding)
     review_model_config = _existing_review_model_config(settings)
     chapter_auto_repair_config = _existing_chapter_auto_repair_config(settings)
     model_runtime_config = _existing_model_runtime_config(settings)
@@ -700,3 +654,219 @@ def save_config(settings: Settings, config_update: AppConfigUpdateRequest | Mode
   )
   atomic_write_json(app_config_path(settings), payload.model_dump(mode="json"))
   return payload
+
+
+def _chat_completions_endpoint(base_url: str) -> str:
+  normalized = base_url.strip().rstrip("/")
+  if not normalized:
+    raise RuntimeError("接口地址不能为空")
+  return normalized if normalized.endswith("/chat/completions") else f"{normalized}/chat/completions"
+
+
+def _embeddings_endpoint(base_url: str) -> str:
+  normalized = base_url.strip().rstrip("/")
+  if not normalized:
+    raise RuntimeError("Embedding 接口地址不能为空")
+  return normalized if normalized.endswith("/embeddings") else f"{normalized}/embeddings"
+
+
+def _first_configured_value(*values: str) -> str:
+  for value in values:
+    cleaned = str(value or "").strip()
+    if cleaned:
+      return cleaned
+  return ""
+
+
+def _model_api_key(config: ModelConfig) -> str:
+  return _first_configured_value(
+    config.api_key,
+    os.getenv("NOVEL_MODEL_API_KEY", ""),
+    os.getenv("DASHSCOPE_API_KEY", ""),
+    os.getenv("ARK_API_KEY", ""),
+    os.getenv("NOVEL_API_KEY", ""),
+    os.getenv("OPENAI_API_KEY", ""),
+  )
+
+
+def _embedding_api_key(config: EmbeddingConfig) -> str:
+  if is_local_embedding_config(config):
+    return ""
+  return _first_configured_value(
+    config.api_key,
+    os.getenv("NOVEL_EMBEDDING_API_KEY", ""),
+    os.getenv("DASHSCOPE_API_KEY", ""),
+    os.getenv("ARK_API_KEY", ""),
+    os.getenv("NOVEL_API_KEY", ""),
+    os.getenv("OPENAI_API_KEY", ""),
+  )
+
+
+def _review_model_api_key(config: ReviewModelConfig) -> str:
+  return _first_configured_value(
+    config.api_key,
+    os.getenv("NOVEL_REVIEW_MODEL_API_KEY", ""),
+    os.getenv("NOVEL_AUXILIARY_MODEL_API_KEY", ""),
+    os.getenv("OPENAI_API_KEY", ""),
+    os.getenv("DASHSCOPE_API_KEY", ""),
+    os.getenv("ARK_API_KEY", ""),
+    os.getenv("NOVEL_API_KEY", ""),
+  )
+
+
+def _test_failure_message(error: object) -> str:
+  classified = classify_model_error(error)
+  return f"{classified.title}：{classified.user_action} 原始错误：{error}"
+
+
+def _passed_item(target: str, label: str, message: str, started: float) -> ModelConfigTestItem:
+  return ModelConfigTestItem(
+    target=target,
+    label=label,
+    status="passed",
+    message=message,
+    elapsed=round(time.perf_counter() - started, 3),
+  )
+
+
+def _failed_item(target: str, label: str, error: object, started: float) -> ModelConfigTestItem:
+  return ModelConfigTestItem(
+    target=target,
+    label=label,
+    status="failed",
+    message=_test_failure_message(error),
+    elapsed=round(time.perf_counter() - started, 3),
+  )
+
+
+def _skipped_item(target: str, label: str, message: str) -> ModelConfigTestItem:
+  return ModelConfigTestItem(target=target, label=label, status="skipped", message=message, elapsed=0.0)
+
+
+def _test_chat_model(
+  target: str,
+  label: str,
+  config: ModelConfig | ReviewModelConfig,
+  api_key: str,
+) -> ModelConfigTestItem:
+  started = time.perf_counter()
+  try:
+    if not api_key:
+      raise RuntimeError("未填写 API Key，也没有找到可用的模型环境变量。")
+    if not config.model_name.strip():
+      raise RuntimeError("模型名称不能为空")
+    endpoint = _chat_completions_endpoint(config.base_url)
+    response_payload = request_json_with_retries(
+      endpoint,
+      headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+      },
+      payload={
+        "model": config.model_name,
+        "messages": [
+          {"role": "system", "content": "你是模型连通性测试服务，只回复 OK。"},
+          {"role": "user", "content": "请回复 OK。"},
+        ],
+        "max_tokens": 16,
+      },
+      error_prefix="模型测试失败",
+      invalid_json_message="模型测试返回的不是合法 JSON",
+      invalid_payload_message="模型测试返回格式不正确",
+      timeout=30,
+    )
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+      raise RuntimeError("模型测试返回为空")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict) or not str(message.get("content") or "").strip():
+      raise RuntimeError("模型测试没有返回文本内容")
+    return _passed_item(target, label, f"{config.model_name} 可用", started)
+  except Exception as error:
+    return _failed_item(target, label, error, started)
+
+
+def _test_embedding_model(config: EmbeddingConfig) -> ModelConfigTestItem:
+  started = time.perf_counter()
+  try:
+    if is_local_embedding_config(config):
+      model_name = normalize_local_embedding_model_name(config.model_name)
+      assert_local_embedding_model_available(model_name)
+      vectors = embed_texts_locally(config, ["模型配置测试"])
+      vector = vectors[0] if vectors else []
+      if not vector:
+        raise RuntimeError("本地 Embedding 测试没有返回向量")
+      return _passed_item(
+        "embedding",
+        "知识检索模型",
+        f"{model_name} 可用，向量维度 {len(vector)}",
+        started,
+      )
+    api_key = _embedding_api_key(config)
+    if not api_key:
+      raise RuntimeError("未填写 Embedding API Key，也没有找到可用的 Embedding 环境变量。")
+    if not config.model_name.strip():
+      raise RuntimeError("Embedding 模型名称不能为空")
+    payload: dict[str, object] = {
+      "model": config.model_name,
+      "input": ["模型配置测试"],
+    }
+    if config.dimensions is not None:
+      payload["dimensions"] = config.dimensions
+    response_payload = request_json_with_retries(
+      _embeddings_endpoint(config.base_url),
+      headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+      },
+      payload=payload,
+      error_prefix="Embedding 测试失败",
+      invalid_json_message="Embedding 测试返回的不是合法 JSON",
+      invalid_payload_message="Embedding 测试返回格式不正确",
+      timeout=30,
+    )
+    data = response_payload.get("data")
+    first = data[0] if isinstance(data, list) and data else None
+    vector = first.get("embedding") if isinstance(first, dict) else None
+    if not isinstance(vector, list) or not vector:
+      raise RuntimeError("Embedding 测试没有返回向量")
+    return _passed_item("embedding", "知识检索模型", f"{config.model_name} 可用，向量维度 {len(vector)}", started)
+  except Exception as error:
+    return _failed_item("embedding", "知识检索模型", error, started)
+
+
+def _model_config_test_status(items: list[ModelConfigTestItem]) -> str:
+  failed_count = sum(1 for item in items if item.status == "failed")
+  passed_count = sum(1 for item in items if item.status == "passed")
+  if failed_count and passed_count:
+    return "partial"
+  if failed_count:
+    return "failed"
+  if passed_count:
+    return "passed"
+  return "skipped"
+
+
+def run_model_config_test(_settings: Settings, request: ModelConfigTestRequest) -> ModelConfigTestResult:
+  targets = [request.target] if request.target != "all" else ["model", "embedding", "review_model"]
+  items: list[ModelConfigTestItem] = []
+
+  for target in targets:
+    if target == "model":
+      items.append(_test_chat_model("model", "写作模型", request.model, _model_api_key(request.model)))
+    elif target == "embedding":
+      items.append(_test_embedding_model(request.embedding))
+    elif target == "review_model":
+      if not request.review_model.enabled:
+        items.append(_skipped_item("review_model", "第二审查模型", "未启用第二审查模型。"))
+      else:
+        items.append(
+          _test_chat_model(
+            "review_model",
+            "第二审查模型",
+            request.review_model,
+            _review_model_api_key(request.review_model),
+          )
+        )
+
+  return ModelConfigTestResult(status=_model_config_test_status(items), items=items)

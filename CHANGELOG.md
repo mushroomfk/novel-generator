@@ -16,7 +16,133 @@
 - 模型配置、许可证导入校验、整本导出
 - Tauri 桌面壳、sidecar backend、浏览器层 smoke 和桌面发布回归
 
+## 2026-06-09
+
+### 打包配置静态检查
+
+- 修改摘要：新增 `verify:packaging-static`，检查内置 Embedding 模型文件、macOS / Linux 和 Windows sidecar 打包脚本、Windows 发布验证脚本以及 GitHub Actions 工作流关键步骤；`npm run verify`、macOS 桌面发布验证和 Windows 桌面发布验证都会先执行这项检查。桌面发布验证现在还会在打包后的 sidecar 和 `.app` 内 sidecar 上调用 `POST /api/config/test`，确认内置本地 Embedding 能加载并返回 512 维向量，防止内置本地模型或关键打包步骤被遗漏。
+- 影响范围：`package.json`、`scripts/verify-packaging-static.mjs`、`scripts/verify-desktop-release.sh`、`scripts/verify-windows-release.ps1`、README、桌面发布回归说明、Windows 打包说明、技能流程回归清单和打包验证流程；不改变模型配置结构、sidecar 输出路径、Tauri 配置、前端设置页或真实写作模型调用链路。
+- 验证结果：`node --check scripts/verify-packaging-static.mjs` 通过；`bash -n scripts/verify-desktop-release.sh scripts/build-backend-sidecar.sh scripts/prepare-macos-test-release.sh scripts/repair-tauri-app-signature.sh` 通过；`npm run verify:packaging-static` 通过；`npm run verify` 通过，包含打包脚本静态检查、418 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖 Agent、章节写回、Obsidian、自学习面板、架构总览、章节核验项目记忆展示、提示词、XP、文件浏览、人物复刻和项目迁移包导出导入；增强后的 `npm run verify:desktop` 通过，包含打包配置静态检查、418 个后端 unittest、前端生产构建、Python sidecar 打包、打包后 sidecar 健康检查和本地 Embedding 测试、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查和本地 Embedding 测试、`.app` 启动检查；`npm run package:test:macos` 通过，重新生成 `release/test-release/macos/稿匣_0.1.2_测试包`；在测试包目录执行 `shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.2_aarch64.dmg: OK`；`hdiutil verify release/test-release/macos/稿匣_0.1.2_测试包/稿匣_0.1.2_aarch64.dmg` 通过。Windows PowerShell 脚本仍未在本机执行，本机没有 `pwsh` 或 `powershell`，当前本地改动还需要重新触发 `Windows Desktop Release` 或在 Windows 本机执行 `npm run verify:desktop:windows` 才能确认进入 Windows 安装包。
+
+### 章节核验详情展示
+
+- 修改摘要：架构总览新增“章节核验”页签，作者可以直接查看每章核验分数、状态、维度、问题、建议和过期标记；项目记忆规则触发项会在对应维度中显示，避免核验报告只存在于后端数据里。
+- 影响范围：架构总览界面、章节核验报告展示、UI smoke、README、技能流程回归清单、测试反馈清单和项目 Agent 指令；不改变后端章节核验数据结构、章节保存接口、项目记忆格式或模型配置。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run build` 通过；`npm run verify:ui` 通过，覆盖设置页 Embedding 配置入口移除、Agent、Obsidian、自学习面板、章节核验项目记忆展示、架构总览、提示词、XP、文件浏览、人物复刻和项目迁移包导出导入；`npm run release:test:macos` 通过，包含 418 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`；在测试包目录执行 `shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.2_aarch64.dmg: OK`；`hdiutil verify release/test-release/macos/稿匣_0.1.2_测试包/稿匣_0.1.2_aarch64.dmg` 通过；用当前 `.app` 内 `Contents/MacOS/novel-backend` 启动临时服务后，`POST /api/config/test` 的本地 Embedding 测试通过，返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`；使用临时数据目录复制真实配置和许可证后，`POST /api/config/test` 真实调用通过，写作模型 `qwen3-max`、知识检索模型 `BAAI/bge-small-zh-v1.5` 和第二审查模型 `qwen/qwen3.7-max` 均为 passed；真实章节链路通过，`qwen3-max` 为 6 章 6000 字临时悬疑项目生成第 1 章 804 字，保存后 `qwen/qwen3.7-max` 生成章节核验，状态 `good`、87 分，`项目记忆规则` 维度 `good`、94 分且 0 个问题，知识检索返回 5 条命中。
+
+### 项目记忆关键物品归属规则
+
+- 修改摘要：真实后端 HTTP 端到端冒烟发现，项目记忆写“铜钥匙不能被交给白石商会”时，章节正文“林追把铜钥匙交给白石商会”没有被 `项目记忆规则` 捕获。章节核验现在会识别“X 不能被交给 / 交出 / 移交 / 转交 / 交付给 Y”这类关键物品、线索或账册归属禁写，正文命中时显示为“铜钥匙 / 交给 / 白石商会”；正文写成“没有把铜钥匙交给白石商会”不会误报。
+- 影响范围：章节保存核验、项目记忆规则维度、长篇关键物品归属连续性、项目服务回归、真实后端 HTTP 冒烟、README、核心引擎说明、技能流程回归清单、测试反馈清单和项目 Agent 指令；不改变项目记忆文件格式、前端接口、Obsidian 规则或模型配置。
+- 验证结果：真实 backend 服务使用临时数据目录启动后，通过 HTTP 覆盖 `GET /api/config`、`POST /api/config/test` 本地 Embedding、`POST /api/projects` 创建作品、`PUT /api/projects/{id}/memory` 写入项目记忆、`POST /api/projects/{id}/knowledge/import`、`GET /api/projects/{id}/knowledge/search`、`PUT /api/projects/{id}/chapters/chapter-001` 保存违规和安全正文、`POST /api/projects/{id}/snapshots`、`POST /api/projects/{id}/export`、`POST /api/projects/{id}/migration/export` 和 `GET /api/projects/{id}`，结果通过；`.venv/bin/python -m py_compile backend/novel_backend/services/chapter_review_service.py backend/tests/test_project_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_project_service -v` 通过，75 个用例通过；`npm run verify` 通过，418 个后端 unittest 和前端生产构建通过；`npm run verify:ui` 通过，覆盖工作台、Agent 章节计划 / 执行、章节生成写回、架构优先、Obsidian 同步 / 检索 / 维护产物跳转、自学习面板、架构总览、提示词、XP、文件浏览、人物复刻和项目迁移包导出导入；`npm run release:test:macos` 通过，包含 418 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`；用新生成的 `.app` 内 `Contents/MacOS/novel-backend` 启动临时服务后，`POST /api/config/test` 本地 Embedding 返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`，并通过 `PUT /api/projects/{id}/chapters/chapter-001` 验证“铜钥匙 / 交给 / 白石商会”和“账册 / 交给 / 顾临”会报风险，否定句不误报；在测试包目录执行 `shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.2_aarch64.dmg: OK`；`hdiutil verify release/test-release/macos/稿匣_0.1.2_测试包/稿匣_0.1.2_aarch64.dmg` 通过；`bash -n scripts/build-backend-sidecar.sh scripts/verify-desktop-release.sh scripts/prepare-macos-test-release.sh scripts/repair-tauri-app-signature.sh` 通过；`node --check scripts/verify-ui-smoke.mjs scripts/fix-macos-native-binaries.mjs scripts/patch-vite-fsevents.mjs scripts/capture-readme-screenshots.mjs` 通过；`cargo test --manifest-path src-tauri/Cargo.toml` 通过，Rust 侧当前 0 个测试用例；本机没有 `pwsh` 或 `powershell`，Windows PowerShell 打包 / 验证脚本未在本机执行，已在 Windows 打包说明中标明需要重新触发 Windows 验证后才能确认当前本地改动进入 Windows 安装包。
+
+### macOS 测试包校验说明
+
+- 修改摘要：macOS 测试版安装说明新增 SHA256 校验步骤，明确需要先进入测试包目录再执行 `shasum -a 256 -c SHA256SUMS.txt`，避免测试人员从其它目录执行时因为相对路径误判校验失败。
+- 影响范围：`docs/macOS测试版安装说明.md` 和重新整理后的 `release/test-release/macos/稿匣_0.1.2_测试包/安装说明-先看这个.md`；不改变 DMG、`.app`、sidecar、签名或打包脚本逻辑。
+- 验证结果：`npm run package:test:macos` 通过；在测试包目录执行 `shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.2_aarch64.dmg: OK`；`hdiutil verify release/test-release/macos/稿匣_0.1.2_测试包/稿匣_0.1.2_aarch64.dmg` 通过。
+
+### Obsidian 保存结果刷新
+
+- 修改摘要：技能库里的 `Obsidian 知识库` 保存配置或手动重新同步后，会主动重新读取 `/api/projects/{project_id}/obsidian` 的最新同步状态，再恢复按钮可用状态；同步结果区会立刻显示新 Vault 的笔记、双链、考据链接和重复命名问题，避免保存接口已完成但界面仍停留在旧状态或空状态。
+- 影响范围：技能库 Obsidian 配置保存、手动重新同步、同步结果区刷新和 UI smoke；不改变 Obsidian 配置结构、Vault 解析规则、知识库索引格式或后端接口。
+- 验证结果：`npm run verify:ui` 通过，已覆盖配置测试 Vault、保存并索引、结果区显示 `灯塔议会`、考据链接、重复命名、歧义双链、反向链接和章节范围；`npm run release:test:macos` 通过，包含 414 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理；`npm run verify` 复验通过，包含 414 个后端 unittest 和前端生产构建。
+
+### 项目记忆状态禁写规则扩展
+
+- 修改摘要：`项目记忆规则` 章节核验增加状态类禁写识别，作者在项目记忆“硬规则 / 警告”中写“不会 / 不能 / 禁止 / 避免”等规则时，系统现在能反查关键人物死亡、被杀、叛变、背叛、黑化、离队和主动暴露身份这类长篇状态变化冲突；“沈砚不能被提前揭示为主谋”“某人不能提前暴露为真凶”“林追不能被提前揭示为卧底”“苏青不能提前暴露为潮师”这类人物在否定词前、身份在后面的写法也会被识别，正文命中时显示为“沈砚 / 主谋”“林追 / 卧底”这类清晰项。正文写成“没有暴露身份”“并不是主谋”“并不是卧底”这类否定表述时不再误判为违规。自动修订提示会携带项目记忆规则问题，让模型改稿时知道必须遵守哪些硬规则；作者修改项目记忆后，已有章节核验报告会标记过期，刷新后按新规则重新检查。
+- 影响范围：章节保存核验、项目记忆规则维度、章节核验过期签名、自动修订触发判断、自动修订提示、项目记忆状态变化和提前揭示身份回归测试、README、核心引擎说明、技能流程回归清单、测试反馈清单和项目 Agent 指令；不改变项目记忆文件格式、前端接口、Obsidian 规则或模型配置。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/services/chapter_review_service.py backend/tests/test_project_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_custom_identity_reveal_rules backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_reveal_rule_with_subject_before_marker backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_forbidden_rules backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_project_memory_reveal_rule_issues backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_project_memory_state_rule_issues -v` 通过；`.venv/bin/python -m unittest backend.tests.test_project_service -v` 通过，74 个用例通过；`npm run backend:test` 通过，417 个后端 unittest 通过；`npm run build` 通过；`npm run verify:ui` 通过，覆盖工作台、Agent、Obsidian、项目迁移、提示词、XP、文件浏览和人物复刻等浏览器流程；`npm run release:test:macos` 通过，包含 417 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`；用新生成的 `.app` 内 `Contents/MacOS/novel-backend` 启动临时服务后调用 `POST /api/config/test`，本地 Embedding 返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`，服务返回耗时 11.652 秒；`cargo test` 通过，Rust 侧当前 0 个测试用例；`bash -n scripts/build-backend-sidecar.sh scripts/verify-desktop-release.sh scripts/prepare-macos-test-release.sh scripts/repair-tauri-app-signature.sh` 通过；`node --check scripts/verify-ui-smoke.mjs scripts/fix-macos-native-binaries.mjs scripts/patch-vite-fsevents.mjs scripts/capture-readme-screenshots.mjs` 通过。Windows PowerShell 打包 / 验证脚本仍未在本机执行。
+
+## 2026-06-08
+
+### 项目记忆规则参与章节核验
+
+- 修改摘要：章节保存后的核验报告新增 `项目记忆规则` 维度，会读取作者项目记忆里的“硬规则 / 警告”，对“不要 / 不能 / 禁止 / 避免”等禁写表达做本地短语反查；正文命中“不要提前揭示某人是主谋”“不要把 A 改名为 B”这类规则时记为 critical，并参与章节自动修订判断。
+- 影响范围：章节保存核验、核验报告维度、自动修订触发判断、项目记忆规则回归测试、README、核心引擎说明、技能流程回归清单、测试反馈清单和项目 Agent 指令；不改变项目记忆文件格式、章节正文保存路径、Obsidian 规则、模型配置或前端接口。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/services/chapter_review_service.py backend/tests/test_project_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_forbidden_rules backend.tests.test_project_service.ProjectServiceTestCase.test_update_chapter_content_generates_chapter_review_report backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_chapter_scoped_obsidian_required_phrase -v` 通过；`.venv/bin/python -m unittest backend.tests.test_project_service -v` 通过，68 个用例通过；`npm run backend:test` 通过，411 个后端 unittest 通过；`npm run build` 通过；`git diff --check` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run verify:ui` 通过；`npm run release:test:macos` 通过，包含 411 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`；用新生成的 `src-tauri/binaries/novel-backend-aarch64-apple-darwin` 启动临时服务后调用 `POST /api/config/test`，本地 Embedding 返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`，首次加载耗时 16.057 秒。
+
+### 桌面发布冷启动验证加固
+
+- 修改摘要：macOS 和 Windows 桌面发布回归脚本的 sidecar 健康检查等待上限从 30 秒调整为 120 秒；如果打包后的 backend 在健康检查前提前退出，脚本会立即打印退出码和日志，避免 PyInstaller onefile 首次解包较慢时被误判为失败，也避免真实崩溃时只看到超时。
+- 影响范围：`npm run verify:desktop`、`npm run release:test:macos` 和 `npm run verify:desktop:windows` 的 sidecar / 应用内 sidecar 冒烟检查；不改变应用启动参数、Tauri 配置、模型配置、项目数据或安装包结构。
+- 验证结果：第一次执行 `npm run release:test:macos` 时，打包后的 sidecar 在 30 秒内尚未完成冷启动，健康检查误失败；脚本调整后重新执行 `npm run release:test:macos` 通过，包含 410 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名修复校验、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`。`bash -n scripts/verify-desktop-release.sh scripts/build-backend-sidecar.sh scripts/prepare-macos-test-release.sh` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过。Windows PowerShell 脚本已同步修改，但未在本机执行。
+
+### 真实模型连续章节复查
+
+- 修改摘要：基于真实测试工程继续执行第 2 章生成、保存、章节核验、知识检索和一致性检查，确认第 1 章保存后的正文、章节合同、知识库和叙事状态会进入后续章节上下文。测试中临时输入的人物名与项目资料库不一致时，生成结果优先沿用项目资料里的既有人物名，符合长篇一致性优先级。
+- 影响范围：真实写作模型链路、第二审查模型链路、本地 Embedding 检索、章节保存后知识索引刷新、叙事状态和连续性检查结果记录；不改变代码、接口或项目数据格式。
+- 验证结果：测试工程 `真实模型长篇链路测试` 中，第 1 章已有 1256 字符正文；真实 `qwen3-max` 生成第 2 章，用时 330.5 秒，正文 1259 字符并保存成功；保存触发真实第二审查模型 `qwen/qwen3.7-max`，章节核验 73/100、状态“需关注”，指出短稿相对 6 章 60000 字目标严重不足、顾临权限铺垫需要更严谨、控制室权限伏笔需后续呼应；知识检索返回 5 条命中，包含第 2 章正文、核心种子和写作边界资料；真实一致性检查返回 3 条问题，确认未提前揭示主谋、人物关系和港口制度基本承接，但短稿不能当完整章上线。
+
+### 章节显式字数目标修复
+
+- 修改摘要：Studio 章节生成和章节工作流 draft 入口在用户传入 `target_words` 时，会按调用方目标生成，不再被项目单章均值覆盖；只有 `target_words=0` 的完整章节生成才使用项目篇幅预算。设置页内部同步删除已无用的 Embedding 表单状态，前端仍固定发送内置本地 Embedding 配置。
+- 影响范围：`chapter_generate_stream`、`chapter_workflow:draft`、章节续写模型输出预算、设置页内部状态和相关回归测试；不改变未传字数时的完整长章节预算、批量生成、知识库 schema 或写作模型配置结构。
+- 验证结果：真实模型链路修复前，6 章 60000 字测试项目里传入 `target_words=900` 仍被提示词改成“目标长度：约 3500 字”，随后 `qwen3-max` 章节生成在 226.332 秒后因供应商断连失败；修复后同一项目真实调用 `qwen3-max` 生成第 1 章，prompt 记录 `continuation_brief` 和 `chapter_generate:partial` 都为 `target_words_in_prompt=900`，生成正文 1256 字并保存成功；保存后真实第二审查模型 `qwen/qwen3.7-max` 生成章节核验，结果 82/100、状态“需关注”；真实 `qwen3-max` 一致性检查完成，指出正文未提前揭示主谋但篇幅偏短；真实去 AI 改稿完成，本地评分 90 → 100。`.venv/bin/python -m unittest backend.tests.test_studio_service.StudioServiceTestCase.test_chapter_generate_stream_respects_explicit_target_words backend.tests.test_generation_service.GenerationServiceTestCase.test_chapter_workflow_draft_respects_explicit_target_words -v` 通过；`.venv/bin/python -m unittest backend.tests.test_generation_service backend.tests.test_studio_service -v` 通过，38 个用例通过；`npm run backend:test` 通过，410 个后端 unittest 通过；`npm run build` 通过；`npm run verify:ui` 通过；`npm run backend:bundle` 通过并更新 `src-tauri/binaries/novel-backend-aarch64-apple-darwin`，新 sidecar 启动后 `GET /api/app/health` 通过，`POST /api/config/test` 的本地 Embedding 测试通过，返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`；`git diff --check` 通过。
+
+### 内置本地 Embedding 模型
+
+- 修改摘要：Embedding 默认改为随 sidecar 打包的本地 `local-fastembed` / `BAAI/bge-small-zh-v1.5`，维度 512，模型文件放在 `backend/novel_backend/assets/embedding_models/fast-bge-small-zh-v1.5`；后端新增本地模型加载路径，知识库向量生成和“测试当前配置”不再要求 Embedding API Key；设置页移除 Embedding 配置入口，保存写作模型时不再按服务商自动改成云端 Embedding；macOS / Linux 和 Windows sidecar 打包脚本会把内置模型目录以及 `fastembed / onnxruntime / tokenizers` 运行依赖收进产物。
+- 影响范围：新项目默认 Embedding 配置、知识库向量生成、模型配置测试、设置页高级区、Python backend 依赖、PyInstaller sidecar 打包脚本、README、核心引擎说明、桌面版方案、桌面发布回归说明、界面回归说明、测试反馈清单和项目 Agent 指令；不改变写作模型配置、章节正文生成接口、后端 OpenAI-compatible `/embeddings` 兼容路径或知识库 schema。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/models.py backend/novel_backend/services/local_embedding_service.py backend/novel_backend/services/embedding_service.py backend/novel_backend/services/config_service.py backend/tests/test_config_service.py backend/tests/test_embedding_service.py` 通过；`HF_HUB_OFFLINE=1` 下直接加载内置模型生成 2 条 512 维向量通过，确认不依赖外部下载；`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_embedding_service -v` 通过，14 个用例通过；`npm run backend:test` 通过，408 个后端 unittest 通过；`npm run build` 通过；`npm run verify:ui` 通过，包含设置页旧 Embedding 入口不存在的检查；`bash -n scripts/build-backend-sidecar.sh` 通过；`npm run backend:bundle` 通过并生成 `src-tauri/binaries/novel-backend-aarch64-apple-darwin`；启动打包后的 sidecar 后，`GET /api/app/health` 通过，`POST /api/config/test` 的本地 Embedding 测试通过，返回 `BAAI/bge-small-zh-v1.5 可用，向量维度 512`。Windows PowerShell 打包脚本未在本机执行。
+
+### AI 写作设置页误关闭修复
+
+- 修改摘要：AI 写作设置页不再通过点击背景关闭；在输入框、文本框、下拉框等编辑控件内按 Escape 也不会关闭设置页，避免复制、选择或修改模型配置时误关页面。设置页仍可通过“关闭”按钮，或在非编辑区按 Escape 关闭。
+- 影响范围：设置页关闭逻辑、浏览器层 smoke 的设置页检查、界面回归说明和测试反馈清单；不改变模型配置保存、配置测试、设置字段或后端接口。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`git diff --check` 通过；`npm run build` 通过，前端生产构建通过；`npm run verify:ui` 通过，已覆盖设置页背景点击不关闭、输入框内 Escape 不关闭、显式关闭按钮可关闭；`npm run release:test:macos` 通过，完成 406 个 backend unittest、前端生产构建、Python sidecar 打包和健康检查、Tauri debug `.app` / dmg 构建、签名修复、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`，DMG SHA256 为 `02d758af68179f8259194ce8ae607ea8186a0aac3d19037bc0528d34965dffb7`。
+
+### 模型配置测试真实调用复查
+
+- 修改摘要：模型设置的“测试当前配置”现在沿用模型请求助手的短暂网络错误重试，避免一次 SSL EOF 直接盖过后续真实错误；模型错误分类新增 `no available channels for model ...` 识别，供应商提示模型无可用通道时会显示为“模型不可用”。
+- 影响范围：模型配置测试接口、模型错误分类、设置页测试当前配置的失败提示；不改变模型配置结构、保存语义、模型端点、真实生成流程或前端设置页结构。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/services/config_service.py backend/novel_backend/services/model_error_service.py backend/tests/test_config_service.py backend/tests/test_model_error_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_config_service.ConfigServiceTestCase.test_model_config_test_uses_current_payload_without_saving backend.tests.test_config_service.ConfigServiceTestCase.test_model_config_test_reports_model_error backend.tests.test_model_error_service.ModelErrorServiceTestCase.test_classifies_common_model_errors backend.tests.test_model_error_service.ModelErrorServiceTestCase.test_request_json_retries_transient_ssl_eof -v` 通过，4 个用例通过；真实模型调用确认写作模型 `qwen3-max` 返回“真实写作模型调用成功。”，第二审查模型 `qwen/qwen3.7-max` 返回“审查模型调用成功。”；“测试当前配置”真实结果为写作模型通过、知识检索模型失败并返回百炼 `401 invalid_api_key`、第二审查模型通过；`https://api.qnaigc.com/v1/models` 带重试查询通过，返回 60 个模型，`qwen3-max` 和 `qwen/qwen3.7-max` 都在列表中；`npm run backend:test` 通过，406 个后端 unittest 通过；`git diff --check` 通过。
+
+### 本地启动配置与隐藏导入控件修正
+
+- 修改摘要：`NOVEL_CORS_ORIGINS` 现在同时支持 JSON 数组和逗号分隔来源列表，避免开发者按常见环境变量写法启动 backend 时直接失败；工作台里的迁移包文件输入保留给“导入迁移包”按钮调用，但从可访问树和键盘焦点中移除，不再出现裸露的 `Choose File` 控件。
+- 影响范围：backend 启动配置解析、`.env.example`、README 本地启动说明、工作台迁移包导入隐藏 input；不改变默认 CORS 来源、迁移包格式、迁移包导入导出逻辑或旧稿接管入口。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_app.AppCorsTestCase -v` 通过，4 个用例通过；`npm run build` 通过；使用 `NOVEL_CORS_ORIGINS="http://localhost:1420,http://127.0.0.1:1420"` 启动 `npm run backend:dev` 成功并通过 `/api/app/health`；浏览器检查确认隐藏 input 不再出现在可访问树中且控制台无 error / warning；`npm run backend:test` 通过，406 个后端 unittest 通过；`npm run verify:ui` 通过，覆盖项目迁移包导出导入。
+
+### 作品入口与迁移包菜单调整
+
+- 修改摘要：作品列表顶部只保留“旧稿”和“新建”，旧稿入口取消高亮底色并增加 hover 提示，说明旧稿文件只支持 `.txt`；迁移包导入入口移动到右上角“更多”菜单，旧稿接管弹窗的文件选择和前端校验同步限制为 `.txt`。
+- 影响范围：作品列表入口、右上角项目工具菜单、旧稿接管弹窗、README、项目 Agent 指令、核心引擎说明、技能流程回归清单、测试反馈清单和浏览器层 smoke 检查；不改变迁移包导出、迁移包格式、旧稿粘贴正文接管或后端章节接管流程。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`git diff --check` 通过；`npm run build` 通过，前端生产构建通过；`npm run verify:ui` 前两次暴露 smoke 从技能库返回工作台时等待错元素，修正后第三次通过，已验证旧稿入口不再高亮、旧稿提示包含 `.txt`、侧栏不再显示迁移包导入入口、右上角“更多”菜单可导出并导入迁移包；文档同步后 `git diff --check` 再次通过；`npm run release:test:macos` 通过，完成 404 个 backend unittest、前端生产构建、Python sidecar 打包和健康检查、Tauri debug `.app` / dmg 构建、签名修复、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理，生成 `release/test-release/macos/稿匣_0.1.2_测试包`，DMG SHA256 为 `39c6fefba3e09ab6e8e6c7b0d54354ed6ff7ed27d85ab77d0069550355cad597`。
+
+### 界面 smoke 设置页适配与重新打包
+
+- 修改摘要：模型设置页已有二级折叠区后，浏览器层 smoke 会先展开“知识检索模型”再检查“单独设置 Embedding”，并对“第二审查模型”标题使用精确匹配，避免把“启用第二审查模型”标签一起命中导致 strict mode 失败。
+- 影响范围：`scripts/verify-ui-smoke.mjs` 的设置页检查步骤；不改变模型配置保存、模型测试接口、前端设置页结构或桌面打包参数。
+- 验证结果：`npm run verify` 通过，404 个后端 unittest 通过，前端生产构建通过；`npm run verify:ui` 前两次暴露设置页折叠区和文本匹配问题，修正 smoke 后第三次通过；`npm run release:test:macos` 通过，完成 backend 回归、前端构建、Python sidecar 打包和健康检查、Tauri debug `.app` / dmg 构建、签名修复、应用内 sidecar 健康检查、`.app` 启动检查和测试包整理；`git diff --check` 通过。
+
+### 模型总览失败倒计时移除
+
+- 修改摘要：模型版故事总览失败后不再写入或返回 `retry_after`。作者手动打开架构总览或刷新模型总览时，会直接再次请求模型并返回真实错误；失败状态仍写入 `.gaoxia/story_overview_model_failure.json`，用于界面展示上次失败原因。全局模型状态行不再显示后台失败暂停秒数倒计时，设置项名称改为“后台失败暂停秒数”。
+- 影响范围：项目详情 `story_overview.model_overview` 状态、模型总览失败文件、架构总览状态展示、全局模型状态行、模型设置高级区、前端 `StoryOverview` 类型和相关说明文档；不改变模型总览缓存文件 `.gaoxia/story_overview_model.json`、整书架构生成、章节生成或后台辅助任务队列的通用重试机制。
+- 验证结果：`python3 -m py_compile backend/novel_backend/models.py backend/novel_backend/services/project_service.py` 通过；`PYTHONPATH=backend python3 -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_model_failure_is_reported_without_local_entities -v` 通过；`PYTHONPATH=backend python3 -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_without_model_cache_keeps_entities_empty backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_uses_validated_model_cache_for_all_sections backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_uses_primary_model_when_review_model_disabled backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_review_request_allows_model_overview backend.tests.test_project_service.ProjectServiceTestCase.test_refresh_story_overview_raises_when_no_model_cache_is_created backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_model_failure_is_reported_without_local_entities backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_model_reads_every_source_chunk backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_without_model_cache_does_not_backfill_main_character backend.tests.test_project_service.ProjectServiceTestCase.test_imported_source_material_without_model_cache_does_not_populate_graph -v` 通过，9 个用例通过；`npm run build` 通过，前端生产构建通过；`npm run verify` 通过，404 个后端 unittest 通过，前端生产构建通过；`git diff --check` 通过。`PYTHONPATH=backend python3 -m pytest backend/tests/test_project_service.py -k "story_overview"` 在 pytest 收集阶段超过 3 分钟没有输出，已停止并改用 unittest 验证。
+
+## 2026-06-06
+
+### 模型总览错误直报与配置测试
+
+- 修改摘要：按产品要求撤销架构总览的本地结构化抽取路径。架构总览的关系、事件和世界要素只来自 `.gaoxia/story_overview_model.json` 模型版总览；模型未配置、调用失败、返回非 JSON 或证据校验失败时，会写入失败状态并在打开架构总览时直接显示错误，不再从本地架构文件抽取人物、事件、地点、道具、技能或组织。模型设置页新增“测试当前配置”，使用当前表单值测试写作模型、知识检索模型和已启用的第二审查模型，不需要先保存配置。
+- 影响范围：项目详情 `story_overview` 数据结构、模型总览辅助任务错误处理、架构总览状态展示、模型配置 API 和模型设置页；不改变整书架构七步生成、章节正文生成、已有架构文件写回或模型总览缓存格式。
+- 验证结果：`PYTHONPATH=backend python3 -m pytest backend/tests/test_config_service.py backend/tests/test_project_service.py -k "model_config_test or story_overview"` 通过，10 个测试通过；`PYTHONPATH=backend python3 -m pytest backend/tests/test_config_service.py backend/tests/test_project_service.py` 通过，79 个测试通过；`npm run build` 通过，前端生产构建通过；本地浏览器打开 `http://127.0.0.1:1420/` 检查模型设置弹窗，确认“测试当前配置”按钮存在，后端不可用时按钮会恢复；`npm run verify` 通过，404 个后端 unittest 通过，前端生产构建通过；`git diff --check` 通过。
+
 ## 2026-06-05
+
+### 架构总览空白修复
+
+- 修改摘要：检查 `她刃` 2026-06-05 20:42-20:44 的生成记录后，确认整书架构七个步骤已完成并写入项目文件，但后续模型版架构总览辅助任务在 20:46 失败，导致默认“关系总览 / 世界要素”页签看起来没有内容。当时曾让模型总览不可用时从本地架构文件抽取基础人物、事件、地点、道具、技能和组织，避免架构已写回但总览默认页签空白；滚动摘要步骤如果模型返回截断的 JSON 外壳，会优先保存摘要正文，不再把坏 JSON 写进 `global_summary.txt`。本地结构化抽取路径已在 2026-06-06 撤销，当前行为以 2026-06-06 记录为准。
+- 影响范围：架构步骤结果解析、`global_summary.txt` 写回内容、当时的项目详情 `story_overview` 本地结构化抽取、架构总览默认页签、相关 backend 回归；不改变整书架构生成步骤、模型端点、辅助模型配置、章节正文生成或已有架构文件内容。
+- 验证结果：`PYTHONPATH=backend python3 -m pytest backend/tests/test_generation_service.py -k "architecture_step or global_summary"` 通过，5 个测试通过；`PYTHONPATH=backend python3 -m pytest backend/tests/test_project_service.py -k "story_overview"` 通过，7 个测试通过；`PYTHONPATH=backend python3 -m pytest backend/tests/test_generation_service.py backend/tests/test_project_service.py` 通过，85 个测试通过；`npm run verify` 通过，401 个后端 unittest 通过，前端生产构建通过；`git diff --check` 通过；用当前 `她刃` 项目数据读取 `get_project_detail(..., allow_model_overview=False)`，确认返回 7 个非空架构文件、8 个人物和章节事件；已把本次被截断的 `global_summary.txt` 修复为模型返回的摘要正文。
+
+### 模型设置简化与侧栏入口按钮调整
+
+- 修改摘要：AI 写作设置面向普通作者简化为常用模型预设、自定义接口、API Key 和篇幅能力，不再暴露温度这类采样输入；Embedding、第二审查模型、自动修订和运行调度改到高级区展开。后端把 `ModelConfig.temperature` 和 `ReviewModelConfig.temperature` 保留为旧配置兼容字段，新保存配置不再写入；聊天模型请求在传输层移除 `temperature / top_p`，避免部分 OpenAI-compatible 模型拒收不支持的可选采样项。作品列表顶部“旧稿 / 迁移包 / 新建”入口改为同宽三段工具条，避免按钮在侧栏里漂移或挤压。
+- 影响范围：模型设置页、配置保存载荷、模型请求传输层、第二审查模型调用、侧栏作品入口按钮、README、项目 Agent 指令、界面回归说明、测试反馈清单和桌面版方案文档；不改变模型服务商、接口地址、API Key 环境变量、Embedding 配置字段、章节生成流程或作品数据格式。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_model_transport_service backend.tests.test_config_service -v` 通过，15 个用例通过；`npm run verify` 通过，399 个后端 unittest 通过，前端生产构建通过；`npm run build` 通过；本地浏览器打开 `http://localhost:1421/` 检查模型设置弹窗，确认不再显示温度相关文字；本地浏览器检查作品列表入口按钮，确认三个按钮同为 92px 宽、32px 高，文字完整显示。
 
 ### 最近改动审查修复
 

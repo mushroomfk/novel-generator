@@ -21,15 +21,15 @@ class ModelConfig(BaseModel):
   api_key: str = ""
   model_name: str = "qwen3.6-plus"
   max_tokens: int = Field(default=8192, ge=256, le=64000)
-  temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+  temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
 class EmbeddingConfig(BaseModel):
-  provider: str = "aliyun-bailian"
-  base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  provider: str = "local-fastembed"
+  base_url: str = "builtin://bge-small-zh-v1.5"
   api_key: str = ""
-  model_name: str = "text-embedding-v4"
-  dimensions: int | None = Field(default=2048, ge=64, le=4096)
+  model_name: str = "BAAI/bge-small-zh-v1.5"
+  dimensions: int | None = Field(default=512, ge=64, le=4096)
   retrieval_k: int = Field(default=6, ge=1, le=20)
   batch_size: int = Field(default=8, ge=1, le=32)
 
@@ -41,7 +41,7 @@ class ReviewModelConfig(BaseModel):
   api_key: str = ""
   model_name: str = ""
   max_tokens: int = Field(default=1800, ge=256, le=16000)
-  temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+  temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
 class ChapterAutoRepairConfig(BaseModel):
@@ -76,6 +76,26 @@ class AppConfigUpdateRequest(BaseModel):
   review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
   chapter_auto_repair: ChapterAutoRepairConfig = Field(default_factory=ChapterAutoRepairConfig)
   model_runtime: ModelRuntimeConfig = Field(default_factory=ModelRuntimeConfig)
+
+
+class ModelConfigTestRequest(BaseModel):
+  target: str = Field(default="all", pattern="^(all|model|embedding|review_model)$")
+  model: ModelConfig = Field(default_factory=ModelConfig)
+  embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+  review_model: ReviewModelConfig = Field(default_factory=ReviewModelConfig)
+
+
+class ModelConfigTestItem(BaseModel):
+  target: str
+  label: str
+  status: str = Field(pattern="^(passed|failed|skipped)$")
+  message: str = ""
+  elapsed: float = 0.0
+
+
+class ModelConfigTestResult(BaseModel):
+  status: str = Field(default="skipped", pattern="^(passed|failed|partial|skipped)$")
+  items: list[ModelConfigTestItem] = Field(default_factory=list)
 
 
 class HealthPayload(BaseModel):
@@ -447,6 +467,14 @@ class ChapterReviewReport(BaseModel):
   is_stale: bool = False
 
 
+class StoryOverviewModelStatus(BaseModel):
+  status: str = Field(default="not_generated", pattern="^(ready|not_generated|disabled|failed|stale)$")
+  message: str = ""
+  generated_at: str = ""
+  failed_at: str = ""
+  error: str = ""
+
+
 class StoryOverview(BaseModel):
   documents: list[StoryDocument] = Field(default_factory=list)
   knowledge_hits: list[KnowledgeSearchResult] = Field(default_factory=list)
@@ -455,6 +483,7 @@ class StoryOverview(BaseModel):
   memory_entries: list[ProjectMemoryEntry] = Field(default_factory=list)
   dream_report: ProjectDreamReport | None = None
   distillation_report: ProjectDistillationReport | None = None
+  model_overview: StoryOverviewModelStatus = Field(default_factory=StoryOverviewModelStatus)
   characters: list[StoryCharacter] = Field(default_factory=list)
   events: list[StoryEntityReference] = Field(default_factory=list)
   locations: list[StoryEntityReference] = Field(default_factory=list)

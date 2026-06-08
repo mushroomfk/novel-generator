@@ -1144,7 +1144,7 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     time_constraint=payload.time_constraint,
     task_name_prefix="chapter_generate",
     candidate_count=3 if candidate_mode == "deep" else 1,
-    prefer_project_budget=True,
+    prefer_project_budget=payload.target_words <= 0,
     complete_chapter=payload.target_words <= 0,
   )
   return ChapterGenerateResult(

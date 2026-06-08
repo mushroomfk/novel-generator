@@ -57,6 +57,14 @@ const emptyOverview = Object.freeze({
   obsidian: null,
   memory_entries: [],
   dream_report: null,
+  model_overview: {
+    status: 'not_generated',
+    message: '',
+    generated_at: '',
+    failed_at: '',
+    error: '',
+  },
+  chapter_reviews: [],
   characters: [],
   events: [],
   locations: [],
@@ -67,6 +75,34 @@ const emptyOverview = Object.freeze({
 });
 
 const overview = computed(() => props.project?.story_overview ?? emptyOverview);
+const modelOverviewStatus = computed(() => overview.value.model_overview ?? emptyOverview.model_overview);
+const modelOverviewStatusLabel = computed(() => {
+  const status = modelOverviewStatus.value.status ?? 'not_generated';
+  if (status === 'ready') {
+    return '模型总览已生成';
+  }
+  if (status === 'failed') {
+    return '模型总览生成失败';
+  }
+  if (status === 'disabled') {
+    return '模型总览未配置';
+  }
+  if (status === 'stale') {
+    return '模型总览已过期';
+  }
+  return '模型总览未生成';
+});
+const modelOverviewMessage = computed(() => {
+  const status = modelOverviewStatus.value;
+  return status.message || status.error || '';
+});
+const modelOverviewIssueText = computed(() => {
+  const status = modelOverviewStatus.value.status ?? 'not_generated';
+  if (status === 'ready') {
+    return '';
+  }
+  return modelOverviewMessage.value || modelOverviewStatusLabel.value;
+});
 const selectedChapter = computed(() => {
   if (!props.selectedChapterId) {
     return null;
@@ -79,6 +115,11 @@ const materials = computed(() => overview.value.materials ?? []);
 const obsidian = computed(() => overview.value.obsidian ?? null);
 const obsidianNotes = computed(() => obsidian.value?.notes ?? []);
 const skills = computed(() => overview.value.skills ?? []);
+const chapterReviews = computed(() => (
+  [...(overview.value.chapter_reviews ?? [])].sort((left, right) => (
+    Number(left.chapter_index ?? 0) - Number(right.chapter_index ?? 0)
+  ))
+));
 const memoryEntries = computed(() => overview.value.memory_entries ?? []);
 const dreamReport = computed(() => overview.value.dream_report ?? null);
 const manualMemoryEntries = computed(() => (
@@ -240,6 +281,11 @@ const supportSummaryCards = computed(() => ([
     label: '项目记忆',
     compactLabel: '记忆',
     value: `${memoryEntries.value.length} 条`,
+  },
+  {
+    label: '章节核验',
+    compactLabel: '核验',
+    value: `${chapterReviews.value.length} 章`,
   },
 ]));
 
@@ -459,6 +505,27 @@ function formatConfidence(value) {
     return '0%';
   }
   return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}%`;
+}
+
+function chapterReviewStatusLabel(status) {
+  return {
+    good: '通过',
+    watch: '需关注',
+    risk: '高风险',
+    na: '未评估',
+  }[status] || status || '未评估';
+}
+
+function chapterReviewIssueLevelLabel(level) {
+  return {
+    critical: '严重',
+    warning: '提醒',
+    info: '提示',
+  }[level] || level || '提示';
+}
+
+function chapterReviewIssueCount(review) {
+  return (review.dimensions ?? []).reduce((sum, item) => sum + (item.issues?.length ?? 0), 0);
 }
 
 function formatTimelineLabel(entry) {
@@ -788,6 +855,17 @@ async function importKnowledge() {
         </div>
       </div>
 
+      <div
+        v-if="modelOverviewIssueText"
+        :class="[
+          'overview-model-status',
+          modelOverviewStatus.status === 'failed' ? 'overview-model-status-error' : '',
+        ]"
+      >
+        <strong>{{ modelOverviewStatusLabel }}</strong>
+        <span>{{ modelOverviewIssueText }}</span>
+      </div>
+
       <button
         class="overview-close"
         type="button"
@@ -845,6 +923,13 @@ async function importKnowledge() {
           项目记忆
         </button>
         <button
+          :class="['overview-tab', { 'overview-tab-active': activeTab === 'reviews' }]"
+          type="button"
+          @click="activeTab = 'reviews'"
+        >
+          章节核验
+        </button>
+        <button
           :class="['overview-tab', { 'overview-tab-active': activeTab === 'dream' }]"
           type="button"
           @click="activeTab = 'dream'"
@@ -888,7 +973,7 @@ async function importKnowledge() {
           v-if="characters.length === 0"
           class="empty-card"
         >
-          模型总览还没有生成，生成完成后这里会显示人物关系。
+          {{ modelOverviewIssueText || '模型总览还没有生成，生成完成后这里会显示人物关系。' }}
         </div>
       </aside>
 
@@ -1364,6 +1449,121 @@ async function importKnowledge() {
     </div>
 
     <div
+      v-else-if="activeTab === 'reviews'"
+      class="overview-body overview-body-reviews"
+      data-testid="story-overview-chapter-reviews"
+    >
+      <section class="review-shell">
+        <div class="memory-toolbar">
+          <div>
+            <p class="overview-kicker">章节核验</p>
+            <h4>查看每章的连续性、项目记忆和设定约束问题</h4>
+          </div>
+          <span class="document-filename">{{ chapterReviews.length }} 章有核验报告</span>
+        </div>
+
+        <article
+          v-for="review in chapterReviews"
+          :key="review.chapter_id"
+          class="document-card review-card"
+          :data-testid="`chapter-review-${review.chapter_id}`"
+        >
+          <div class="document-head">
+            <div>
+              <p class="overview-kicker">第 {{ review.chapter_index }} 章</p>
+              <h4>{{ review.chapter_title || '未命名章节' }}</h4>
+            </div>
+            <span>{{ formatDateTime(review.updated_at) }}</span>
+          </div>
+
+          <div class="review-score-row">
+            <span :class="['memory-tag', `review-status-${review.status || 'na'}`]">
+              {{ chapterReviewStatusLabel(review.status) }}
+            </span>
+            <strong>{{ review.overall_score }}/100</strong>
+            <span>{{ chapterReviewIssueCount(review) }} 个问题</span>
+            <span v-if="review.is_stale">报告已过期</span>
+          </div>
+
+          <p class="dream-summary">{{ review.summary || '暂无摘要。' }}</p>
+
+          <div
+            v-if="review.highlights?.length"
+            class="chip-row"
+          >
+            <span
+              v-for="item in review.highlights"
+              :key="`${review.chapter_id}-highlight-${item}`"
+              class="meta-chip meta-chip-accent"
+            >
+              {{ item }}
+            </span>
+          </div>
+
+          <ul
+            v-if="review.suggestions?.length"
+            class="plain-list review-suggestions"
+          >
+            <li
+              v-for="item in review.suggestions"
+              :key="`${review.chapter_id}-suggestion-${item}`"
+            >
+              {{ item }}
+            </li>
+          </ul>
+
+          <div class="review-dimension-grid">
+            <article
+              v-for="dimension in review.dimensions ?? []"
+              :key="`${review.chapter_id}-${dimension.id}`"
+              class="entity-card review-dimension-card"
+              :data-testid="dimension.id === 'project_memory' ? 'chapter-review-project-memory-dimension' : undefined"
+            >
+              <div class="knowledge-result-head">
+                <strong>{{ dimension.label }}</strong>
+                <span>{{ chapterReviewStatusLabel(dimension.status) }} · {{ dimension.score }}/100</span>
+              </div>
+              <p>{{ dimension.summary || '暂无摘要。' }}</p>
+
+              <div
+                v-if="dimension.highlights?.length"
+                class="chip-row"
+              >
+                <span
+                  v-for="item in dimension.highlights"
+                  :key="`${review.chapter_id}-${dimension.id}-highlight-${item}`"
+                  class="meta-chip"
+                >
+                  {{ item }}
+                </span>
+              </div>
+
+              <ul
+                v-if="dimension.issues?.length"
+                class="plain-list review-issue-list"
+              >
+                <li
+                  v-for="issue in dimension.issues"
+                  :key="`${review.chapter_id}-${dimension.id}-${issue.title}-${issue.detail}`"
+                >
+                  <strong>{{ chapterReviewIssueLevelLabel(issue.level) }}：{{ issue.title }}</strong>
+                  <p>{{ issue.detail }}</p>
+                </li>
+              </ul>
+            </article>
+          </div>
+        </article>
+
+        <div
+          v-if="chapterReviews.length === 0"
+          class="empty-card"
+        >
+          还没有章节核验报告。保存章节正文后会自动生成。
+        </div>
+      </section>
+    </div>
+
+    <div
       v-else-if="activeTab === 'dream'"
       class="overview-body overview-body-dream"
     >
@@ -1830,6 +2030,35 @@ async function importKnowledge() {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 14px;
+}
+
+.overview-model-status {
+  display: grid;
+  gap: 4px;
+  max-width: 520px;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  background: #f6f8fa;
+  padding: 10px 12px;
+  color: #4f5b66;
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.overview-model-status strong {
+  color: #1f2328;
+  font-size: 13px;
+}
+
+.overview-model-status-error {
+  border-color: #f4b4ad;
+  background: #fff4f2;
+  color: #9f2d20;
+}
+
+.overview-model-status-error strong {
+  color: #8c1d18;
 }
 
 .overview-title-line {
@@ -2320,6 +2549,11 @@ async function importKnowledge() {
   display: block;
 }
 
+.overview-body-reviews {
+  display: block;
+  overflow: auto;
+}
+
 .overview-body-dream {
   display: block;
 }
@@ -2348,6 +2582,71 @@ async function importKnowledge() {
   display: grid;
   gap: 12px;
   align-content: start;
+}
+
+.review-shell {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  min-width: 0;
+}
+
+.review-card {
+  display: grid;
+  gap: 12px;
+}
+
+.review-score-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #5c6675;
+  font-size: 13px;
+}
+
+.review-score-row strong {
+  color: #1f2328;
+  font-size: 18px;
+}
+
+.review-dimension-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.review-dimension-card {
+  align-content: start;
+}
+
+.review-suggestions,
+.review-issue-list {
+  margin: 0;
+}
+
+.review-issue-list p {
+  margin: 4px 0 0;
+  color: #4f5b66;
+  line-height: 1.6;
+}
+
+.review-status-good {
+  border-color: #bbf7d0;
+  background: #ecfdf5;
+  color: #166534;
+}
+
+.review-status-watch {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.review-status-risk {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
 }
 
 .dream-runner {
@@ -2603,6 +2902,7 @@ async function importKnowledge() {
   .overview-body-characters,
   .dream-grid,
   .overview-body-documents,
+  .review-dimension-grid,
   .knowledge-grid,
   .entity-grid,
   .overview-summary,

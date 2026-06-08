@@ -199,12 +199,21 @@ export interface ChapterReviewReport {
   is_stale: boolean;
 }
 
+export interface StoryOverviewModelStatus {
+  status: 'ready' | 'not_generated' | 'disabled' | 'failed' | 'stale' | string;
+  message: string;
+  generated_at: string;
+  failed_at: string;
+  error: string;
+}
+
 export interface StoryOverview {
   documents: StoryDocument[];
   knowledge_hits: KnowledgeSearchResult[];
   materials: KnowledgeMaterial[];
   memory_entries: ProjectMemoryEntry[];
   dream_report?: ProjectDreamReport | null;
+  model_overview: StoryOverviewModelStatus;
   characters: StoryCharacter[];
   events: StoryEntityReference[];
   locations: StoryEntityReference[];
@@ -271,7 +280,7 @@ export interface ModelConfig {
   api_key: string;
   model_name: string;
   max_tokens: number;
-  temperature: number;
+  temperature?: number | null;
 }
 
 export interface EmbeddingConfig {
@@ -291,7 +300,7 @@ export interface ReviewModelConfig {
   api_key: string;
   model_name: string;
   max_tokens: number;
-  temperature: number;
+  temperature?: number | null;
 }
 
 export interface ChapterAutoRepairConfig {

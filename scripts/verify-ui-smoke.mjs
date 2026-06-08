@@ -202,6 +202,28 @@ async function waitForProjectDocumentContent(backendUrl, projectId, documentKey,
   throw new Error(`等待文档内容超时：${projectId}/${documentKey}`);
 }
 
+async function waitForProjectChapterReviewText(backendUrl, projectId, chapterId, expectedText, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const intervalMs = options.intervalMs ?? 300;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const detail = await apiRequest(backendUrl, `/api/projects/${projectId}`);
+      const review = detail?.story_overview?.chapter_reviews?.find((item) => item.chapter_id === chapterId);
+      if (JSON.stringify(review ?? {}).includes(expectedText)) {
+        return;
+      }
+    } catch {
+      // ignore until timeout
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(`等待章节核验文本超时：${projectId}/${chapterId}`);
+}
+
 async function saveProjectChapterContent(backendUrl, projectId, chapterId, content) {
   await apiRequest(backendUrl, `/api/projects/${projectId}/chapters/${chapterId}`, {
     method: 'PUT',
@@ -224,6 +246,20 @@ async function waitForWorkspaceComposer(page) {
     const composer = document.querySelector('[data-testid="workspace-composer-input"]')
       ?? document.querySelector('[data-testid="architecture-composer-input"]');
     return composer instanceof HTMLTextAreaElement && composer.getClientRects().length > 0;
+  });
+}
+
+async function waitForWorkspaceComposerReady(page) {
+  await page.waitForFunction(() => {
+    const composer = document.querySelector('[data-testid="workspace-composer-input"]');
+    const submit = document.querySelector('.composer-submit-button');
+    return composer instanceof HTMLTextAreaElement
+      && composer.getClientRects().length > 0
+      && !composer.disabled
+      && submit instanceof HTMLButtonElement
+      && !submit.disabled
+      && submit.getAttribute('aria-label') === '发送'
+      && !submit.classList.contains('composer-submit-button-running');
   });
 }
 
@@ -940,6 +976,12 @@ async function seedProjectWorkflow(backendUrl, projectId) {
           category: '目标',
           content: '故事定为港口悬疑长篇。主角因为一把旧钥匙重新卷入失踪船队和家族旧账，前段先立住钥匙来源和追查压力，中段拆开家族与旧船队关系，后段让主角在真相和秩序之间做选择。',
         },
+        {
+          id: 'project-key-item-ownership',
+          title: '关键物品归属',
+          category: '硬规则',
+          content: '铜钥匙不能被交给白石商会。账册不能交给顾临。',
+        },
       ],
     }),
   });
@@ -1251,7 +1293,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await waitForChapterPreviewContent(page, token);
 
     log('检查 Agent 章节计划和执行');
-    await page.getByTestId('workspace-composer-input').waitFor();
+    await waitForWorkspaceComposerReady(page);
     await page.getByTestId('workspace-composer-input').fill('续写这一章，把追兵压近一点。');
     await page.locator('.composer-submit-button').click();
     await page.waitForFunction(() => {
@@ -1273,6 +1315,7 @@ async function runSmoke(previewUrl, backendUrl) {
     }
 
     log('检查当前第一章时生成第二章会写回第二章');
+    await waitForWorkspaceComposerReady(page);
     await page.getByTestId('workspace-composer-input').fill('参考第一章，生成第二章内容。');
     await page.locator('.composer-submit-button').click();
     await page.waitForFunction(() => {
@@ -1283,6 +1326,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002', { timeoutMs: 60000 });
 
     log('检查混合命令优先走架构');
+    await waitForWorkspaceComposerReady(page);
     await page.getByTestId('workspace-composer-input').fill('把资料库的资料分析完，再重新弄续写架构');
     await page.locator('.composer-submit-button').click();
     await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
@@ -1594,14 +1638,24 @@ async function runSmoke(previewUrl, backendUrl) {
     await waitForWorkspaceComposer(page);
 
     await page.getByTestId('open-settings-button').click();
-    await page.getByTestId('settings-modal').waitFor();
-    await page.getByTestId('settings-modal').locator('.accordion-summary').click();
-    await page.getByTestId('settings-modal').getByText('单独设置 Embedding').waitFor();
-    await page.getByTestId('settings-modal').getByLabel('单独设置 Embedding').check();
-    await page.getByTestId('settings-modal').getByText('Embedding 模型').waitFor();
-    await page.getByTestId('settings-modal').getByText('自学习审查模型').waitFor();
+    const settingsModal = page.getByTestId('settings-modal');
+    await settingsModal.waitFor();
+    await settingsModal.locator('.accordion-summary').click();
+    if (await settingsModal.getByText('知识检索模型').count()) {
+      throw new Error('设置页不应再显示知识检索模型配置入口');
+    }
+    if (await settingsModal.getByText('单独设置 Embedding').count()) {
+      throw new Error('设置页不应再显示单独设置 Embedding');
+    }
+    await settingsModal.getByText('第二审查模型', { exact: true }).waitFor();
+    await settingsModal.getByText('运行调度', { exact: true }).waitFor();
+    await page.mouse.click(16, 16);
+    await settingsModal.waitFor();
+    await settingsModal.locator('input').first().click();
     await page.keyboard.press('Escape');
-    await page.getByTestId('settings-modal').waitFor({ state: 'hidden' });
+    await settingsModal.waitFor();
+    await settingsModal.getByRole('button', { name: '关闭' }).click();
+    await settingsModal.waitFor({ state: 'hidden' });
     await page.getByTestId('new-conversation-button').click();
     await page.getByTestId('architecture-composer-input').waitFor();
 
@@ -1637,6 +1691,21 @@ async function runSmoke(previewUrl, backendUrl) {
       document.querySelectorAll('[data-testid^="agent-session-row-"]').length >= 2
     ));
 
+    log('检查章节核验项目记忆展示');
+    await saveProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-001',
+      '# 第一章\n林追把铜钥匙交给白石商会，又把账册交给顾临。\n',
+    );
+    await waitForProjectChapterReviewText(
+      backendUrl,
+      seededProject.id,
+      'chapter-001',
+      '铜钥匙 / 交给 / 白石商会',
+      { timeoutMs: 60000 },
+    );
+
     log('检查架构总览');
     await page.getByTestId('open-story-overview-button').click();
     await page.getByTestId('story-overview-modal').waitFor();
@@ -1651,6 +1720,12 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.locator('[data-overview-target="skills"]').waitFor();
     await page.getByRole('button', { name: '查看时间线' }).click();
     await page.getByTestId('story-overview-timeline').waitFor();
+    await page.getByTestId('story-overview-modal').getByRole('button', { name: '章节核验' }).click();
+    await page.getByTestId('story-overview-chapter-reviews').waitFor();
+    await page.getByTestId('chapter-review-project-memory-dimension').first().waitFor();
+    await page.getByTestId('story-overview-chapter-reviews').getByText('项目记忆规则').first().waitFor();
+    await page.getByTestId('story-overview-chapter-reviews').getByText('铜钥匙 / 交给 / 白石商会').first().waitFor();
+    await page.getByTestId('story-overview-chapter-reviews').getByText('账册 / 交给 / 顾临').first().waitFor();
     await page.getByTestId('story-overview-modal').getByRole('button', { name: '知识检索' }).click();
     await page.getByTestId('story-overview-obsidian').waitFor();
     await page
@@ -1660,6 +1735,19 @@ async function runSmoke(previewUrl, backendUrl) {
       .waitFor();
     await page.keyboard.press('Escape');
     await page.getByTestId('story-overview-modal').waitFor({ state: 'hidden' });
+    await saveProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-001',
+      `# 第一章\n主角擅长开锁，${token} 在灯塔下出现。潮声后面有人跟来。\n`,
+    );
+    await waitForProjectChapterContent(
+      backendUrl,
+      seededProject.id,
+      'chapter-001',
+      '潮声后面有人跟来',
+      { timeoutMs: 30000 },
+    );
     log('检查提示词方案');
     await page.getByTestId('open-skills-button').click();
     await page.getByTestId('skills-stage').waitFor();
@@ -1734,8 +1822,26 @@ async function runSmoke(previewUrl, backendUrl) {
     );
 
     log('检查项目迁移包导出导入');
-    await page.locator('.project-card-active').getByTestId('project-menu-trigger').click();
-    await page.getByTestId('project-export-migration-button').click();
+    if (await page.getByTestId('skills-stage').isVisible().catch(() => false)) {
+      await page.getByTestId('return-workspace-button').click();
+      await page.getByTestId('project-tools-trigger').waitFor();
+    }
+    const oldDraftClassName = await page.getByTestId('import-existing-novel-button').getAttribute('class');
+    if (oldDraftClassName?.includes('header-action-primary')) {
+      throw new Error('旧稿入口不应使用高亮底色');
+    }
+    const oldDraftTitle = await page.getByTestId('import-existing-novel-button').getAttribute('title');
+    if (!oldDraftTitle?.includes('.txt')) {
+      throw new Error('旧稿入口没有提示只支持 .txt 文件');
+    }
+    if (await page.getByTestId('import-project-button').count()) {
+      throw new Error('侧栏不应继续显示迁移包导入入口');
+    }
+    const projectToolsMenu = page.locator('.stage-tools-menu').first();
+    if (!(await projectToolsMenu.evaluate((node) => node instanceof HTMLDetailsElement && node.open).catch(() => false))) {
+      await page.getByTestId('project-tools-trigger').click();
+    }
+    await page.getByTestId('project-migration-export-button').click();
     const migrationExportNotice = page.locator('.notice-banner').filter({ hasText: '迁移包已导出' }).first();
     await migrationExportNotice.waitFor({ timeout: 20000 });
     const migrationExportText = await migrationExportNotice.textContent();
@@ -1744,7 +1850,15 @@ async function runSmoke(previewUrl, backendUrl) {
       throw new Error(`没有从迁移包导出提示中读取到路径：${migrationExportText ?? ''}`);
     }
     await access(migrationPackagePath);
-    await page.getByTestId('project-migration-file-input').setInputFiles(migrationPackagePath);
+    const migrationImportButton = page.getByTestId('project-migration-import-button');
+    if (!(await migrationImportButton.isVisible().catch(() => false))) {
+      if (!(await projectToolsMenu.evaluate((node) => node instanceof HTMLDetailsElement && node.open).catch(() => false))) {
+        await page.getByTestId('project-tools-trigger').click();
+      }
+    }
+    const migrationFileChooser = page.waitForEvent('filechooser');
+    await migrationImportButton.click();
+    await (await migrationFileChooser).setFiles(migrationPackagePath);
     await page.getByText(`已导入《${projectNameSecondRenamed}》`).waitFor({ timeout: 30000 });
     const projectsAfterMigration = await apiRequest(backendUrl, '/api/projects');
     const importedProject = projectsAfterMigration

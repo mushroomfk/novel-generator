@@ -1,6 +1,6 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue';
-import { updateModelConfig } from '../lib/api.js';
+import { testModelConfig, updateModelConfig } from '../lib/api.js';
 
 const MODEL_PRESETS = [
   {
@@ -23,6 +23,23 @@ const MODEL_PRESETS = [
   },
 ];
 
+const TOKEN_BUDGET_PRESETS = [
+  { value: 4096, label: '普通章节', helper: '适合短任务、资料整理和普通章节续写。' },
+  { value: 8192, label: '长章节', helper: '适合多数长篇章节生成。' },
+  { value: 16000, label: '超长章节', helper: '适合长上下文、批量续写和复杂修订。' },
+  { value: 24000, label: '大纲到正文', helper: '适合一次携带大量设定和章节证据。' },
+];
+
+const LOCAL_EMBEDDING_CONFIG = {
+  provider: 'local-fastembed',
+  base_url: 'builtin://bge-small-zh-v1.5',
+  api_key: '',
+  model_name: 'BAAI/bge-small-zh-v1.5',
+  dimensions: 512,
+  retrieval_k: 6,
+  batch_size: 8,
+};
+
 const props = defineProps({
   config: {
     type: Object,
@@ -39,16 +56,6 @@ const form = reactive({
     api_key: '',
     model_name: 'qwen3.6-plus',
     max_tokens: 8192,
-    temperature: 0.8,
-  },
-  embedding: {
-    provider: 'aliyun-bailian',
-    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    api_key: '',
-    model_name: 'text-embedding-v4',
-    dimensions: '',
-    retrieval_k: 6,
-    batch_size: 8,
   },
   review_model: {
     enabled: false,
@@ -57,7 +64,6 @@ const form = reactive({
     api_key: '',
     model_name: '',
     max_tokens: 1800,
-    temperature: 0.2,
   },
   chapter_auto_repair: {
     enabled: true,
@@ -77,84 +83,14 @@ const form = reactive({
 });
 
 const isSaving = ref(false);
+const isTesting = ref(false);
 const message = ref('');
-const customEmbeddingEnabled = ref(false);
+const messageTone = ref('');
 
-function inferModelFamily(model) {
-  const baseUrl = String(model?.base_url ?? '').trim().toLowerCase();
-  const modelName = String(model?.model_name ?? '').trim().toLowerCase();
-
-  if (baseUrl.includes('dashscope.aliyuncs.com')) {
-    return 'aliyun';
-  }
-  if (baseUrl.includes('ark.cn-beijing.volces.com')) {
-    return 'volcengine';
-  }
-  if (baseUrl.includes('api.openai.com')) {
-    return 'openai-compatible';
-  }
-
-  if (modelName.startsWith('qwen')) {
-    return 'aliyun';
-  }
-  if (modelName.startsWith('doubao-')) {
-    return 'volcengine';
-  }
-  if (modelName.startsWith('gpt-') || modelName.startsWith('text-embedding-')) {
-    return 'openai-compatible';
-  }
-
-  return '';
-}
-
-function inferEmbeddingConfig(model, fallback) {
-  const family = inferModelFamily(model);
-  const apiKey = String(model?.api_key ?? '').trim() || String(fallback?.api_key ?? '').trim();
-
-  if (family === 'aliyun') {
-    return {
-      provider: 'aliyun-bailian',
-      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-      api_key: apiKey,
-      model_name: 'text-embedding-v4',
-      dimensions: 2048,
-      retrieval_k: fallback?.retrieval_k ?? 6,
-      batch_size: fallback?.batch_size ?? 8,
-    };
-  }
-
-  if (family === 'volcengine') {
-    return {
-      provider: 'volcengine-ark',
-      base_url: 'https://ark.cn-beijing.volces.com/api/coding/v3',
-      api_key: apiKey,
-      model_name: 'doubao-embedding-vision',
-      dimensions: null,
-      retrieval_k: fallback?.retrieval_k ?? 6,
-      batch_size: fallback?.batch_size ?? 8,
-    };
-  }
-
-  if (family === 'openai-compatible') {
-    return {
-      provider: 'openai-compatible',
-      base_url: String(model?.base_url ?? '').trim() || 'https://api.openai.com/v1',
-      api_key: apiKey,
-      model_name: 'text-embedding-3-small',
-      dimensions: null,
-      retrieval_k: fallback?.retrieval_k ?? 6,
-      batch_size: fallback?.batch_size ?? 8,
-    };
-  }
-
-  return {
-    ...fallback,
-    dimensions: fallback?.dimensions ?? null,
-  };
-}
-
-const autoEmbeddingFamily = computed(() => inferModelFamily(form.model));
-const autoEmbeddingConfig = computed(() => inferEmbeddingConfig(form.model, form.embedding));
+const selectedTokenPreset = computed(() => (
+  TOKEN_BUDGET_PRESETS.find((item) => item.value === Number(form.model.max_tokens))
+  ?? TOKEN_BUDGET_PRESETS[1]
+));
 
 function normalizeDimensions(value) {
   if (value === '' || value === null || value === undefined) {
@@ -173,20 +109,6 @@ function normalizeEmbeddingPayload(embedding) {
   };
 }
 
-function sameEmbeddingConfig(left, right) {
-  const normalizedLeft = normalizeEmbeddingPayload(left ?? {});
-  const normalizedRight = normalizeEmbeddingPayload(right ?? {});
-  return [
-    'provider',
-    'base_url',
-    'api_key',
-    'model_name',
-    'dimensions',
-    'retrieval_k',
-    'batch_size',
-  ].every((key) => String(normalizedLeft[key] ?? '') === String(normalizedRight[key] ?? ''));
-}
-
 watch(
   () => props.config,
   (nextConfig) => {
@@ -195,11 +117,6 @@ watch(
     }
 
     Object.assign(form.model, nextConfig.model ?? {});
-    Object.assign(form.embedding, {
-      ...form.embedding,
-      ...(nextConfig.embedding ?? {}),
-      dimensions: nextConfig.embedding?.dimensions ?? '',
-    });
     Object.assign(form.review_model, {
       ...form.review_model,
       ...(nextConfig.review_model ?? {}),
@@ -212,10 +129,6 @@ watch(
       ...form.model_runtime,
       ...(nextConfig.model_runtime ?? {}),
     });
-    customEmbeddingEnabled.value = !sameEmbeddingConfig(
-      form.embedding,
-      inferEmbeddingConfig(form.model, form.embedding),
-    );
   },
   { immediate: true },
 );
@@ -225,27 +138,81 @@ function applyModelPreset(preset) {
     ...form.model,
     ...preset.config,
   });
-  message.value = `已填入 ${preset.label} 整套预设，知识检索会自动跟随。`;
+  message.value = `已填入 ${preset.label} 预设，知识检索使用内置本地模型。`;
+}
+
+function modelPayloadFromForm() {
+  return {
+    provider: form.model.provider,
+    base_url: form.model.base_url,
+    api_key: form.model.api_key,
+    model_name: form.model.model_name,
+    max_tokens: Number(form.model.max_tokens) || 8192,
+  };
+}
+
+function reviewModelPayloadFromForm() {
+  return {
+    enabled: Boolean(form.review_model.enabled),
+    provider: form.review_model.provider,
+    base_url: form.review_model.base_url,
+    api_key: form.review_model.api_key,
+    model_name: form.review_model.model_name,
+    max_tokens: Number(form.review_model.max_tokens) || 1800,
+  };
+}
+
+function settingsPayloadFromForm() {
+  return {
+    model: modelPayloadFromForm(),
+    embedding: normalizeEmbeddingPayload(LOCAL_EMBEDDING_CONFIG),
+    review_model: reviewModelPayloadFromForm(),
+    chapter_auto_repair: { ...form.chapter_auto_repair },
+    model_runtime: { ...form.model_runtime },
+  };
+}
+
+function testItemText(item) {
+  const statusText = item.status === 'passed'
+    ? '通过'
+    : item.status === 'skipped'
+      ? '跳过'
+      : '失败';
+  return `${item.label} ${statusText}${item.message ? `：${item.message}` : ''}`;
+}
+
+async function testCurrentConfig() {
+  isTesting.value = true;
+  message.value = '';
+  messageTone.value = '';
+
+  try {
+    const result = await testModelConfig({
+      ...settingsPayloadFromForm(),
+      target: 'all',
+    });
+    messageTone.value = result.status === 'passed' ? 'success' : result.status === 'skipped' ? '' : 'error';
+    message.value = (result.items ?? []).map(testItemText).join('；') || '没有可测试的模型配置';
+  } catch (error) {
+    messageTone.value = 'error';
+    message.value = error instanceof Error ? error.message : '模型配置测试失败';
+  } finally {
+    isTesting.value = false;
+  }
 }
 
 async function save() {
   isSaving.value = true;
   message.value = '';
+  messageTone.value = '';
 
   try {
-    const embeddingPayload = customEmbeddingEnabled.value
-      ? normalizeEmbeddingPayload(form.embedding)
-      : normalizeEmbeddingPayload(autoEmbeddingConfig.value);
-    await updateModelConfig({
-      model: { ...form.model },
-      embedding: embeddingPayload,
-      review_model: { ...form.review_model },
-      chapter_auto_repair: { ...form.chapter_auto_repair },
-      model_runtime: { ...form.model_runtime },
-    });
+    await updateModelConfig(settingsPayloadFromForm());
     message.value = '写作设置已保存';
+    messageTone.value = 'success';
     emit('updated');
   } catch (error) {
+    messageTone.value = 'error';
     message.value =
       error instanceof Error ? error.message : '保存写作设置失败';
   } finally {
@@ -259,9 +226,9 @@ async function save() {
     <details class="settings-accordion">
       <summary class="accordion-summary">
         <div class="accordion-copy">
-          <p class="accordion-label">高级设置</p>
+          <p class="accordion-label">模型设置</p>
           <h3>{{ form.model.model_name }}</h3>
-          <p class="accordion-helper">{{ form.model.provider }} · 知识检索会自动跟随当前服务商</p>
+          <p class="accordion-helper">{{ form.model.provider }} · 知识检索可用内置本地模型</p>
         </div>
       </summary>
 
@@ -311,132 +278,31 @@ async function save() {
             placeholder="留空则走环境变量"
             type="password"
           />
-          <small class="field-helper">保存在本机配置里；留空时 backend 会回退到 `NOVEL_MODEL_API_KEY`、`DASHSCOPE_API_KEY`、`ARK_API_KEY` 等环境变量。</small>
+          <small class="field-helper">保存在本机配置里；留空时读取 `NOVEL_MODEL_API_KEY`、`DASHSCOPE_API_KEY`、`ARK_API_KEY` 等环境变量。</small>
         </label>
 
-        <div class="grid two-columns">
-          <label>
-            <span>单次回复长度</span>
-            <input
-              v-model.number="form.model.max_tokens"
-              min="256"
-              max="64000"
-              step="256"
-              type="number"
-            />
-          </label>
-
-          <label>
-            <span>创意发散度</span>
-            <input
-              v-model.number="form.model.temperature"
-              min="0"
-              max="2"
-              step="0.1"
-              type="number"
-            />
-          </label>
-        </div>
-
-        <div class="section-label">
-          Embedding / RAG
-        </div>
-        <label class="checkbox-field">
-          <input
-            v-model="customEmbeddingEnabled"
-            type="checkbox"
-          />
-          单独设置 Embedding
+        <label>
+          <span>篇幅能力</span>
+          <select v-model.number="form.model.max_tokens">
+            <option
+              v-for="preset in TOKEN_BUDGET_PRESETS"
+              :key="preset.value"
+              :value="preset.value"
+            >
+              {{ preset.label }}
+            </option>
+          </select>
+          <small class="field-helper">{{ selectedTokenPreset.helper }}</small>
         </label>
-        <div class="auto-panel">
-          <p class="auto-title">
-            {{ customEmbeddingEnabled ? form.embedding.model_name : autoEmbeddingConfig.model_name }}
-          </p>
-          <p class="auto-copy">
-            {{
-              customEmbeddingEnabled
-                ? '知识检索会使用下面单独填写的 Embedding 配置。'
-                : autoEmbeddingFamily === 'aliyun'
-                  ? '当前默认使用阿里的 Embedding 配置。'
-                  : autoEmbeddingFamily === 'volcengine'
-                    ? '当前默认使用豆包的 Embedding 配置。'
-                    : autoEmbeddingFamily === 'openai-compatible'
-                      ? '当前默认使用 OpenAI-compatible 的 Embedding 配置。'
-                      : '当前服务商没有命中内置整套预设，会沿用现有 Embedding 配置。'
-            }}
-          </p>
-          <p class="auto-copy">服务商：{{ customEmbeddingEnabled ? form.embedding.provider : autoEmbeddingConfig.provider }}</p>
-          <p class="auto-copy">接口地址：{{ customEmbeddingEnabled ? form.embedding.base_url : autoEmbeddingConfig.base_url }}</p>
-          <p class="field-helper">默认跟随当前写作模型；勾选后可以为知识检索填写独立模型、接口地址和 API Key。</p>
-        </div>
-        <div
-          v-if="customEmbeddingEnabled"
-          class="embedding-fields"
-        >
-          <div class="grid two-columns">
-            <label>
-              <span>Embedding 服务商</span>
-              <input v-model="form.embedding.provider" />
-            </label>
 
-            <label>
-              <span>Embedding 模型</span>
-              <input v-model="form.embedding.model_name" />
-            </label>
-          </div>
-
-          <label>
-            <span>Embedding 接口地址</span>
-            <input v-model="form.embedding.base_url" />
-          </label>
-
-          <label>
-            <span>Embedding API Key</span>
-            <input
-              v-model="form.embedding.api_key"
-              autocomplete="off"
-              placeholder="留空则走环境变量"
-              type="password"
-            />
-          </label>
-
-          <div class="grid three-columns">
-            <label>
-              <span>向量维度</span>
-              <input
-                v-model="form.embedding.dimensions"
-                min="64"
-                max="4096"
-                placeholder="留空则不传"
-                type="number"
-              />
-            </label>
-
-            <label>
-              <span>检索数量</span>
-              <input
-                v-model.number="form.embedding.retrieval_k"
-                min="1"
-                max="20"
-                type="number"
-              />
-            </label>
-
-            <label>
-              <span>批量大小</span>
-              <input
-                v-model.number="form.embedding.batch_size"
-                min="1"
-                max="32"
-                type="number"
-              />
-            </label>
-          </div>
+        <div class="auto-panel smart-panel">
+          <p class="auto-title">智能参数</p>
+          <p class="auto-copy">写作风格参数由系统处理，避免部分模型因为不支持附加项而报错。</p>
         </div>
 
-        <div class="section-label">
-          自学习审查模型
-        </div>
+        <details class="advanced-group">
+          <summary>第二审查模型</summary>
+          <div class="advanced-body">
         <label class="checkbox-field">
           <input
             v-model="form.review_model.enabled"
@@ -444,6 +310,10 @@ async function save() {
           />
           启用第二审查模型
         </label>
+        <div
+          v-if="form.review_model.enabled"
+          class="review-fields"
+        >
         <div class="grid two-columns">
           <label>
             <span>服务商标识</span>
@@ -472,34 +342,15 @@ async function save() {
             placeholder="留空则走 NOVEL_REVIEW_MODEL_API_KEY"
             type="password"
           />
-          <small class="field-helper">环境变量 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 的优先级高于这里保存的配置。</small>
+          <small class="field-helper">环境变量 `NOVEL_REVIEW_MODEL_API_KEY`、`NOVEL_REVIEW_MODEL_BASE_URL`、`NOVEL_REVIEW_MODEL_NAME` 的优先级更高。</small>
         </label>
-        <div class="grid two-columns">
-          <label>
-            <span>审查回复长度</span>
-            <input
-              v-model.number="form.review_model.max_tokens"
-              min="256"
-              max="16000"
-              step="256"
-              type="number"
-            />
-          </label>
-          <label>
-            <span>审查温度</span>
-            <input
-              v-model.number="form.review_model.temperature"
-              min="0"
-              max="2"
-              step="0.1"
-              type="number"
-            />
-          </label>
         </div>
+          </div>
+        </details>
 
-        <div class="section-label">
-          章节核验自动修订
-        </div>
+        <details class="advanced-group">
+          <summary>自动修订</summary>
+          <div class="advanced-body">
         <label class="switch-row">
           <input
             v-model="form.chapter_auto_repair.enabled"
@@ -530,11 +381,13 @@ async function save() {
             />
           </label>
         </div>
-        <small class="field-helper">状态为 risk 会直接触发；其他状态低于触发分数时触发。建议最多 1 到 2 轮，避免正文偏离原章节目标。</small>
+        <small class="field-helper">状态为 risk 会直接触发；其他状态低于触发分数时触发。</small>
+          </div>
+        </details>
 
-        <div class="section-label">
-          模型运行调度
-        </div>
+        <details class="advanced-group">
+          <summary>运行调度</summary>
+          <div class="advanced-body">
         <div class="grid two-columns">
           <label>
             <span>主模型并发</span>
@@ -576,7 +429,7 @@ async function save() {
           </label>
 
           <label>
-            <span>失败冷却秒数</span>
+            <span>后台失败暂停秒数</span>
             <input
               v-model.number="form.model_runtime.provider_cooldown_seconds"
               min="0"
@@ -613,21 +466,34 @@ async function save() {
             type="number"
           />
         </label>
-        <small class="field-helper">默认主模型和检索都设为 1；章节候选设为标准时会避免一次续写放大成多路模型请求。</small>
+        <small class="field-helper">并发过高可能触发供应商限流。</small>
+          </div>
+        </details>
 
         <p
           v-if="message"
-          class="message"
+          :class="['message', messageTone ? `message-${messageTone}` : '']"
         >
           {{ message }}
         </p>
 
-        <button
-          :disabled="isSaving"
-          type="submit"
-        >
-          {{ isSaving ? '保存中…' : '保存写作设置' }}
-        </button>
+        <div class="form-actions">
+          <button
+            class="secondary-action"
+            :disabled="isSaving || isTesting"
+            type="button"
+            @click="testCurrentConfig"
+          >
+            {{ isTesting ? '测试中…' : '测试当前配置' }}
+          </button>
+
+          <button
+            :disabled="isSaving || isTesting"
+            type="submit"
+          >
+            {{ isSaving ? '保存中…' : '保存写作设置' }}
+          </button>
+        </div>
       </form>
     </details>
   </section>
@@ -772,9 +638,13 @@ label > span {
   display: grid;
   gap: 6px;
   border: 1px solid #dce6f4;
-  border-radius: 16px;
+  border-radius: 8px;
   background: #f8fbff;
   padding: 14px;
+}
+
+.smart-panel {
+  background: #f6f8fa;
 }
 
 .auto-title {
@@ -791,9 +661,45 @@ label > span {
   line-height: 1.6;
 }
 
-.embedding-fields {
+.review-fields {
   display: grid;
   gap: 14px;
+}
+
+.advanced-group {
+  border: 1px solid #dce6f4;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.advanced-group summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: #1f2328;
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.advanced-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-group summary::after {
+  content: '+';
+  float: right;
+  color: #57606a;
+}
+
+.advanced-group[open] summary::after {
+  content: '-';
+}
+
+.advanced-body {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid #dce6f4;
+  padding: 14px;
 }
 
 input,
@@ -824,6 +730,16 @@ select {
   margin: 0;
   color: #57606a;
   font-size: 13px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.message-success {
+  color: #166534;
+}
+
+.message-error {
+  color: #b42318;
 }
 
 .preset-button {
@@ -844,6 +760,27 @@ button {
   font-weight: 700;
   cursor: pointer;
   font-size: 13px;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.form-actions button {
+  min-width: 128px;
+}
+
+.secondary-action {
+  border: 1px solid #d0d7de;
+  background: #f6f8fa;
+  color: #1f2328;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.65;
 }
 
 @media (max-width: 720px) {

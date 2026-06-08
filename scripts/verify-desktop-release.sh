@@ -42,15 +42,26 @@ smoke_backend_binary() {
   local data_dir
   local log_file
   local pid
+  local status
+  local embedding_payload
+  local embedding_result
 
   port="$(free_port)"
   data_dir="$(mktemp -d /tmp/novel-backend-smoke.XXXXXX)"
   log_file="$BUILD_LOG_DIR/${label}.log"
+  embedding_payload='{"target":"embedding","embedding":{"provider":"local-fastembed","base_url":"builtin://bge-small-zh-v1.5","api_key":"","model_name":"BAAI/bge-small-zh-v1.5","dimensions":512,"retrieval_k":6,"batch_size":8}}'
 
   "$binary" --host 127.0.0.1 --port "$port" --data-dir "$data_dir" >"$log_file" 2>&1 &
   pid=$!
 
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 240); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || status=$?
+      echo "${label} 启动前退出，退出码: ${status:-0}" >&2
+      cat "$log_file" >&2 || true
+      rm -rf "$data_dir"
+      exit 1
+    fi
     if curl -fsS "http://127.0.0.1:${port}/api/app/health" >"$BUILD_LOG_DIR/${label}-health.json" 2>/dev/null; then
       break
     fi
@@ -64,6 +75,29 @@ smoke_backend_binary() {
     wait "$pid" 2>/dev/null || true
     exit 1
   fi
+
+  embedding_result="$BUILD_LOG_DIR/${label}-embedding.json"
+  if ! curl -fsS -H 'Content-Type: application/json' -d "$embedding_payload" "http://127.0.0.1:${port}/api/config/test" >"$embedding_result" 2>/dev/null; then
+    echo "${label} 本地 Embedding 测试请求失败" >&2
+    cat "$log_file" >&2 || true
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    exit 1
+  fi
+
+  python3 - "$embedding_result" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+payload = json.loads(open(path, encoding="utf-8").read())
+data = payload.get("data") or {}
+items = data.get("items") or []
+item = items[0] if items else {}
+message = item.get("message", "")
+if data.get("status") != "passed" or item.get("status") != "passed" or "512" not in message:
+    raise SystemExit(f"本地 Embedding 测试未通过: {json.dumps(payload, ensure_ascii=False)}")
+PY
 
   curl -fsS -X POST -H 'Content-Type: application/json' -d '{}' "http://127.0.0.1:${port}/api/app/shutdown" >/dev/null
   wait "$pid" 2>/dev/null || status=$?
@@ -157,6 +191,9 @@ smoke_app_launch() {
   wait "$pid" 2>/dev/null || true
   kill_app_bundle_sidecars
 }
+
+log "检查打包配置"
+(cd "$ROOT_DIR" && npm run verify:packaging-static)
 
 log "运行 backend 回归"
 (cd "$ROOT_DIR" && npm run backend:test)

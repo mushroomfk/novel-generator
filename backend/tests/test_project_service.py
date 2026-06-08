@@ -140,11 +140,15 @@ class ProjectServiceTestCase(unittest.TestCase):
     chapter_path.parent.mkdir(parents=True, exist_ok=True)
     chapter_path.write_text(content, encoding="utf-8")
 
-  def test_story_overview_without_model_cache_does_not_extract_graph(self) -> None:
-    summary = self.create_demo_project("无模型总览")
+  def test_story_overview_without_model_cache_keeps_entities_empty(self) -> None:
+    summary = self.create_demo_project("本地总览")
     project_dir = Path(summary.path)
     (project_dir / "character_design.txt").write_text(
-      "林追：港口里最会追线索的人，擅长开锁，习惯在黑夜里行动。\n",
+      "林追：港口里最会追线索的人，擅长开锁，隶属白石商会。\n苏青：掌握旧账本，和林追一起追查潮汐航线。\n",
+      encoding="utf-8",
+    )
+    (project_dir / "blueprint.txt").write_text(
+      "雨夜靠港：\nchapter：1\ngoal：林追在旧码头仓库用开锁技巧打开铁门，找到一把铜钥匙，随后闯进白石商会。\n",
       encoding="utf-8",
     )
     self.write_chapter(
@@ -153,10 +157,23 @@ class ProjectServiceTestCase(unittest.TestCase):
       "# 第一章 雨夜靠港\n林追在旧码头仓库用开锁技巧打开铁门，找到一把铜钥匙，随后闯进白石商会。\n",
     )
 
-    detail = get_project_detail(self.settings, summary.id)
+    with patch.dict(
+      os.environ,
+      {
+        "NOVEL_MODEL_API_KEY": "",
+        "DASHSCOPE_API_KEY": "",
+        "ARK_API_KEY": "",
+        "NOVEL_API_KEY": "",
+        "OPENAI_API_KEY": "",
+        "NOVEL_REVIEW_MODEL_API_KEY": "",
+        "NOVEL_AUXILIARY_MODEL_API_KEY": "",
+      },
+    ):
+      detail = get_project_detail(self.settings, summary.id)
 
     documents = {item.key: item.content for item in detail.story_overview.documents}
     self.assertIn("林追", documents["character_design"])
+    self.assertEqual(detail.story_overview.model_overview.status, "disabled")
     self.assertEqual(detail.story_overview.characters, [])
     self.assertEqual(detail.story_overview.events, [])
     self.assertEqual(detail.story_overview.locations, [])
@@ -413,6 +430,74 @@ class ProjectServiceTestCase(unittest.TestCase):
         refresh_project_model_story_overview(self.settings, summary.id, force=True)
 
     self.assertFalse((Path(summary.path) / ".gaoxia" / "story_overview_model.json").exists())
+
+  def test_story_overview_model_failure_is_reported_without_local_entities(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(),
+        review_model=ReviewModelConfig(
+          enabled=True,
+          api_key="bad-key",
+          base_url="https://model.local/v1",
+          model_name="overview-model",
+        ),
+      ),
+    )
+    summary = self.create_demo_project("模型失败总览")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林晚：发布会现场被公开羞辱，陈小雨拿走证据账本。",
+      encoding="utf-8",
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      side_effect=RuntimeError("模型请求失败: 401 invalid_api_key"),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "模型总览生成失败.*invalid_api_key"):
+        get_project_detail(self.settings, summary.id, review_characters=True)
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    self.assertEqual(detail.story_overview.model_overview.status, "failed")
+    self.assertIn("invalid_api_key", detail.story_overview.model_overview.message)
+    self.assertNotIn("retry_after", detail.story_overview.model_overview.model_dump())
+    self.assertEqual(detail.story_overview.characters, [])
+    self.assertEqual(detail.story_overview.events, [])
+    self.assertFalse((project_dir / ".gaoxia" / "story_overview_model.json").exists())
+    failure_path = project_dir / ".gaoxia" / "story_overview_model_failure.json"
+    failure_payload = json.loads(failure_path.read_text(encoding="utf-8"))
+    self.assertNotIn("retry_after", failure_payload)
+
+    model_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "林晚",
+            "current_state": "在发布会现场被当众羞辱。",
+            "evidence": ["林晚：发布会现场被公开羞辱"],
+          }
+        ],
+        "events": [],
+        "locations": [],
+        "props": [],
+        "skills": [],
+        "scenes": [],
+        "organizations": [],
+      },
+      ensure_ascii=False,
+    )
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": model_content}}]},
+    ) as retried_request:
+      retried_detail = get_project_detail(self.settings, summary.id, review_characters=True)
+
+    self.assertEqual(retried_request.call_count, 1)
+    self.assertEqual(retried_detail.story_overview.model_overview.status, "ready")
+    self.assertIn("林晚", [item.name for item in retried_detail.story_overview.characters])
+    self.assertFalse(failure_path.exists())
 
   def test_story_overview_model_reads_every_source_chunk(self) -> None:
     save_config(
@@ -1061,6 +1146,226 @@ foreshadows:
     self.assertIn("共享连续性证据", continuity_dimension.summary)
     self.assertTrue(any("手动记忆" in item for item in continuity_dimension.highlights))
 
+  def test_chapter_review_catches_project_memory_forbidden_rules(self) -> None:
+    summary = self.create_demo_project("项目记忆核验")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="警告",
+            title="别提前揭底",
+            content="不要提前揭示沈砚就是主谋。不要把林澈改名为林追。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n林追打开密押日志，顾临低声说沈砚就是主谋。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    memory_dimension = next(item for item in review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("触犯项目记忆警告：别提前揭底" in item.title for item in memory_dimension.issues))
+    self.assertTrue(any("沈砚" in item.detail and "主谋" in item.detail for item in memory_dimension.issues))
+    self.assertTrue(any("林追" in item.detail for item in memory_dimension.issues))
+
+    review_status = summarize_chapter_review_status(detail, "chapter-001")
+    self.assertGreaterEqual(review_status["critical_issue_count"], 1)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+  def test_chapter_review_catches_project_memory_reveal_rule_with_subject_before_marker(self) -> None:
+    summary = self.create_demo_project("项目记忆主谋核验")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="沈砚真相暂缓",
+            content="沈砚不能被提前揭示为主谋。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临翻开密押日志，终于确认主谋是沈砚。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    memory_dimension = next(item for item in review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("沈砚真相暂缓" in item.title for item in memory_dimension.issues))
+    self.assertTrue(any("沈砚 / 主谋" in item.detail for item in memory_dimension.issues))
+    self.assertFalse(any("沈砚就" in item.detail for item in memory_dimension.issues))
+
+  def test_chapter_review_catches_project_memory_custom_identity_reveal_rules(self) -> None:
+    summary = self.create_demo_project("项目记忆身份核验")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="隐藏身份暂缓",
+            content="林追不能被提前揭示为卧底。苏青不能提前暴露为潮师。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临翻开旧船队档案，确认卧底是林追，苏青则是潮师。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    memory_dimension = next(item for item in review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("林追 / 卧底" in item.detail for item in memory_dimension.issues))
+    self.assertTrue(any("苏青 / 潮师" in item.detail for item in memory_dimension.issues))
+
+    safe_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临翻开旧船队档案，确认林追并不是卧底，苏青没有暴露为潮师。\n"),
+    )
+    safe_review = next(item for item in safe_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    safe_memory_dimension = next(item for item in safe_review.dimensions if item.id == "project_memory")
+    self.assertNotEqual(safe_memory_dimension.status, "risk")
+    self.assertFalse(safe_memory_dimension.issues)
+
+  def test_chapter_review_catches_project_memory_transfer_rules(self) -> None:
+    summary = self.create_demo_project("项目记忆物品归属核验")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="关键物品归属",
+            content="铜钥匙不能被交给白石商会。账册不能交给顾临。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n林追把铜钥匙交给白石商会，又把账册交给顾临。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    memory_dimension = next(item for item in review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("铜钥匙 / 交给 / 白石商会" in item.detail for item in memory_dimension.issues))
+    self.assertTrue(any("账册 / 交给 / 顾临" in item.detail for item in memory_dimension.issues))
+
+    safe_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n林追没有把铜钥匙交给白石商会，也没有把账册交给顾临。\n"),
+    )
+    safe_review = next(item for item in safe_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    safe_memory_dimension = next(item for item in safe_review.dimensions if item.id == "project_memory")
+    self.assertNotEqual(safe_memory_dimension.status, "risk")
+    self.assertFalse(safe_memory_dimension.issues)
+
+  def test_chapter_review_catches_project_memory_state_change_rules(self) -> None:
+    summary = self.create_demo_project("项目记忆状态核验")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="顾临仍在局内",
+            content="顾临不能死亡，也不能叛变。林追不会主动暴露身份。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临在仓库里被杀，林追为了换船票主动暴露身份。\n"),
+    )
+
+    review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    memory_dimension = next(item for item in review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("顾临" in item.detail and "被杀" in item.detail for item in memory_dimension.issues))
+    self.assertTrue(any("林追" in item.detail and "暴露身份" in item.detail for item in memory_dimension.issues))
+
+    review_status = summarize_chapter_review_status(detail, "chapter-001")
+    self.assertGreaterEqual(review_status["critical_issue_count"], 2)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+  def test_chapter_review_becomes_stale_after_project_memory_changes(self) -> None:
+    summary = self.create_demo_project("项目记忆过期核验")
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临在仓库里被杀，林追带着账本离开。\n"),
+    )
+    initial_review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertFalse(initial_review.is_stale)
+    initial_memory_dimension = next(item for item in initial_review.dimensions if item.id == "project_memory")
+    self.assertEqual(initial_memory_dimension.status, "na")
+
+    changed = update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="顾临必须存活",
+            content="顾临不能死亡。",
+          )
+        ]
+      ),
+    )
+    stale_review = next(item for item in changed.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertTrue(stale_review.is_stale)
+
+    refreshed, review_error = refresh_chapter_review(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterReviewRefreshRequest(style_name=""),
+    )
+    self.assertEqual(review_error, "")
+    refreshed_review = next(item for item in refreshed.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    self.assertFalse(refreshed_review.is_stale)
+    memory_dimension = next(item for item in refreshed_review.dimensions if item.id == "project_memory")
+    self.assertEqual(memory_dimension.status, "risk")
+    self.assertTrue(any("顾临必须存活" in item.title for item in memory_dimension.issues))
+    self.assertTrue(any("顾临" in item.detail and "被杀" in item.detail for item in memory_dimension.issues))
+
   def test_chapter_review_checks_obsidian_forbidden_phrases_and_staleness(self) -> None:
     summary = self.create_demo_project("Obsidian 章节核验")
     vault_dir = Path(self._temp_dir.name) / "review-vault"
@@ -1537,6 +1842,125 @@ required_phrases: [银潮灯]
     repaired_status = summarize_chapter_review_status(repaired_detail, "chapter-002")
     self.assertEqual(repaired_status["obsidian_required_issue_count"], 0)
     self.assertEqual(repaired_status["must_repair_issue_count"], 0)
+
+  def test_auto_repair_uses_project_memory_state_rule_issues(self) -> None:
+    summary = self.create_demo_project("项目记忆自动修订")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="林追身份边界",
+            content="林追不会主动暴露身份。顾临不能死亡。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临在仓库里被杀。林追为了换船票主动暴露身份。\n"),
+    )
+    review_status = summarize_chapter_review_status(detail, "chapter-001")
+    self.assertGreaterEqual(review_status["critical_issue_count"], 2)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    captured_messages: list[dict[str, str]] = []
+
+    def fake_repair_model(_settings, messages, **_kwargs):
+      captured_messages.extend(messages)
+      return json.dumps(
+        {
+          "summary": "改掉项目记忆禁写状态。",
+          "changes": ["保留顾临存活", "改成林追隐藏身份"],
+          "revised_content": "# 第一章 雾港\n顾临在仓库里负伤昏迷，被林追拖到货箱后藏起。林追没有暴露身份，只用假名换到一张船票。\n",
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.chapter_auto_repair_service._invoke_model", side_effect=fake_repair_model):
+      repaired_detail, review_error, repair_result = auto_repair_chapter_after_review(
+        self.settings,
+        summary.id,
+        "chapter-001",
+        detail,
+      )
+
+    self.assertEqual(review_error, "")
+    self.assertTrue(repair_result.attempted)
+    self.assertTrue(repair_result.applied)
+    prompt_text = "\n".join(message["content"] for message in captured_messages)
+    self.assertIn("项目记忆规则", prompt_text)
+    self.assertIn("林追不会主动暴露身份", prompt_text)
+    self.assertIn("顾临不能死亡", prompt_text)
+    repaired_chapter = next(item for item in repaired_detail.chapters if item.id == "chapter-001")
+    self.assertNotIn("被杀", repaired_chapter.content)
+    self.assertNotIn("主动暴露身份", repaired_chapter.content)
+    repaired_status = summarize_chapter_review_status(repaired_detail, "chapter-001")
+    self.assertEqual(repaired_status["critical_issue_count"], 0)
+
+  def test_auto_repair_uses_project_memory_reveal_rule_issues(self) -> None:
+    summary = self.create_demo_project("项目记忆揭示自动修订")
+    update_project_memory(
+      self.settings,
+      summary.id,
+      ProjectMemoryUpdateRequest(
+        entries=[
+          ProjectMemoryEntryInput(
+            category="硬规则",
+            title="沈砚主谋暂缓",
+            content="沈砚不能被提前揭示为主谋。",
+          )
+        ]
+      ),
+    )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临翻开密押日志，终于确认主谋是沈砚。\n"),
+    )
+    review_status = summarize_chapter_review_status(detail, "chapter-001")
+    self.assertGreaterEqual(review_status["critical_issue_count"], 1)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    captured_messages: list[dict[str, str]] = []
+
+    def fake_repair_model(_settings, messages, **_kwargs):
+      captured_messages.extend(messages)
+      return json.dumps(
+        {
+          "summary": "移除提前揭示主谋的句子。",
+          "changes": ["保留密押日志线索", "隐藏沈砚身份"],
+          "revised_content": "# 第一章 雾港\n顾临翻开密押日志，只确认有人动过旧船队账册，真正主使仍未露面。\n",
+        },
+        ensure_ascii=False,
+      )
+
+    with patch("novel_backend.services.chapter_auto_repair_service._invoke_model", side_effect=fake_repair_model):
+      repaired_detail, review_error, repair_result = auto_repair_chapter_after_review(
+        self.settings,
+        summary.id,
+        "chapter-001",
+        detail,
+      )
+
+    self.assertEqual(review_error, "")
+    self.assertTrue(repair_result.attempted)
+    self.assertTrue(repair_result.applied)
+    prompt_text = "\n".join(message["content"] for message in captured_messages)
+    self.assertIn("项目记忆规则", prompt_text)
+    self.assertIn("沈砚不能被提前揭示为主谋", prompt_text)
+    self.assertIn("沈砚 / 主谋", prompt_text)
+    repaired_chapter = next(item for item in repaired_detail.chapters if item.id == "chapter-001")
+    self.assertNotIn("主谋是沈砚", repaired_chapter.content)
+    repaired_status = summarize_chapter_review_status(repaired_detail, "chapter-001")
+    self.assertEqual(repaired_status["critical_issue_count"], 0)
 
   def test_chapter_review_obsidian_evidence_prefers_source_key(self) -> None:
     guard_context = SimpleNamespace(

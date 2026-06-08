@@ -41,6 +41,18 @@ function Invoke-BackendSmoke {
   $DataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("novel-backend-smoke-" + [System.Guid]::NewGuid().ToString("N"))
   $StdoutLog = Join-Path $BuildLogDir "$Label.stdout.log"
   $StderrLog = Join-Path $BuildLogDir "$Label.stderr.log"
+  $EmbeddingPayload = @{
+    target = "embedding"
+    embedding = @{
+      provider = "local-fastembed"
+      base_url = "builtin://bge-small-zh-v1.5"
+      api_key = ""
+      model_name = "BAAI/bge-small-zh-v1.5"
+      dimensions = 512
+      retrieval_k = 6
+      batch_size = 8
+    }
+  } | ConvertTo-Json -Depth 4
 
   New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
@@ -56,7 +68,12 @@ function Invoke-BackendSmoke {
     $HealthUrl = "http://127.0.0.1:$Port/api/app/health"
     $Healthy = $false
 
-    for ($Attempt = 0; $Attempt -lt 60; $Attempt++) {
+    for ($Attempt = 0; $Attempt -lt 240; $Attempt++) {
+      if ($Process.HasExited) {
+        if (Test-Path $StdoutLog) { Get-Content $StdoutLog | Write-Host }
+        if (Test-Path $StderrLog) { Get-Content $StderrLog | Write-Host }
+        throw "$Label exited before health check with code $($Process.ExitCode)"
+      }
       try {
         Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 2 | Out-File -Encoding utf8 (Join-Path $BuildLogDir "$Label.health.json")
         $Healthy = $true
@@ -71,6 +88,23 @@ function Invoke-BackendSmoke {
       if (Test-Path $StdoutLog) { Get-Content $StdoutLog | Write-Host }
       if (Test-Path $StderrLog) { Get-Content $StderrLog | Write-Host }
       throw "$Label failed health check"
+    }
+
+    $EmbeddingResult = Invoke-RestMethod `
+      -Method Post `
+      -Uri "http://127.0.0.1:$Port/api/config/test" `
+      -ContentType "application/json" `
+      -Body $EmbeddingPayload `
+      -TimeoutSec 60
+    $EmbeddingResult | ConvertTo-Json -Depth 8 | Out-File -Encoding utf8 (Join-Path $BuildLogDir "$Label.embedding.json")
+    if (
+      $EmbeddingResult.data.status -ne "passed" -or
+      $EmbeddingResult.data.items[0].status -ne "passed" -or
+      -not ($EmbeddingResult.data.items[0].message -match "512")
+    ) {
+      if (Test-Path $StdoutLog) { Get-Content $StdoutLog | Write-Host }
+      if (Test-Path $StderrLog) { Get-Content $StderrLog | Write-Host }
+      throw "$Label local embedding check failed"
     }
 
     Invoke-RestMethod `
@@ -107,9 +141,13 @@ function Invoke-BackendSmoke {
 try {
   New-Item -ItemType Directory -Force -Path $BuildLogDir | Out-Null
 
-  Write-Step "Run backend tests"
+  Write-Step "Check packaging configuration"
   Push-Location $RootDir
   try {
+    & npm run verify:packaging-static
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    Write-Step "Run backend tests"
     & npm run backend:test:windows
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

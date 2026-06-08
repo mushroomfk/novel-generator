@@ -60,6 +60,8 @@ _MODEL_NOT_FOUND_PATTERNS = (
   "invalid model",
   "does not exist",
   "unknown model",
+  "no available channel",
+  "no available channels",
   "模型不存在",
   "模型名",
 )

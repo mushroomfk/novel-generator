@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import ssl
 import unittest
 from io import BytesIO
@@ -106,3 +107,30 @@ class ModelTransportServiceTestCase(unittest.TestCase):
     self.assertEqual(request.headers["Authorization"], "Bearer test-key")
     self.assertEqual(request.headers["Content-type"], "application/octet-stream")
     self.assertEqual(request.headers["X-trace-id"], "trace-1")
+
+  def test_chat_completion_payload_omits_sampling_parameters(self) -> None:
+    with patch(
+      "novel_backend.services.model_transport_service.urllib_request.urlopen",
+      return_value=FakeResponse('{"ok": true}'),
+    ) as urlopen:
+      payload = request_json(
+        "https://example.com/v1/chat/completions",
+        "test-key",
+        {
+          "model": "demo",
+          "messages": [{"role": "user", "content": "hi"}],
+          "temperature": 0.7,
+          "top_p": 0.9,
+          "max_tokens": 1000,
+        },
+        failure_label="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_format_message="模型返回格式不正确",
+      )
+
+    request = urlopen.call_args.args[0]
+    body = json.loads(request.data.decode("utf-8"))
+    self.assertEqual(payload, {"ok": True})
+    self.assertNotIn("temperature", body)
+    self.assertNotIn("top_p", body)
+    self.assertEqual(body["max_tokens"], 1000)

@@ -46,7 +46,6 @@ const props = defineProps({
 const emit = defineEmits([
   'create-project',
   'import-existing-novel',
-  'import-project',
   'select',
   'select-chapter',
   'select-discussion-thread',
@@ -180,20 +179,13 @@ onBeforeUnmount(() => {
 
       <div class="panel-header-actions">
         <button
-          class="header-action header-action-primary"
+          class="header-action"
           data-testid="import-existing-novel-button"
+          title="旧稿文件仅支持 .txt，也可以直接粘贴正文"
           type="button"
           @click="emit('import-existing-novel')"
         >
           旧稿
-        </button>
-        <button
-          class="header-action"
-          data-testid="import-project-button"
-          type="button"
-          @click="emit('import-project')"
-        >
-          迁移包
         </button>
         <button
           class="header-action"
@@ -404,9 +396,7 @@ onBeforeUnmount(() => {
 }
 
 .panel-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  display: grid;
   gap: 10px;
   margin-bottom: 8px;
 }
@@ -414,15 +404,18 @@ onBeforeUnmount(() => {
 .panel-header-copy {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
   min-width: 0;
 }
 
 .panel-header-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: center;
-  gap: 4px;
-  flex: 0 0 auto;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
 }
 
 .eyebrow {
@@ -443,29 +436,22 @@ onBeforeUnmount(() => {
 }
 
 .header-action {
-  border: 1px solid transparent;
-  border-radius: 999px;
-  padding: 6px 10px;
+  border: 1px solid #d7e3f7;
+  border-radius: 14px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 7px 8px;
   background: transparent;
   color: #475467;
   font-size: 12px;
+  line-height: 1.2;
   white-space: nowrap;
   cursor: pointer;
 }
 
 .header-action:hover {
-  background: #e9eef7;
+  background: #eef5ff;
   color: #1d4ed8;
-}
-
-.header-action-primary {
-  background: #1d4ed8;
-  color: #ffffff;
-}
-
-.header-action-primary:hover {
-  background: #1e40af;
-  color: #ffffff;
 }
 
 .empty {

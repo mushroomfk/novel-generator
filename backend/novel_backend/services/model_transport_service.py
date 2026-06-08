@@ -27,6 +27,25 @@ _RETRYABLE_TRANSPORT_PATTERNS = (
   "tls",
   "_ssl.c",
 )
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+_OPTIONAL_SAMPLING_KEYS = ("temperature", "top_p")
+
+
+def _is_chat_completion_request(endpoint: str, payload: dict[str, object] | None) -> bool:
+  if payload is None:
+    return False
+  normalized_endpoint = endpoint.strip().lower().rstrip("/")
+  return normalized_endpoint.endswith(_CHAT_COMPLETIONS_SUFFIX) and "messages" in payload
+
+
+def prepare_model_request_payload(endpoint: str, payload: dict[str, object] | None) -> dict[str, object] | None:
+  if not _is_chat_completion_request(endpoint, payload):
+    return payload
+
+  sanitized = dict(payload)
+  for key in _OPTIONAL_SAMPLING_KEYS:
+    sanitized.pop(key, None)
+  return sanitized
 
 
 def _build_request(
@@ -86,9 +105,10 @@ def request_json(
 ) -> dict[str, object]:
   if payload is not None and body is not None:
     raise RuntimeError("请求参数冲突")
+  safe_payload = prepare_model_request_payload(endpoint, payload)
   request_body = body if body is not None else (
-    json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if payload is not None else None
+    json.dumps(safe_payload, ensure_ascii=False).encode("utf-8")
+    if safe_payload is not None else None
   )
 
   raw_text = ""

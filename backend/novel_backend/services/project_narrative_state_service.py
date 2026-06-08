@@ -5664,16 +5664,18 @@ def _invoke_narrative_editor_model(settings: Settings, messages: list[dict[str, 
     from novel_backend.services.generation_service import _extract_message_content, _request_chat_completion
 
     try:
+      payload: dict[str, object] = {
+        "model": str(independent_model["model_name"]),
+        "messages": messages,
+        "max_tokens": min(3600, int(independent_model["max_tokens"])),
+      }
+      if independent_model.get("temperature") is not None:
+        payload["temperature"] = float(independent_model["temperature"])
       with model_runtime_slot(settings, lane="chat", task_name="narrative_state_editor:review_model"):
         response_payload = _request_chat_completion(
           str(independent_model["endpoint"]),
           str(independent_model["api_key"]),
-          {
-            "model": str(independent_model["model_name"]),
-            "messages": messages,
-            "temperature": float(independent_model["temperature"]),
-            "max_tokens": min(3600, int(independent_model["max_tokens"])),
-          },
+          payload,
         )
     except Exception as error:
       mark_model_runtime_cooldown(settings, "chat", str(error))

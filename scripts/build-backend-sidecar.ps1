@@ -33,10 +33,25 @@ try {
     "--specpath", $SpecDir
   )
 
+  $LocalEmbeddingModels = Join-Path $RootDir "backend\novel_backend\assets\embedding_models"
+  if (Test-Path $LocalEmbeddingModels) {
+    $PyInstallerArgs += @("--add-data", "$LocalEmbeddingModels;novel_backend\assets\embedding_models")
+  }
+
   if (Test-Path $Python) {
     & $Python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('liteparse') else 1)" *> $null
     if ($LASTEXITCODE -eq 0) {
       $PyInstallerArgs += @("--collect-binaries", "liteparse", "--collect-datas", "liteparse")
+    }
+
+    & $Python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('fastembed') else 1)" *> $null
+    if ($LASTEXITCODE -eq 0) {
+      $PyInstallerArgs += @(
+        "--collect-submodules", "fastembed",
+        "--collect-binaries", "onnxruntime",
+        "--collect-submodules", "onnxruntime",
+        "--collect-binaries", "tokenizers"
+      )
     }
   }
 

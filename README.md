@@ -27,13 +27,13 @@
 
 ## 使用流程
 
-1. 创建作品，设置章节数量、目标字数和基础设定；已有旧稿时，也可以从左侧“旧稿”入口导入已有小说。
+1. 创建作品，设置章节数量、目标字数和基础设定；已有旧稿时，也可以从左侧“旧稿”入口导入已有小说，旧稿文件只支持 `.txt`，也可以直接粘贴正文。
 2. 导入资料、人物卡、参考文本、网页、PDF，或接入已有 Obsidian Vault，建立本地知识索引。
 3. 生成整书架构或章节蓝图，把故事方向沉淀为项目文件。
 4. 选中目标章节，在 Agent 对话中提出续写、改稿、资料分析或架构调整请求。
 5. 审阅执行计划和生成结果，确认后写回章节正文。
 6. 通过本地历史、项目记忆、Prompt 历史和知识检索继续迭代。
-7. 换电脑或备份时导出项目迁移包，在另一台设备导入后继续写作。
+7. 换电脑或备份时从工作台右上角“更多”菜单导入或导出项目迁移包，在另一台设备继续写作。
 
 ## 相对常见 AI 写作工具的优势
 
@@ -82,13 +82,14 @@
 - 桌面壳：`Tauri 2` 负责窗口、应用元数据、桌面打包和 Python sidecar 拉起
 - 前端：`Vue 3 + Vite + TypeScript` 提供作品列表、章节工作台、技能库、设置页和 Agent 对话
 - 后端：`FastAPI` 负责项目文件、章节正文、资料导入、模型请求、技能流程和执行状态
-- 本地数据：作品文件、章节、设定、Obsidian 接入配置和历史记录保存在作品目录；资料索引使用 `SQLite / FTS5`；旧稿接管会把粘贴文本或 `txt / md / docx / pdf` 旧稿拆成章节正文，写入 `.gaoxia/takeover/` 状态、原稿副本、拆章结果和接管报告，并把接续位置、上一章结尾、最近章节和写作边界写入 `core_seed.txt`、`plot_structure.txt`、`character_state.txt`、`blueprint.txt`、`global_summary.txt` 与 `checkpoint.json`，再刷新本地知识库；恢复接管时会保留已有非空章节正文，不用旧稿覆盖作者已改内容；前端会在读取前拒绝 30MB 以上旧稿文件；项目迁移包使用 `.gaoxia-project.zip` 保存完整作品目录并导入到当前工作区；如果 Obsidian Vault 位于项目目录外，迁移包会保留项目内配置和章节学习状态，外部 Vault 的同步文件只保留配置、空统计和重新同步提示，不携带笔记列表、摘要或预览；包内 `narrative_state.json` 会移除 Obsidian 维护建议和动作，`.gaoxia/obsidian_drafts/` 维护草稿不会进入迁移包；包内 `project_distillation.json` 会移除外部 Obsidian 蒸馏条目并标记为需要重建；`.gaoxia/learning/*.json/.jsonl` 和其它 `.gaoxia` 状态里的外部 Obsidian 资料分析、自学习复盘、失败案例文本会改成迁移提示；Agent 线程和 `.gaoxia/runs/` workflow 状态会保留，但其中的 Obsidian 资料分析 artifact、维护 artifact、相关 trace / event、action / subtask 摘要会改成迁移提示，可重建的 `.gaoxia/thread_context/` 索引不会进入迁移包；打包用的 `knowledge.db` 副本也会移除外部 Obsidian 索引内容，导入后按当前环境重新建索引
+- 本地数据：作品文件、章节、设定、Obsidian 接入配置和历史记录保存在作品目录；资料索引使用 `SQLite / FTS5`；旧稿接管会把粘贴文本或 `.txt` 旧稿文件拆成章节正文，写入 `.gaoxia/takeover/` 状态、原稿副本、拆章结果和接管报告，并把接续位置、上一章结尾、最近章节和写作边界写入 `core_seed.txt`、`plot_structure.txt`、`character_state.txt`、`blueprint.txt`、`global_summary.txt` 与 `checkpoint.json`，再刷新本地知识库；恢复接管时会保留已有非空章节正文，不用旧稿覆盖作者已改内容；前端会在读取前拒绝 30MB 以上旧稿文件；项目迁移包使用 `.gaoxia-project.zip` 保存完整作品目录并导入到当前工作区，前端导入入口在工作台右上角“更多”菜单；如果 Obsidian Vault 位于项目目录外，迁移包会保留项目内配置和章节学习状态，外部 Vault 的同步文件只保留配置、空统计和重新同步提示，不携带笔记列表、摘要或预览；包内 `narrative_state.json` 会移除 Obsidian 维护建议和动作，`.gaoxia/obsidian_drafts/` 维护草稿不会进入迁移包；包内 `project_distillation.json` 会移除外部 Obsidian 蒸馏条目并标记为需要重建；`.gaoxia/learning/*.json/.jsonl` 和其它 `.gaoxia` 状态里的外部 Obsidian 资料分析、自学习复盘、失败案例文本会改成迁移提示；Agent 线程和 `.gaoxia/runs/` workflow 状态会保留，但其中的 Obsidian 资料分析 artifact、维护 artifact、相关 trace / event、action / subtask 摘要会改成迁移提示，可重建的 `.gaoxia/thread_context/` 索引不会进入迁移包；打包用的 `knowledge.db` 副本也会移除外部 Obsidian 索引内容，导入后按当前环境重新建索引
 - Obsidian 路径过滤：`include_patterns / exclude_patterns` 按大小写不敏感匹配；默认排除 `.obsidian/**`、`.trash/**` 和 `templates/**` 时，也会排除 `.OBSIDIAN/`、`.Trash/`、`Templates/` 等常见大小写写法；作者自定义 `drafts/**` 这类过滤规则时也能匹配 `Drafts/`；候选笔记超过 `max_notes` 时，会先按 Vault 相对路径稳定排序再应用数量上限，并在同步警告里提示有候选笔记未同步；候选总数和 `max_notes` 会进入来源签名，让界面的 skipped 和警告随 Vault 增删更新
 - Agent 资料分析上下文：`review_knowledge` 继承目标章节时，不只读取资料库和章节安全的 Vault 笔记，也会读取该章的 `build_project_context_bundle()`，把章节任务卡、章节合同、Obsidian 待审软约束和项目学习版文风 / XP 放入资料分析提示；多章节任务切换到另一章时，会为新章节重新生成资料摘要
-- 章节连续性合同：章节生成、候选审校、章节核验和自动修订共用同一份连续性证据。生成第 50/80 章这类中段章节时，后端会把目标位置、人物状态、滚动摘要、蓝图锚点、近期章节尾段、叙事状态账本、剧情债务、人物弧线、Obsidian 约束和资料证据整理为合同；生成提示词会把合同视为优先约束，章节核验新增 `章节连续性合同` 维度，明确合同项缺失会计入自动修订触发条件，自动修订提示也会读取这份合同
+- 章节连续性合同和项目记忆规则：章节生成、候选审校、章节核验和自动修订共用同一份连续性证据。生成第 50/80 章这类中段章节时，后端会把目标位置、人物状态、滚动摘要、蓝图锚点、近期章节尾段、叙事状态账本、剧情债务、人物弧线、Obsidian 约束和资料证据整理为合同；生成提示词会把合同视为优先约束，章节核验新增 `章节连续性合同` 维度，明确合同项缺失会计入自动修订触发条件，自动修订提示也会读取这份合同。章节核验还会反查作者项目记忆里的“硬规则 / 警告”禁写表达，例如“不要提前揭示某人是主谋”“某人不能被提前揭示为主谋 / 真凶 / 卧底 / 潮师”“不要把 A 改名为 B”“铜钥匙不能被交给白石商会”“顾临不能死亡 / 叛变”或“林追不会主动暴露身份”，命中时在 `项目记忆规则` 维度记为 critical，并参与自动修订判断；正文写成“没有暴露身份”“并不是主谋”“并不是卧底”或“没有把铜钥匙交给白石商会”这类否定状态表述时不算违规；作者修改项目记忆后，已有章节核验会标为过期，刷新后按新规则重新检查
+- 章节核验界面：架构总览新增“章节核验”页签，会显示每章核验分数、状态、维度、问题、建议和过期标记；项目记忆规则命中项会在对应维度里直接展示，方便作者定位长篇人物、线索和情节连续性风险
 - 资料解析：PDF 导入在 `qwen-doc-turbo` 不可用或失败后，会优先尝试 LiteParse 本地解析并按页加入 `【第 N 页】` 标记；LiteParse 未安装、解析失败或无正文时回到 `pypdf`，只有本地文本为空时才尝试 LiteParse OCR，OCR 语言可用 `NOVEL_LITEPARSE_OCR_LANGUAGE` 配置
 - 模型接入：使用 OpenAI-compatible `chat/completions`，可接入 OpenAI、DashScope、火山方舟等兼容服务
-- 章节写作安全：架构总览仍可读取 `.gaoxia/story_overview_model.json` 里的模型版全书总览；章节生成、改稿、诊断上下文和项目级文风 / XP 提示不会读取这个缓存，项目记忆和续写 / 改稿类项目蒸馏包也不会从模型总览里的全书实体反写；没有目标章节时，续写、改稿、仿写和人物任务默认不带入 Obsidian 后段笔记，整书架构任务仍可使用全书资料，避免后段设定通过总览缓存或蒸馏报告进入早期章节
+- 章节写作安全：架构总览的关系、事件和世界要素只读取 `.gaoxia/story_overview_model.json` 里的模型版全书总览；模型总览不可用、生成失败或结果没有通过证据校验时，界面会显示模型总览状态和错误，不会从本地架构文件抽取结构化节点。章节生成、改稿、诊断上下文和项目级文风 / XP 提示不会读取模型总览缓存，项目记忆和续写 / 改稿类项目蒸馏包也不会从模型总览里的全书实体反写；没有目标章节时，续写、改稿、仿写和人物任务默认不带入 Obsidian 后段笔记，整书架构任务仍可使用全书资料，避免后段设定通过总览缓存或蒸馏报告进入早期章节
 - 检索增强：关键词检索、embedding、rerank、Obsidian 图谱笔记和联网考据可组合使用，适配资料库和作者参考库；Obsidian 会解析 `summary / description / abstract / keywords / search_terms / 关键词` 等摘要 / 检索词 Properties、正文内联属性 `summary:: / keywords::`，也支持 Dataview 常见的 `[summary:: ...]`、`(keywords:: ...)` 段落内写法；双链、Markdown 内链、反向链接、未解析链接、歧义链接、必须包含和禁止出现短语都会参与同步，这些短语既可以写在 frontmatter，也可以写成正文里的“必须出现：…”、“禁止出现：…”、同名小节或 `required_phrases:: / forbidden_phrases::` 内联属性；frontmatter 字段名支持大小写、空格、连字符和下划线等常见属性写法，frontmatter 或正文内联属性里的 `source_notes / related_characters / related_notes / depends_on / foreshadows / payoffs / reveals / related_locations / related_props / related_organizations` 等关系字段会参与图谱解析，并把依赖、伏笔、兑现、揭示、相关地点等关系语义保留到知识索引、章节上下文和界面预览；Canvas file 节点关系进入章节上下文时，会优先显示目标笔记标题和可见来源笔记标题，而不是原始文件路径；章节上下文只展示目标章节可见的关系目标，当前笔记正文或摘要里指向未来笔记的 `[[双链]]` 或 Markdown 内链会改写为“未开放设定”，真正未解析或歧义的双链仍作为图谱风险提示，避免早期章节通过关系标题、正文链接或 Markdown 链接路径看到后段笔记；笔记还可声明 `chapter_range / chapter_start / chapter_end / reveal_after_chapter`、正文里的“适用章节”“第几章后可用”、`chapter_range:: / reveal_after_chapter::` 内联属性，开放范围可写成 `chapter_range: 58+`、`chapter_range:: 第59章以后`，或 Obsidian 正文 / 属性标签 `#章节/58-60`、`#第58章`、`#第58章起`、`#Ch58-60`、`#Ch58+`、`#适用章节／40～42`、`#剧透/57`、`#剧透／39`、`#第57章后可用`，用于控制当前章节能否引用；写作上下文会按当前任务、目标章节、当前章和上一章尾段带入相关笔记及一跳关联，选笔记时会把标题、路径、别名、标签、双链、Markdown 内链、摘要、关键词、章节范围、必需 / 禁止短语和中文词组重合度一起纳入匹配，明确绑定目标章节的笔记会提高选择优先级，并把命中笔记整理为本章 Obsidian 设定检查清单；相关笔记里的必需 / 禁止短语会提升为本章 Obsidian 写作约束；普通知识检索、Agent 资料分析、任务蒸馏、连续性证据包和章节核验都会按目标章节过滤未来 Obsidian 设定，知识检索预览、连续性证据正文和反向关联也会按目标章节处理；有目标章节时，知识检索和证据检索会先读取更大的候选池再按章节过滤，章节上下文触发的知识检索也会传入目标章节，Obsidian 检索命中如果无法对应到当前总览里的可见笔记，会被丢弃，避免未来笔记或旧索引通过图谱摘要进入早期章节，也避免后段笔记太多时把当前章节可用资料挤出结果；技能库、架构总览和联网考据会把当前选中章节传给后端，有选中章节时只显示或引用该章节安全预览，联网考据提示也会标明目标章节；若 `review_knowledge` 后面紧跟章节生成、改稿或一致性检查，它会继承后续章节作为 Obsidian 过滤范围，并按任务说明和目标章节优先读取当前章绑定笔记；若后面是整书架构，则保持全书资料视角；叙事状态账本会把目标章节可见的 Obsidian 来源、必写项、禁写项、图谱风险和本章执行状态并入章节任务卡，记录哪些必写项已满足、哪些仍缺失、哪些禁写项已触犯；未完成或触犯的 Obsidian 要求会转成后续章节可见的高优先级叙事债务，修订满足后关闭；启用 Obsidian 时，账本还会根据未入 Vault 的剧情债务、人物弧线和图谱问题生成维护建议，给出建议笔记路径和带来源 ID、来源章节、相关人物字段、人物双链或来源笔记路径的 Markdown 草稿；剧情债务和人物草稿会按来源章节写入 `reveal_after_chapter`，多个来源章节时按最晚来源章开放，发布后按目标章节过滤，不会把后段自动维护笔记带入早期章节；这些建议会进入 Agent 规划上下文，路由 / 规划给模型看的建议明细也会按目标章节筛选；多章节指令会优先按生成、改稿、拆场或诊断的动作目标章节判断，不会简单使用句子里的第一个章节号；没有明确目标章节的非架构任务只保留维护摘要，不暴露后段建议标题、路径或动作；Agent 路由 / 规划和自学习状态读取当前项目详情时，会用最新 Obsidian 摘要刷新维护建议，并可自动写入中高优先级待审草稿；重复出现的未解析双链会生成 `Graph/` 待审草稿，草稿会继承来源笔记的章节范围和剧透边界；若来源章节范围不连续，或多个开放式来源起点不同，会改用较晚可见的剧透边界，不合成过宽章节范围；重名和歧义链接会生成修复提醒；已解析双链如果来源笔记可见范围没有被目标笔记可见范围覆盖，会形成章节范围不匹配风险；带未解析或歧义双链的笔记不会被计入孤立笔记；中高优先级建议会在章节保存、Obsidian 同步或章节上下文生成时自动写入项目 `.gaoxia/obsidian_drafts/` 待审草稿，用户仍可显式保存或更新草稿；自动草稿未被人工改动时，后续图谱来源列表、来源内容或章节边界变化会更新草稿里的 `source_notes` 和范围字段，人工改动过的草稿不会被自动覆盖；保存草稿遇到同路径既有人工内容时也会保留原文并记录状态；用户显式发布时才写入配置的 Vault，目标路径必须在 Vault 内且不会覆盖已有笔记，发布后会重新同步 Obsidian 摘要和 `knowledge.db`，新笔记里的人物双链、Markdown 内链、图谱草稿别名和 frontmatter 来源关系会进入已解析 / 未解析链接统计，并按继承的章节边界控制可见范围；模型叙事编辑在生成下一章合同时会读取当前章和下一章的 Obsidian 约束；章节核验会反查当前章节可用的相关 Obsidian 笔记，正文触犯禁止短语时给出风险项，正文提到笔记、连续性证据命中笔记，或少量连续章节范围明确绑定的笔记缺少必需短语时给出警告；这些必写 / 禁写问题会计入自动修订触发条件；重复命名不会被强行解析到任意笔记；Vault 文件变化会通过来源签名触发同步摘要刷新，章节核验使用目标章节可见的 Obsidian 签名，未来章节专用笔记变化不会让早期章节核验过期
 - Obsidian 章节计划类层级标签范围：`#章节计划/58`、`#章节合同/58-60`、`#场景卡/59`、`#scene-plan/59` 这类标签会同时参与类型推断和章节范围解析；不需要再额外维护 `chapter_range`。普通 `#人物/主角`、`#剧情债务/伏笔` 仍只按类型或关系语义处理，不会被当成章节范围。
 - Obsidian 考据来源会继续进入长篇生产链路。目标章节可见笔记里的 `external_references` 会写入叙事状态账本章节任务卡，出现在模型叙事编辑提示、Agent 路由 / 规划能力上下文、自学习面板最新章节任务卡和任务蒸馏材料备注中；项目蒸馏签名也会记录 `external_references / external_links`，考据来源变化后会刷新对应蒸馏资料，让章节计划、资料考据和写作执行使用同一批来源说明。
@@ -213,6 +214,12 @@ npm run backend:dev
 npm run dev
 ```
 
+如果前端不是默认来源，可以设置 `NOVEL_CORS_ORIGINS`；支持 JSON 数组，也支持逗号分隔：
+
+```bash
+NOVEL_CORS_ORIGINS="http://localhost:1420,http://127.0.0.1:1420" npm run backend:dev
+```
+
 ## 配置模型
 
 复制环境变量示例：
@@ -221,7 +228,7 @@ npm run dev
 cp .env.example .env
 ```
 
-模型调用走 OpenAI-compatible `chat/completions`。API Key 可在应用设置里保存，也可以通过环境变量提供：
+模型调用走 OpenAI-compatible `chat/completions`。设置页只要求填写服务商、模型、接口地址、API Key 和篇幅档位；采样类参数由系统处理，实际 `chat/completions` 请求会移除 `temperature / top_p`，避免部分模型拒收可选采样项。API Key 可在应用设置里保存，也可以通过环境变量提供：
 
 - `NOVEL_MODEL_API_KEY`
 - `NOVEL_API_KEY`
@@ -229,23 +236,24 @@ cp .env.example .env
 - `ARK_API_KEY`
 - `OPENAI_API_KEY`
 
-Embedding 检索默认跟随当前写作模型的服务商配置，也可以在设置里勾选“单独设置 Embedding”后使用独立模型、接口地址和 API Key。可用环境变量：
+Embedding 检索默认使用随 sidecar 打包的本地 `BAAI/bge-small-zh-v1.5`，通过 `fastembed` 和 ONNX Runtime 直接加载，安装后不需要用户再下载模型或填写 Embedding API Key。设置页不再显示 Embedding 配置入口，保存和“测试当前配置”都会使用内置本地模型。旧配置或直接调用后端 API 传入 OpenAI-compatible `/embeddings` 配置时，仍可读取这些环境变量：
 
 - `NOVEL_EMBEDDING_API_KEY`
 - `DASHSCOPE_API_KEY`
 - `ARK_API_KEY`
 - `NOVEL_API_KEY`
 - `OPENAI_API_KEY`
+- `NOVEL_LOCAL_EMBEDDING_CACHE_DIR`：仅用于排障或开发，覆盖内置本地模型目录；正式打包默认读取 sidecar 内置模型。
 
-设置页的“模型运行调度”控制本机模型请求节奏。默认主模型并发为 1、检索并发为 1，后台模型任务只在前台空闲后执行；章节候选模式默认 `standard`，也可以切到 `fast` 或 `deep`。
+设置页高级区的“运行调度”控制本机模型请求节奏。默认主模型并发为 1、检索并发为 1，后台模型任务只在前台空闲后执行；章节候选模式默认 `standard`，也可以改为 `fast` 或 `deep`。
 
-第二审查模型用于模型审查、章节核验和模型版故事总览。章节核验和故事总览会优先使用第二审查模型；第二审查模型不可用时，改用当前写作模型。关系总览只读取模型版故事总览缓存；没有可用缓存时不再用本地规则猜人物、事件或地点。设置页可保存第二审查模型，也可以用环境变量覆盖：
+第二审查模型用于模型审查、章节核验和模型版故事总览。章节核验和故事总览会优先使用第二审查模型；第二审查模型不可用时，改用当前写作模型。关系总览优先读取模型版故事总览缓存；没有可用缓存或模型总览生成失败时，会显示模型总览状态和错误，不会从本地架构文件抽取人物、事件或世界要素。设置页高级区可保存第二审查模型，也可以用环境变量覆盖：
 
 - `NOVEL_REVIEW_MODEL_API_KEY`
 - `NOVEL_REVIEW_MODEL_BASE_URL`
 - `NOVEL_REVIEW_MODEL_NAME`
 
-辅助任务后台巡检用于刷新知识库索引、模型版故事总览、系统记忆和去 AI 智能巡检。默认开启，默认间隔 180 秒；当前台模型或检索任务忙时，后台巡检会延后到后续巡检。章节保存和做梦完成会排队 `humanize_review`，它会按样本签名、历史去 AI 输出和 12 小时冷却时间判断是否调用裁判模型。模型版故事总览没有生成 `.gaoxia/story_overview_model.json` 时，任务会记录为失败并等待重试。
+辅助任务后台巡检用于刷新知识库索引、模型版故事总览、系统记忆和去 AI 智能巡检。默认开启，默认间隔 180 秒；当前台模型或检索任务忙时，后台巡检会延后到后续巡检。章节保存和做梦完成会排队 `humanize_review`，它会按样本签名、历史去 AI 输出和 12 小时冷却时间判断是否调用裁判模型。模型版故事总览没有生成 `.gaoxia/story_overview_model.json` 时，后台任务会记录失败并交给辅助任务队列后续再处理；作者手动打开架构总览或刷新模型总览时，会立即再次请求模型并显示失败原因，不返回失败倒计时。模型设置页提供“测试当前配置”，会用当前表单值测试写作模型、知识检索模型和已启用的第二审查模型，不需要先保存配置。
 
 - `NOVEL_AUXILIARY_WORKER_ENABLED`
 - `NOVEL_AUXILIARY_WORKER_INTERVAL_SECONDS`
@@ -263,7 +271,8 @@ Embedding 检索默认跟随当前写作模型的服务商配置，也可以在�
 | `npm run dev:all` | 同时启动 backend 和前端 |
 | `npm run backend:test` | 运行 Python 单测 |
 | `npm run build` | 类型检查并构建前端 |
-| `npm run verify` | 执行 backend 单测和前端构建 |
+| `npm run verify` | 执行打包脚本静态检查、backend 单测和前端构建 |
+| `npm run verify:packaging-static` | 检查内置 Embedding 模型文件、sidecar 打包脚本和 Windows 发布工作流关键步骤 |
 | `npm run verify:ui` | 运行浏览器层 smoke |
 | `npm run backend:bundle` | 打包 Python sidecar |
 | `npm run backend:bundle:windows` | 在 Windows 打包 Python sidecar |

@@ -2961,7 +2961,10 @@ async function saveObsidianConfig() {
     obsidianState.value = detail.story_overview?.obsidian ?? null;
     isObsidianFormDirty.value = false;
     syncObsidianFormFromState(obsidianState.value, { force: true });
-    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { projectDetail: false }));
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, {
+      obsidian: true,
+      projectDetail: false,
+    }));
     setToolMessage(`Obsidian 配置已保存，知识索引已更新${refreshFailureText(refreshError)}`);
   } catch (error) {
     if (requestId !== obsidianStateRequestId.value) {
@@ -2989,7 +2992,10 @@ async function runObsidianSync() {
     obsidianState.value = detail.story_overview?.obsidian ?? null;
     isObsidianFormDirty.value = false;
     syncObsidianFormFromState(obsidianState.value, { force: true });
-    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, { projectDetail: false }));
+    const refreshError = await refreshAfterObsidianMaintenance(obsidianMaintenanceRefreshPayload(response, {
+      obsidian: true,
+      projectDetail: false,
+    }));
     setToolMessage(`Obsidian 笔记已同步到知识索引${refreshFailureText(refreshError)}`);
   } catch (error) {
     if (requestId !== obsidianStateRequestId.value) {

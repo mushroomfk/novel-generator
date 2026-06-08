@@ -68,8 +68,23 @@ PYINSTALLER_ARGS=(
   --specpath "$SPEC_DIR"
 )
 
+if [[ -d "$ROOT_DIR/backend/novel_backend/assets/embedding_models" ]]; then
+  PYINSTALLER_ARGS+=(
+    --add-data "$ROOT_DIR/backend/novel_backend/assets/embedding_models:novel_backend/assets/embedding_models"
+  )
+fi
+
 if [[ -x "$VENV_PYTHON" ]] && "$VENV_PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('liteparse') else 1)" >/dev/null 2>&1; then
   PYINSTALLER_ARGS+=(--collect-binaries liteparse --collect-datas liteparse)
+fi
+
+if [[ -x "$VENV_PYTHON" ]] && "$VENV_PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('fastembed') else 1)" >/dev/null 2>&1; then
+  PYINSTALLER_ARGS+=(
+    --collect-submodules fastembed
+    --collect-binaries onnxruntime
+    --collect-submodules onnxruntime
+    --collect-binaries tokenizers
+  )
 fi
 
 "$VENV_PYINSTALLER" "${PYINSTALLER_ARGS[@]}" "$ROOT_DIR/backend/novel_backend/main.py"

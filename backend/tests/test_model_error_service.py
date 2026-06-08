@@ -36,6 +36,10 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(classify_model_error("模型请求失败: 401 invalid api key").kind, "auth")
     self.assertEqual(classify_model_error("模型请求失败: 404 model not found").kind, "model_not_found")
     self.assertEqual(classify_model_error("invalid model name").kind, "model_not_found")
+    self.assertEqual(
+      classify_model_error("模型测试失败: 400 no available channels for model qwen3.7-max").kind,
+      "model_not_found",
+    )
 
   def test_classifies_aliyun_arrearage_as_billing_error(self) -> None:
     error = (

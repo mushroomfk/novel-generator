@@ -6,6 +6,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from novel_backend.services.model_error_service import is_transient_model_network_error
+from novel_backend.services.model_transport_service import prepare_model_request_payload
 
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120
 DEFAULT_MODEL_REQUEST_RETRY_DELAYS = (0.8, 1.6)
@@ -22,7 +23,8 @@ def request_json_with_retries(
   timeout: int = DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
   retry_delays: tuple[float, ...] = DEFAULT_MODEL_REQUEST_RETRY_DELAYS,
 ) -> dict[str, object]:
-  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+  safe_payload = prepare_model_request_payload(endpoint, payload)
+  body = json.dumps(safe_payload, ensure_ascii=False).encode("utf-8")
   last_error: BaseException | None = None
 
   for attempt_index in range(len(retry_delays) + 1):

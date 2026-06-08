@@ -123,7 +123,7 @@ const modelRuntimeLine = computed(() => {
   }
   if (cooldownEntries.length > 0) {
     const [, cooldown] = cooldownEntries[0];
-    return `后台模型冷却中：约 ${cooldown.remaining_seconds ?? 0}s`;
+    return `后台模型任务暂停：${cooldown.reason || '模型服务暂时不可用'}`;
   }
   return '';
 });
@@ -814,8 +814,16 @@ function closeTransientOverlay() {
   }
 }
 
+function isEditableTarget(target) {
+  return target instanceof Element
+    && Boolean(target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'));
+}
+
 function handleWindowKeydown(event) {
   if (event.key === 'Escape') {
+    if (isSettingsOpen.value && isEditableTarget(event.target)) {
+      return;
+    }
     closeTransientOverlay();
   }
 }
@@ -948,7 +956,6 @@ onBeforeUnmount(() => {
           :project-discussion-summary="getProjectDiscussionSummary(selectedProjectDetail)"
           @create-project="isCreateOpen = true"
           @import-existing-novel="handleExistingNovelImportRequest"
-          @import-project="handleProjectMigrationImportRequest"
           @select="handleProjectSelect"
           @select-chapter="handleChapterSelect"
           @select-discussion-thread="handleDiscussionThreadSelect"
@@ -962,8 +969,11 @@ onBeforeUnmount(() => {
         <input
           ref="migrationImportInput"
           accept=".gaoxia-project.zip,.zip"
+          aria-hidden="true"
           class="visually-hidden"
           data-testid="project-migration-file-input"
+          hidden
+          tabindex="-1"
           type="file"
           @change="handleProjectMigrationFileSelected"
         >
@@ -1044,6 +1054,16 @@ onBeforeUnmount(() => {
                   @click="handleProjectMigrationExport(selectedProjectDetail)"
                 >
                   {{ projectActionPendingId === selectedProjectDetail.id ? '导出中…' : '导出迁移包' }}
+                </button>
+
+                <button
+                  :disabled="isMigrationImporting"
+                  class="stage-tools-item"
+                  data-testid="project-migration-import-button"
+                  type="button"
+                  @click="handleProjectMigrationImportRequest"
+                >
+                  {{ isMigrationImporting ? '导入中…' : '导入迁移包' }}
                 </button>
 
                 <button
@@ -1346,7 +1366,6 @@ onBeforeUnmount(() => {
         v-if="isSettingsOpen"
         class="modal-overlay modal-overlay-drawer"
         data-testid="settings-modal"
-        @click.self="isSettingsOpen = false"
       >
         <section
           class="modal-dialog modal-dialog-drawer settings-drawer"

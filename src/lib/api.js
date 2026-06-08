@@ -547,6 +547,13 @@ export async function updateModelConfig(payload) {
   });
 }
 
+export async function testModelConfig(payload) {
+  return request('/api/config/test', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function getLicenseStatus() {
   return request('/api/license/validate');
 }

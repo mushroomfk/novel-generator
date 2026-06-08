@@ -3,6 +3,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import { arrayBufferToBase64 } from '../lib/importFiles.js';
 
 const MAX_FILE_BYTES = 30 * 1024 * 1024;
+const ALLOWED_FILE_SUFFIX = '.txt';
 
 const props = defineProps({
   open: {
@@ -72,6 +73,13 @@ async function handleFileSelected(event) {
   form.content_base64 = '';
   form.source_filename = '';
   if (!file) {
+    return;
+  }
+  if (!file.name.toLowerCase().endsWith(ALLOWED_FILE_SUFFIX)) {
+    fileError.value = '旧稿文件只支持 .txt，请转换后再导入或直接粘贴正文';
+    if (fileInput.value) {
+      fileInput.value.value = '';
+    }
     return;
   }
   if (file.size > MAX_FILE_BYTES) {
@@ -215,7 +223,7 @@ function submit() {
           <div class="takeover-file-row">
             <input
               ref="fileInput"
-              accept=".txt,.md,.markdown,.docx,.pdf"
+              accept=".txt"
               class="visually-hidden"
               data-testid="existing-novel-file-input"
               type="file"
@@ -223,6 +231,7 @@ function submit() {
             >
             <button
               class="secondary-button"
+              title="旧稿文件仅支持 .txt，也可以直接粘贴正文"
               type="button"
               @click="fileInput?.click()"
             >
@@ -331,6 +340,7 @@ function submit() {
             <h4>处理内容</h4>
             <ul>
               <li>按章节标题拆分旧稿</li>
+              <li>文件导入只支持 .txt</li>
               <li>逐章写入项目章节</li>
               <li>生成接管报告和章节清单</li>
               <li>刷新本地知识库索引</li>

@@ -20,6 +20,8 @@ Windows Desktop Release
 4. 执行 `npm run verify:desktop:windows`
 5. 上传 Windows 安装包和 sidecar
 
+`npm run verify:desktop:windows` 会先执行 `npm run verify:packaging-static`，检查内置 Embedding 模型文件、Windows sidecar 打包脚本、Windows 发布验证脚本和 GitHub Actions 工作流关键步骤。macOS 本机也可以执行 `npm run verify:packaging-static` 做同样的静态检查，但它不会生成 Windows 安装包，也不能替代 Windows runner 或 Windows 实机验证。
+
 上传产物包括：
 
 - `src-tauri/target/release/bundle/nsis/*.exe`
@@ -44,7 +46,7 @@ release/test-release/windows/稿匣_0.1.2_测试包/
 
 共享给测试用户时优先提供 `稿匣_0.1.2_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
 
-当前 `0.1.2` Windows 测试包由 GitHub Actions run `26353093355` 在提交 `7051ada1de89275d7f508325c060ad75c721cbdc` 上生成，并已上传到 GitHub Release `v0.1.2`。
+截至 2026-06-09，已知的 `0.1.2` Windows 测试包由 GitHub Actions run `26353093355` 在提交 `7051ada1de89275d7f508325c060ad75c721cbdc` 上生成，并已上传到 GitHub Release `v0.1.2`。如果当前工作区有新的本地改动，必须重新触发 `Windows Desktop Release` 或在 Windows 本机执行 `npm run verify:desktop:windows`，才能确认新的后端逻辑和内置模型已经进入 Windows 安装包。
 
 ## 本地 Windows 打包
 
@@ -75,10 +77,11 @@ npm run verify:desktop:windows
 
 这条命令会做：
 
+- 检查打包配置静态项
 - 运行 Windows backend 单测
 - 构建前端
 - 用 PyInstaller 打包 Windows sidecar
-- 拉起 sidecar，检查 `/api/app/health` 和 `/api/app/shutdown`
+- 拉起 sidecar，检查 `/api/app/health`、`/api/config/test` 本地 Embedding 和 `/api/app/shutdown`
 - 执行 Tauri NSIS release 构建
 - 检查 NSIS `setup.exe` 是否生成
 
@@ -89,7 +92,7 @@ npm run verify:desktop:windows
 - Windows backend 单测
 - 前端生产构建
 - Windows sidecar 打包
-- sidecar 运行级健康检查
+- sidecar 运行级健康检查和本地 Embedding 加载检查
 - Tauri Windows 安装包构建
 - GitHub Actions 产物上传
 

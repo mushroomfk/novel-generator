@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 from uuid import uuid4
 
@@ -97,7 +98,7 @@ _ARCHITECTURE_STEP_REQUIREMENTS = {
   "plot_structure": "只输出整本推进结构、阶段目标和关键转折，不要写人物小传。必须沿用人物设定里已经确定的核心人物名单；如需新增配角，只能作为单次情节功能角色，不要替换核心人物或改名。",
   "character_state": "只输出当前阶段人物状态、关系变化和后续隐患。必须沿用人物设定里的姓名、身份和关系，不要另造一套联盟成员；如发现人物设定互相冲突，在 summary 或 checklist 指出冲突。",
   "blueprint": "输出可直接写入项目文件的章节蓝图，按章节列出标题、目标和钩子。必须沿用人物设定和人物状态里的核心人物名单，不要在蓝图里把未设定人物改成核心成员。",
-  "global_summary": "输出滚动摘要，浓缩已定设定和目前推进状态，长度控制在 120 到 220 字。",
+  "global_summary": "输出滚动摘要，浓缩已定设定和目前推进状态，长度控制在 120 到 220 字。content 必须是一段中文摘要，不要输出 JSON、字段表、章节列表或完整架构。",
 }
 
 _ARCHITECTURE_STEP_DEPENDENCIES = {
@@ -404,6 +405,19 @@ def _extract_json_object(text: str) -> dict[str, object] | None:
   return None
 
 
+def _partial_json_string_from_key(text: str, key: str) -> str:
+  pattern = re.compile(rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"')
+  matched = pattern.search(_strip_code_fence(text))
+  if not matched:
+    return ""
+  raw_value = matched.group(1)
+  try:
+    decoded = json.loads(f'"{raw_value}"')
+  except json.JSONDecodeError:
+    decoded = raw_value.replace('\\"', '"').replace("\\n", "\n")
+  return str(decoded or "").strip()
+
+
 def _string_from_keys(payload: dict[str, object], *keys: str) -> str:
   for key in keys:
     value = payload.get(key)
@@ -524,7 +538,6 @@ def _invoke_model(
   chat_payload = {
     "model": config.model_name,
     "messages": messages,
-    "temperature": config.temperature if temperature is None else temperature,
     "max_tokens": config.max_tokens if max_tokens is None else max_tokens,
   }
   if enable_thinking is not None and _model_is_aliyun(config):
@@ -900,13 +913,52 @@ def _fallback_architecture_step_result(text: str, payload: ArchitectureStepReque
   )
 
 
+def _normalize_global_summary_content(content: str, summary: str) -> str:
+  text = str(content or "").strip()
+  summary_text = str(summary or "").strip()
+  if summary_text and (
+    not text
+    or text.startswith(("{", "["))
+    or len(text) > 700
+    or '"acts"' in text
+    or '"main_characters"' in text
+    or "acts：" in text
+    or "main_characters：" in text
+  ):
+    return summary_text
+  return text
+
+
+def _salvage_architecture_step_payload(text: str, payload: ArchitectureStepRequest, task_id: str) -> ArchitectureStepResult | None:
+  headline = _partial_json_string_from_key(text, "headline") or _partial_json_string_from_key(text, "title")
+  summary = _partial_json_string_from_key(text, "summary")
+  content = _partial_json_string_from_key(text, "content")
+  if payload.step == "global_summary":
+    content = _normalize_global_summary_content(content, summary)
+  if not content:
+    return None
+  return ArchitectureStepResult(
+    task_id=task_id,
+    step=payload.step,
+    mode=payload.mode,
+    headline=headline or f"{_ARCHITECTURE_STEP_LABELS[payload.step]} 已生成",
+    summary=summary or headline or "这一步的草稿已经整理好。",
+    content=content,
+    checklist=[],
+    target_chapters=None if payload.mode != "continue" else None,
+  )
+
+
 def _parse_architecture_step_payload(text: str, payload: ArchitectureStepRequest, task_id: str) -> ArchitectureStepResult:
   parsed = _extract_json_object(text)
   if not isinstance(parsed, dict):
-    return _fallback_architecture_step_result(text, payload, task_id)
+    salvaged = _salvage_architecture_step_payload(text, payload, task_id)
+    return salvaged if salvaged is not None else _fallback_architecture_step_result(text, payload, task_id)
   headline = _string_from_keys(parsed, "headline", "判断", "title")
   summary = _string_from_keys(parsed, "summary", "说明", "analysis")
   content = _structured_text_from_keys(parsed, "content", "正文", "result")
+  if payload.step == "global_summary":
+    content = _normalize_global_summary_content(content, summary)
   checklist = _string_list_from_keys(parsed, "checklist", "要点", "suggestions")
   if not content:
     return _fallback_architecture_step_result(text, payload, task_id)
@@ -2578,7 +2630,7 @@ def _generate_chapter_workflow(
       target_words=normalized_payload.target_words,
       support_text=support,
       task_name_prefix="chapter_workflow:draft",
-      prefer_project_budget=normalized_payload.target_words <= 1_800,
+      prefer_project_budget=normalized_payload.target_words <= 0,
     )
     return ChapterWorkflowResult(
       task_id=task_id,

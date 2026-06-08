@@ -131,6 +131,67 @@ _HANDOFF_GENERIC_TERMS = (
   "让",
   "把",
 )
+_PROJECT_MEMORY_RULE_CATEGORIES = {"硬规则", "警告"}
+_PROJECT_MEMORY_NEGATIVE_MARKERS = ("不要", "不得", "禁止", "不可", "不许", "不能", "不会", "避免")
+_PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS = {
+  "不要",
+  "不得",
+  "禁止",
+  "不可",
+  "不许",
+  "不能",
+  "不会",
+  "避免",
+  "提前",
+  "直接",
+  "公开",
+  "揭示",
+  "揭开",
+  "揭露",
+  "暴露",
+  "写出",
+  "写成",
+  "改成",
+  "改名",
+  "变成",
+  "叫成",
+  "说明",
+  "说出",
+  "透露",
+  "出现",
+  "身份",
+  "真相",
+  "主角",
+  "角色",
+  "人物",
+  "写",
+  "让",
+  "把",
+}
+_PROJECT_MEMORY_STATE_RULES = (
+  ("死亡", ("死亡", "死去", "死掉", "死了", "丧命", "遇害", "被杀", "被害", "阵亡", "牺牲")),
+  ("叛变", ("叛变", "背叛", "倒戈", "投敌")),
+  ("黑化", ("黑化", "堕落")),
+  ("离队", ("离队", "离开队伍", "退出队伍", "脱离队伍")),
+  ("暴露身份", ("暴露身份", "身份暴露", "公开身份", "主动暴露")),
+)
+_PROJECT_MEMORY_REVEAL_ROLES = ("主谋", "真凶", "幕后主使", "幕后黑手", "凶手", "反派")
+_PROJECT_MEMORY_REVEAL_ACTIONS = ("揭示", "揭开", "揭露", "暴露", "公开", "透露", "点破", "说明", "说出")
+_PROJECT_MEMORY_TRANSFER_ACTIONS = ("交给", "交出", "交还", "移交", "转交", "交付", "送给", "递给", "献给", "交到", "卖给")
+_PROJECT_MEMORY_NEGATED_STATE_PREFIXES = (
+  "没有",
+  "没",
+  "未",
+  "并未",
+  "并没有",
+  "尚未",
+  "不会",
+  "不能",
+  "不曾",
+  "不是",
+  "无需",
+  "不要",
+)
 _CONFLICT_TOKENS = (
   "追",
   "拦",
@@ -464,7 +525,8 @@ def _resolve_independent_review_model(settings: Settings) -> dict[str, object] |
   base_url = os.environ.get("NOVEL_REVIEW_MODEL_BASE_URL", "").strip()
   model_name = os.environ.get("NOVEL_REVIEW_MODEL_NAME", "").strip()
   max_tokens = int(os.environ.get("NOVEL_REVIEW_MODEL_MAX_TOKENS", "") or config.max_tokens)
-  temperature = float(os.environ.get("NOVEL_REVIEW_MODEL_TEMPERATURE", "") or config.temperature)
+  temperature_text = os.environ.get("NOVEL_REVIEW_MODEL_TEMPERATURE", "").strip()
+  temperature = float(temperature_text) if temperature_text else config.temperature
   if not api_key and config.enabled:
     api_key = config.api_key.strip()
   if not base_url and config.enabled:
@@ -549,16 +611,18 @@ def _call_model_review(
     from novel_backend.services.generation_service import _extract_message_content, _request_chat_completion
 
     try:
+      payload: dict[str, object] = {
+        "model": str(independent_model["model_name"]),
+        "messages": messages,
+        "max_tokens": int(independent_model["max_tokens"]),
+      }
+      if independent_model.get("temperature") is not None:
+        payload["temperature"] = float(independent_model["temperature"])
       with model_runtime_slot(settings, lane="chat", task_name="chapter_review:evaluator"):
         response_payload = _request_chat_completion(
           str(independent_model["endpoint"]),
           str(independent_model["api_key"]),
-          {
-            "model": str(independent_model["model_name"]),
-            "messages": messages,
-            "temperature": float(independent_model["temperature"]),
-            "max_tokens": int(independent_model["max_tokens"]),
-          },
+          payload,
         )
     except Exception as error:
       mark_model_runtime_cooldown(settings, "chat", str(error))
@@ -1259,6 +1323,335 @@ def _obsidian_dimension(project_detail, chapter, guard_context=None) -> ChapterR
   return _dimension("obsidian", "Obsidian 设定", score, summary, highlights=highlights, issues=issues)
 
 
+def _rule_sentences(text: str) -> list[str]:
+  sentences: list[str] = []
+  for raw_line in str(text or "").splitlines():
+    line = raw_line.strip(" -\t")
+    if not line:
+      continue
+    parts = re.split(r"[。！？!?；;]\s*", line)
+    sentences.extend(part.strip() for part in parts if part.strip())
+  return sentences
+
+
+def _quoted_terms(text: str) -> list[str]:
+  terms: list[str] = []
+  for pattern in (
+    r"“([^”]{2,40})”",
+    r"\"([^\"]{2,40})\"",
+    r"'([^']{2,40})'",
+    r"《([^》]{2,40})》",
+    r"【([^】]{2,40})】",
+  ):
+    terms.extend(match.strip() for match in re.findall(pattern, text) if match.strip())
+  return _ordered_unique(terms)
+
+
+def _memory_negative_fragment(sentence: str) -> str:
+  earliest = -1
+  for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
+    index = sentence.find(marker)
+    if index >= 0 and (earliest < 0 or index < earliest):
+      earliest = index
+  return sentence[earliest:] if earliest >= 0 else ""
+
+
+def _explicit_replacement_terms(fragment: str) -> list[str]:
+  terms: list[str] = []
+  for match in re.finditer(r"(?:改名为|改成|写成|叫成|变成|称为)([\u4e00-\u9fffA-Za-z0-9_·]{2,24})", fragment):
+    term = match.group(1).strip()
+    if term and term not in _PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS:
+      terms.append(term)
+  return _ordered_unique(terms)
+
+
+def _clean_project_memory_subject(value: str) -> str:
+  subject = str(value or "").strip()
+  for term in sorted(_PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS, key=len, reverse=True):
+    subject = subject.replace(term, "")
+  return subject.strip(" ，,、：:的了被")
+
+
+def _clean_project_memory_identity(value: str) -> str:
+  identity = str(value or "").strip(" ，,、：:的了。！？!?；;")
+  if identity in _PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS:
+    return ""
+  return identity if len(identity) >= 2 else ""
+
+
+def _identity_terms_after_reveal_action(text: str) -> list[str]:
+  action_pattern = "|".join(re.escape(action) for action in _PROJECT_MEMORY_REVEAL_ACTIONS)
+  terms: list[str] = []
+  for match in re.finditer(
+    rf"(?:{action_pattern})[^。！？!?；;\n]{{0,18}}?(?:就是|是|成为|成了|为)([\u4e00-\u9fffA-Za-z0-9_·]{{2,16}})",
+    text or "",
+  ):
+    term = _clean_project_memory_identity(match.group(1))
+    if term:
+      terms.append(term)
+  return _ordered_unique(terms)
+
+
+def _generic_reveal_match(chapter_text: str, text: str) -> str:
+  action_pattern = "|".join(re.escape(action) for action in _PROJECT_MEMORY_REVEAL_ACTIONS)
+  for match in re.finditer(
+    rf"(?:{action_pattern})[^。！？!?；;\n]{{0,12}}?([\u4e00-\u9fffA-Za-z0-9_·]{{2,16}}?)(?:就是|是|成为|成了|为)([\u4e00-\u9fffA-Za-z0-9_·]{{2,16}})",
+    text or "",
+  ):
+    name = _clean_project_memory_subject(match.group(1))
+    identity = _clean_project_memory_identity(match.group(2))
+    if name and identity and _chapter_reveals_role(chapter_text, name, identity):
+      return f"{name} / {identity}"
+  return ""
+
+
+def _chapter_reveals_role(chapter_text: str, name: str, role: str) -> bool:
+  if not name or not role:
+    return False
+  patterns = (
+    rf"{re.escape(name)}[^。！？!?；;\n]{{0,16}}{re.escape(role)}",
+    rf"{re.escape(role)}[^。！？!?；;\n]{{0,16}}{re.escape(name)}",
+  )
+  for pattern in patterns:
+    for match in re.finditer(pattern, chapter_text or ""):
+      segment = match.group(0)
+      if any(marker in segment for marker in ("不是", "并非", "并不是", "否认", "未被", "没有")):
+        continue
+      return True
+  return False
+
+
+def _explicit_reveal_match(chapter_text: str, rule_sentence: str, fragment: str) -> str:
+  for text in (fragment, rule_sentence):
+    for match in re.finditer(
+      r"([\u4e00-\u9fffA-Za-z0-9_·]{2,16}?)(?:就是|是|成为|成了|为)("
+      + "|".join(re.escape(role) for role in _PROJECT_MEMORY_REVEAL_ROLES)
+      + r")",
+      text,
+    ):
+      name = _clean_project_memory_subject(match.group(1))
+      role = match.group(2).strip()
+      if _chapter_reveals_role(chapter_text, name, role):
+        return f"{name} / {role}"
+    generic_match = _generic_reveal_match(chapter_text, text)
+    if generic_match:
+      return generic_match
+
+  for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
+    index = rule_sentence.find(marker)
+    if index <= 0:
+      continue
+    prefix = rule_sentence[:index].strip(" ，,、：:")
+    fragment_after_marker = rule_sentence[index:]
+    roles = [role for role in _PROJECT_MEMORY_REVEAL_ROLES if role in fragment_after_marker]
+    roles.extend(_identity_terms_after_reveal_action(fragment_after_marker))
+    roles = _ordered_unique(roles)
+    if not roles:
+      continue
+    subjects = [_clean_project_memory_subject(item) for item in [*_quoted_terms(prefix), *_tokens(prefix, limit=4)]]
+    for subject in _ordered_unique(item for item in subjects if item):
+      for role in roles:
+        if _chapter_reveals_role(chapter_text, subject, role):
+          return f"{subject} / {role}"
+  return ""
+
+
+def _clean_project_memory_transfer_target(value: str) -> str:
+  target = str(value or "").strip(" ，,、：:的了。！？!?；;")
+  if target in _PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS:
+    return ""
+  return target if len(target) >= 2 else ""
+
+
+def _transfer_targets_after_action(text: str) -> list[tuple[str, str]]:
+  action_pattern = "|".join(re.escape(action) for action in _PROJECT_MEMORY_TRANSFER_ACTIONS)
+  targets: list[tuple[str, str]] = []
+  for match in re.finditer(
+    rf"(?:被|把)?({action_pattern})([\u4e00-\u9fffA-Za-z0-9_·]{{2,24}})",
+    text or "",
+  ):
+    action = match.group(1)
+    target = _clean_project_memory_transfer_target(match.group(2))
+    if target:
+      targets.append((action, target))
+  return list(dict.fromkeys(targets))
+
+
+def _chapter_transfers_object(chapter_text: str, subject: str, action: str, target: str) -> bool:
+  if not subject or not target:
+    return False
+  action_pattern = "|".join(re.escape(item) for item in _PROJECT_MEMORY_TRANSFER_ACTIONS)
+  pattern = rf"{re.escape(subject)}[^。！？!?；;\n]{{0,24}}(?:{action_pattern})[^。！？!?；;\n]{{0,12}}{re.escape(target)}"
+  for match in re.finditer(pattern, chapter_text or ""):
+    segment = match.group(0)
+    action_match = re.search(action_pattern, segment)
+    if action_match:
+      action_start = match.start() + action_match.start()
+      prefix = (chapter_text or "")[max(0, action_start - 16) : action_start]
+      if any(marker in prefix for marker in _PROJECT_MEMORY_NEGATED_STATE_PREFIXES):
+        continue
+    return True
+  return False
+
+
+def _explicit_transfer_match(chapter_text: str, rule_sentence: str) -> str:
+  for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
+    index = rule_sentence.find(marker)
+    if index <= 0:
+      continue
+    prefix = rule_sentence[:index].strip(" ，,、：:")
+    fragment_after_marker = rule_sentence[index:]
+    targets = _transfer_targets_after_action(fragment_after_marker)
+    if not targets:
+      continue
+    subjects = [_clean_project_memory_subject(item) for item in [*_quoted_terms(prefix), *_tokens(prefix, limit=4)]]
+    for subject in _ordered_unique(item for item in subjects if item):
+      for action, target in targets:
+        if _chapter_transfers_object(chapter_text, subject, action, target):
+          return f"{subject} / {action} / {target}"
+  return ""
+
+
+def _memory_rule_subject_candidates(sentence: str, terms: tuple[str, ...]) -> list[str]:
+  candidates = _quoted_terms(sentence)
+  for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
+    index = sentence.find(marker)
+    if index <= 0:
+      continue
+    prefix = sentence[:index].strip(" ，,、：:")
+    if prefix:
+      candidates.extend(_tokens(prefix, limit=4))
+  for term in sorted(terms, key=len, reverse=True):
+    for match in re.finditer(r"(?:让|把|使)?([\u4e00-\u9fffA-Za-z0-9_·]{2,16})[^。！？!?；;]{0,8}" + re.escape(term), sentence):
+      candidates.append(match.group(1).strip())
+
+  cleaned: list[str] = []
+  for candidate in candidates:
+    value = str(candidate or "").strip()
+    for generic in sorted(_PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS, key=len, reverse=True):
+      value = value.replace(generic, "")
+    value = value.strip(" ，,、：:的了")
+    if len(value) >= 2:
+      cleaned.append(value)
+  return _ordered_unique(cleaned)
+
+
+def _explicit_state_rule_match(chapter_text: str, rule_sentence: str) -> str:
+  for label, terms in _PROJECT_MEMORY_STATE_RULES:
+    if not any(term in rule_sentence for term in terms):
+      continue
+    chapter_hit = next((term for term in terms if _state_term_occurs_affirmatively(chapter_text, term)), "")
+    if not chapter_hit:
+      continue
+    subjects = _memory_rule_subject_candidates(rule_sentence, terms)
+    if subjects:
+      for subject in subjects:
+        if subject in chapter_text:
+          return f"{subject} / {chapter_hit}"
+      continue
+    return f"{label} / {chapter_hit}" if label != chapter_hit else chapter_hit
+  return ""
+
+
+def _state_term_occurs_affirmatively(text: str, term: str) -> bool:
+  for match in re.finditer(re.escape(term), text or ""):
+    prefix = text[max(0, match.start() - 8) : match.start()]
+    if any(marker in prefix for marker in _PROJECT_MEMORY_NEGATED_STATE_PREFIXES):
+      continue
+    return True
+  return False
+
+
+def _memory_rule_violation_match(chapter_text: str, rule_sentence: str) -> str:
+  fragment = _memory_negative_fragment(rule_sentence)
+  if not fragment:
+    return ""
+  reveal_match = _explicit_reveal_match(chapter_text, rule_sentence, fragment)
+  if reveal_match:
+    return reveal_match
+  transfer_match = _explicit_transfer_match(chapter_text, rule_sentence)
+  if transfer_match:
+    return transfer_match
+  state_match = _explicit_state_rule_match(chapter_text, rule_sentence)
+  if state_match:
+    return state_match
+  for term in [*_quoted_terms(fragment), *_explicit_replacement_terms(fragment)]:
+    if term and term in chapter_text:
+      return term
+  tokens = [
+    token
+    for token in _tokens(fragment, limit=10)
+    if token not in _TOKEN_STOPWORDS and token not in _PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS
+  ]
+  if not tokens:
+    return ""
+  matched = [token for token in tokens if token in chapter_text]
+  required = min(2, len(tokens))
+  if len(matched) >= required:
+    return " / ".join(matched[:4])
+  return ""
+
+
+def _project_memory_dimension(project_detail, chapter) -> ChapterReviewDimension:
+  entries = [
+    item for item in list(getattr(project_detail.story_overview, "memory_entries", []) or [])
+    if str(getattr(item, "category", "") or "") in _PROJECT_MEMORY_RULE_CATEGORIES
+  ]
+  if not entries:
+    return _dimension("project_memory", "项目记忆规则", 0, "当前没有项目记忆规则，暂不做记忆反查。", status="na")
+
+  chapter_text = _body_text(chapter)
+  issues: list[ChapterReviewIssue] = []
+  checked_count = 0
+  for entry in entries[:20]:
+    category = str(getattr(entry, "category", "") or "")
+    title = str(getattr(entry, "title", "") or "").strip() or "未命名记忆"
+    for sentence in _rule_sentences(str(getattr(entry, "content", "") or "")):
+      if not any(marker in sentence for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS):
+        continue
+      checked_count += 1
+      matched = _memory_rule_violation_match(chapter_text, sentence)
+      if not matched:
+        continue
+      issues.append(
+        ChapterReviewIssue(
+          level="critical",
+          title=f"触犯项目记忆{category}：{title}",
+          detail=f"项目记忆要求：{_compact_text(sentence, 160)}；正文命中：{matched}",
+        )
+      )
+      if len(issues) >= 4:
+        break
+    if len(issues) >= 4:
+      break
+
+  if checked_count == 0:
+    return _dimension(
+      "project_memory",
+      "项目记忆规则",
+      0,
+      "项目记忆里没有可自动反查的禁写规则，暂不计入评分。",
+      status="na",
+    )
+
+  score = 94 - sum(_issue_penalty(item.level) for item in issues)
+  if issues:
+    score = min(score, 60)
+  highlights = [f"已反查项目记忆规则 {checked_count} 条"]
+  summary = "项目记忆规则已参与本章核验。"
+  if issues:
+    summary = f"项目记忆规则发现 {len(issues)} 个硬性冲突。"
+  return _dimension(
+    "project_memory",
+    "项目记忆规则",
+    score,
+    summary,
+    highlights=highlights,
+    issues=issues,
+    status="risk" if issues else None,
+  )
+
+
 def _style_dimension(settings: Settings, chapter, style_name: str, model_dimension: dict[str, object] | None) -> ChapterReviewDimension:
   if not style_name.strip():
     return _dimension("style", "文风贴合", 0, "当前没有绑定文风方案，暂时不做贴合度评分。", status="na")
@@ -1452,6 +1845,7 @@ def build_chapter_review(
   continuity_dimension = _continuity_dimension(project_detail, chapter, guard_context)
   continuity_contract_dimension = _continuity_contract_dimension(project_detail, chapter, guard_context)
   obsidian_dimension = _obsidian_dimension(project_detail, chapter, guard_context)
+  project_memory_dimension = _project_memory_dimension(project_detail, chapter)
   style_dimension = _style_dimension(
     settings,
     chapter,
@@ -1468,6 +1862,7 @@ def build_chapter_review(
     continuity_dimension,
     continuity_contract_dimension,
     obsidian_dimension,
+    project_memory_dimension,
     style_dimension,
   ]
   scored_dimensions = [item.score for item in dimensions if item.status != "na"]
@@ -1490,6 +1885,7 @@ def build_chapter_review(
       suspense_dimension,
       continuity_contract_dimension,
       obsidian_dimension,
+      project_memory_dimension,
       style_dimension,
     ):
       if item.issues:

@@ -40,8 +40,10 @@ from novel_backend.services.generation_service import (
   _CONTINUITY_CHECK_SYSTEM_PROMPT,
   _continuation_segment_targets,
   _generate_architecture_step,
+  _generate_chapter_workflow,
   _generate_continuation_candidates,
   _generate_continuation_brief,
+  _parse_architecture_step_payload,
   _judge_continuation,
   _run_continuation_pipeline,
   architecture_step_stream,
@@ -695,7 +697,7 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertTrue(captured_payloads[0]["enable_thinking"])
     self.assertFalse(captured_payloads[1]["enable_thinking"])
     self.assertTrue(captured_payloads[2]["enable_thinking"])
-    self.assertEqual(captured_payloads[1]["max_tokens"], 11000)
+    self.assertEqual(captured_payloads[1]["max_tokens"], 2400)
     self.assertEqual(events[-1][1]["status"], "completed")
 
   def test_continuation_segment_targets_are_balanced(self) -> None:
@@ -902,6 +904,45 @@ status: canonical
         "chapter_generate:segment-03:partial:dialogue-pressure",
       ],
     )
+
+  def test_chapter_workflow_draft_respects_explicit_target_words(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="章节目标",
+        genre="悬疑",
+        target_chapters=6,
+        target_words=60000,
+      ),
+    )
+
+    def fake_pipeline(_settings, **kwargs):
+      self.assertEqual(kwargs["target_words"], 900)
+      self.assertFalse(kwargs["prefer_project_budget"])
+      return {
+        "headline": "短正文",
+        "summary": "按调用方目标生成。",
+        "content": "# 第一章\n短正文继续推进。",
+        "next_action": "继续。",
+        "checklist": ["保留线索"],
+        "scenes": [],
+      }
+
+    with patch("novel_backend.services.generation_service._run_continuation_pipeline", side_effect=fake_pipeline):
+      result = _generate_chapter_workflow(
+        self.settings,
+        ChapterWorkflowRequest(
+          project_id=project.id,
+          chapter_id="chapter-001",
+          mode="draft",
+          instruction="生成短测试正文。",
+          target_words=900,
+        ),
+        "workflow-target-test",
+      )
+
+    self.assertEqual(result.headline, "短正文")
+    self.assertEqual(result.draft, "# 第一章\n短正文继续推进。")
 
   def test_segmented_continuation_adds_sections_until_length_target(self) -> None:
     project = create_project(
@@ -1351,6 +1392,49 @@ status: canonical
     self.assertEqual(sent_payload["max_tokens"], 2200)
     self.assertIn("第一章从港口旧案开始。", sent_prompt)
     self.assertNotIn("蓝图尾部不该进入世界设定提示", sent_prompt)
+
+  def test_global_summary_uses_summary_when_model_returns_truncated_json_content(self) -> None:
+    summary = "本版架构沿用林晚庆功宴受害、拒签封口协议、王梅递纸条引出苏青等关键事实，三重压迫机制贯穿全书，后续围绕署名权、婚育承诺书和苏青账本推进反制。"
+    model_text = (
+      '{\n'
+      '  "headline": "重梳全书架构以承接已确立事实",\n'
+      f'  "summary": "{summary}",\n'
+      '  "content": "{\\n  \\"title\\": \\"她刃\\",\\n  \\"acts\\": [\\n    {\\"name\\": \\"第一幕\\"}'
+    )
+
+    result = _parse_architecture_step_payload(
+      model_text,
+      ArchitectureStepRequest(project_id="project-id", step="global_summary"),
+      "task-global-summary",
+    )
+
+    self.assertEqual(result.content, summary)
+    self.assertNotIn('"headline"', result.content)
+    self.assertNotIn('"acts"', result.content)
+
+  def test_global_summary_prefers_summary_over_nested_json_content(self) -> None:
+    summary = "本版架构保留核心事件和七人联盟反制线，重点推进证据链、舆论战和行业问责。"
+    model_text = json.dumps(
+      {
+        "headline": "滚动摘要已整理。",
+        "summary": summary,
+        "content": {
+          "title": "她刃",
+          "main_characters": [{"name": "林晚"}],
+          "acts": [{"name": "第一幕"}],
+        },
+        "checklist": [],
+      },
+      ensure_ascii=False,
+    )
+
+    result = _parse_architecture_step_payload(
+      model_text,
+      ArchitectureStepRequest(project_id="project-id", step="global_summary"),
+      "task-global-summary",
+    )
+
+    self.assertEqual(result.content, summary)
 
   def test_continuity_guard_prefers_manual_memory_and_recent_chapters(self) -> None:
     project = create_project(

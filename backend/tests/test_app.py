@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import unittest
+from unittest.mock import patch
 
 from fastapi.exceptions import RequestValidationError
 
 from novel_backend.app import LOCAL_ORIGIN_PATTERN, create_app
-from novel_backend.config import reset_settings_cache
+from novel_backend.config import Settings, reset_settings_cache
 from novel_backend.models import AGENT_MESSAGE_CONTENT_MAX_LENGTH
 
 
@@ -26,6 +28,24 @@ class AppCorsTestCase(unittest.TestCase):
 
     self.assertIsNone(pattern.match("https://example.com"))
     self.assertIsNone(pattern.match("http://192.168.1.10:1420"))
+
+  def test_cors_origins_env_accepts_comma_separated_values(self) -> None:
+    with patch.dict(
+      os.environ,
+      {"NOVEL_CORS_ORIGINS": "http://localhost:1420,http://127.0.0.1:1420"},
+    ):
+      settings = Settings()
+
+    self.assertEqual(settings.cors_origins, ["http://localhost:1420", "http://127.0.0.1:1420"])
+
+  def test_cors_origins_env_accepts_json_array(self) -> None:
+    with patch.dict(
+      os.environ,
+      {"NOVEL_CORS_ORIGINS": '["http://localhost:1420","http://127.0.0.1:1420"]'},
+    ):
+      settings = Settings()
+
+    self.assertEqual(settings.cors_origins, ["http://localhost:1420", "http://127.0.0.1:1420"])
 
 
 class AppValidationErrorTestCase(unittest.TestCase):

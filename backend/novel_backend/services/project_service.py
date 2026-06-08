@@ -68,6 +68,7 @@ from novel_backend.models import (
   StoryDocumentUpdateRequest,
   StoryEntityReference,
   StoryOverview,
+  StoryOverviewModelStatus,
   WorkingTreeStatus,
 )
 from novel_backend.services.embedding_service import embed_texts, embedding_config_signature
@@ -176,7 +177,6 @@ _MIGRATION_AGENT_TEXT_KEYS = {
 }
 _MIGRATION_AGENT_NOTICE_TITLE = "Obsidian 资料分析已移除"
 _MODEL_STORY_OVERVIEW_SOURCE_CHUNK_LIMIT = 4500
-_MODEL_STORY_OVERVIEW_FAILURE_COOLDOWN_SECONDS = 600
 _ARCHITECTURE_PROGRESS_FILENAME = "architecture_progress.json"
 _ARCHITECTURE_PROGRESS_SCHEMA_VERSION = "1"
 _AGENT_THREAD_CONTEXT_DIRNAME = "thread_context"
@@ -925,18 +925,6 @@ _LOCATION_ORGANIZATION_FOLLOWING_SUFFIXES = tuple(
 )
 def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_iso_datetime(value: object) -> datetime | None:
-  if not isinstance(value, str) or not value.strip():
-    return None
-  try:
-    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-  except ValueError:
-    return None
-  if parsed.tzinfo is None:
-    return parsed.replace(tzinfo=timezone.utc)
-  return parsed.astimezone(timezone.utc)
 
 
 def _safe_folder_name(name: str) -> str:
@@ -5779,29 +5767,27 @@ def _invoke_auxiliary_model(
     raise
 
 
-def _request_model_story_overview(settings: Settings, source_text: str) -> dict[str, object] | None:
+def _request_model_story_overview(settings: Settings, source_text: str) -> dict[str, object]:
   messages = _model_overview_messages(source_text)
   config, api_key, model_source = _story_overview_model_enabled(settings)
   if config is None:
     append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
-    return None
-  try:
-    content = _invoke_auxiliary_model(
-      settings,
-      messages,
-      task_name="story_overview_model",
-      temperature=0.1,
-      max_tokens=8192,
-      model_config=config,
-      api_key=api_key,
-      model_source=model_source,
-      timeout=240,
-    )
-    return _extract_json_object_from_text(content)
-  except Exception as error:
-    if str(error) == "辅助模型未配置":
-      append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
-    return None
+    raise RuntimeError("模型总览生成失败：写作模型和第二审查模型均未配置。")
+  content = _invoke_auxiliary_model(
+    settings,
+    messages,
+    task_name="story_overview_model",
+    temperature=0.1,
+    max_tokens=8192,
+    model_config=config,
+    api_key=api_key,
+    model_source=model_source,
+    timeout=240,
+  )
+  payload = _extract_json_object_from_text(content)
+  if payload is None:
+    raise RuntimeError("模型总览生成失败：模型返回的不是合法 JSON。")
+  return payload
 
 
 def _normalized_evidence_text(text: str) -> str:
@@ -6178,24 +6164,26 @@ def _merge_model_story_overviews(
   )
 
 
-def _model_story_overview_failure_active(project_dir: Path) -> bool:
+def _read_model_story_overview_failure(project_dir: Path) -> dict[str, object] | None:
   payload = read_json(_model_story_overview_failure_path(project_dir), None)
-  if not isinstance(payload, dict):
-    return False
-  retry_after = _parse_iso_datetime(payload.get("retry_after"))
-  if retry_after is None:
-    return False
-  return retry_after > datetime.now(timezone.utc)
+  return payload if isinstance(payload, dict) else None
+
+
+def _model_story_overview_failure_message(payload: dict[str, object] | None) -> str:
+  error = str((payload or {}).get("error") or "").strip()
+  if error:
+    if error.startswith("模型总览生成失败"):
+      return error
+    return f"模型总览生成失败：{error}"
+  return "模型总览生成失败，请检查写作模型或第二审查模型配置和模型调用日志。"
 
 
 def _write_model_story_overview_failure(project_dir: Path, error: str) -> None:
-  retry_after_timestamp = datetime.now(timezone.utc).timestamp() + _MODEL_STORY_OVERVIEW_FAILURE_COOLDOWN_SECONDS
   atomic_write_json(
     _model_story_overview_failure_path(project_dir),
     {
       "schema_version": _MODEL_STORY_OVERVIEW_SCHEMA_VERSION,
       "failed_at": _now_iso(),
-      "retry_after": datetime.fromtimestamp(retry_after_timestamp, timezone.utc).isoformat(),
       "error": str(error or "模型总览生成失败"),
     },
   )
@@ -6206,6 +6194,69 @@ def _clear_model_story_overview_failure(project_dir: Path) -> None:
     _model_story_overview_failure_path(project_dir).unlink()
   except FileNotFoundError:
     pass
+
+
+def _model_story_overview_status(
+  settings: Settings,
+  project_dir: Path,
+  documents: list[StoryDocument],
+  material_payloads: list[dict[str, str]],
+  chapters: list[ChapterSummary],
+) -> StoryOverviewModelStatus:
+  source_signature = _overview_source_signature(
+    documents,
+    material_payloads,
+    chapters,
+    obsidian_source_signature_entries(project_dir),
+  )
+  cache_payload = read_json(_model_story_overview_path(project_dir), None)
+  stale_generated_at = ""
+  if isinstance(cache_payload, dict) and cache_payload.get("schema_version") == _MODEL_STORY_OVERVIEW_SCHEMA_VERSION:
+    generated_at = str(cache_payload.get("generated_at") or "")
+    if cache_payload.get("source_signature") == source_signature:
+      return StoryOverviewModelStatus(
+        status="ready",
+        message="模型总览已生成。",
+        generated_at=generated_at,
+      )
+    stale_generated_at = generated_at
+
+  failure_payload = _read_model_story_overview_failure(project_dir)
+  if failure_payload is not None:
+    return StoryOverviewModelStatus(
+      status="failed",
+      message=_model_story_overview_failure_message(failure_payload),
+      failed_at=str(failure_payload.get("failed_at") or ""),
+      error=str(failure_payload.get("error") or ""),
+    )
+
+  if stale_generated_at:
+    return StoryOverviewModelStatus(
+      status="stale",
+      message="模型总览已过期，需要重新生成。",
+      generated_at=stale_generated_at,
+    )
+
+  if _story_overview_model_enabled(settings)[0] is None:
+    return StoryOverviewModelStatus(
+      status="disabled",
+      message="写作模型和第二审查模型均未配置，不能生成模型总览。",
+    )
+
+  return StoryOverviewModelStatus(
+    status="not_generated",
+    message="模型总览还没有生成。",
+  )
+
+
+def _base_story_overview(project_dir: Path, documents: list[StoryDocument], status: StoryOverviewModelStatus) -> StoryOverview:
+  return StoryOverview(
+    documents=documents,
+    materials=_build_knowledge_materials(project_dir),
+    obsidian=load_obsidian_state(project_dir),
+    memory_entries=load_project_memory(project_dir),
+    model_overview=status,
+  )
 
 
 def _model_story_overview_or_none(
@@ -6230,11 +6281,9 @@ def _model_story_overview_or_none(
     return cached
   if not allow_request:
     return None
-  if not force and _model_story_overview_failure_active(project_dir):
-    return None
   if _story_overview_model_enabled(settings)[0] is None:
     append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
-    return None
+    raise RuntimeError("模型总览生成失败：写作模型和第二审查模型均未配置。")
 
   obsidian_records, _obsidian_skipped, _obsidian_warnings = collect_obsidian_note_records(project_dir)
   source_blocks = _overview_source_blocks(documents, material_payloads, chapters, obsidian_records)
@@ -6251,11 +6300,15 @@ def _model_story_overview_or_none(
   chunk_overviews: list[StoryOverview] = []
   for index, source_chunk in enumerate(source_chunks, start=1):
     chunk_text = f"【来源分片 {index}/{len(source_chunks)}】\n{source_chunk}"
-    model_payload = _request_model_story_overview(settings, chunk_text)
-    if model_payload is None:
+    try:
+      model_payload = _request_model_story_overview(settings, chunk_text)
+    except Exception as error:
       append_app_log(settings, f"story_overview_model chunk {index}/{len(source_chunks)} failed", level="WARNING")
-      _write_model_story_overview_failure(project_dir, f"chunk {index}/{len(source_chunks)} failed")
-      return None
+      _write_model_story_overview_failure(project_dir, str(error))
+      error_message = str(error)
+      if not error_message.startswith("模型总览生成失败"):
+        error_message = f"模型总览生成失败：{error_message}"
+      raise RuntimeError(error_message) from error
     chunk_overview = _validated_model_story_overview(
       model_payload,
       project_dir=project_dir,
@@ -6270,7 +6323,7 @@ def _model_story_overview_or_none(
   if overview is None:
     append_app_log(settings, "story_overview_model returned no validated overview nodes", level="WARNING")
     _write_model_story_overview_failure(project_dir, "returned no validated overview nodes")
-    return None
+    raise RuntimeError("模型总览生成失败：模型没有返回可验证的人物、事件或世界要素。")
   atomic_write_json(
     _model_story_overview_path(project_dir),
     {
@@ -6390,6 +6443,7 @@ def _build_story_overview(
 ) -> StoryOverview:
   documents = _build_story_documents(project_dir)
   material_payloads = _load_knowledge_material_payloads(project_dir)
+  model_status = _model_story_overview_status(settings, project_dir, documents, material_payloads, chapters)
   model_overview = _model_story_overview_or_none(
     settings,
     project_dir,
@@ -6401,14 +6455,15 @@ def _build_story_overview(
     use_cache=use_model_overview_cache,
   )
   if model_overview is not None:
-    return model_overview.model_copy(update={"obsidian": load_obsidian_state(project_dir)})
+    model_status = _model_story_overview_status(settings, project_dir, documents, material_payloads, chapters)
+    return model_overview.model_copy(
+      update={
+        "obsidian": load_obsidian_state(project_dir),
+        "model_overview": model_status,
+      }
+    )
 
-  return StoryOverview(
-    documents=documents,
-    materials=_build_knowledge_materials(project_dir),
-    obsidian=load_obsidian_state(project_dir),
-    memory_entries=load_project_memory(project_dir),
-  )
+  return _base_story_overview(project_dir, documents, model_status)
 
 
 def _overview_has_structured_entities(overview: StoryOverview) -> bool:

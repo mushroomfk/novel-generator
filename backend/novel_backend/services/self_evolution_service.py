@@ -2628,7 +2628,8 @@ def _invoke_optional_reviewer_model(settings: Settings, messages: list[dict[str,
   base_url = os.environ.get("NOVEL_REVIEW_MODEL_BASE_URL", "").strip()
   model_name = os.environ.get("NOVEL_REVIEW_MODEL_NAME", "").strip()
   max_tokens = int(os.environ.get("NOVEL_REVIEW_MODEL_MAX_TOKENS", "") or review_config.max_tokens)
-  temperature = float(os.environ.get("NOVEL_REVIEW_MODEL_TEMPERATURE", "") or review_config.temperature)
+  temperature_text = os.environ.get("NOVEL_REVIEW_MODEL_TEMPERATURE", "").strip()
+  temperature = float(temperature_text) if temperature_text else review_config.temperature
   if not api_key and bool(review_config.enabled):
     api_key = review_config.api_key.strip()
   if not base_url and bool(review_config.enabled):
@@ -2639,16 +2640,18 @@ def _invoke_optional_reviewer_model(settings: Settings, messages: list[dict[str,
     return ""
   endpoint = _chat_completions_endpoint(base_url)
   try:
+    payload: dict[str, object] = {
+      "model": model_name,
+      "messages": messages,
+      "max_tokens": max_tokens,
+    }
+    if temperature is not None:
+      payload["temperature"] = temperature
     with model_runtime_slot(settings, lane="chat", task_name="self_evolution_model_review:cross"):
       response_payload = _request_chat_completion(
         endpoint,
         api_key,
-        {
-          "model": model_name,
-          "messages": messages,
-          "temperature": temperature,
-          "max_tokens": max_tokens,
-        },
+        payload,
       )
   except Exception as error:
     mark_model_runtime_cooldown(settings, "chat", str(error))

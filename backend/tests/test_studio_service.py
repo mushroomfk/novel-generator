@@ -1001,6 +1001,36 @@ class StudioServiceTestCase(unittest.TestCase):
     self.assertIn("那股看不见的人气已经贴到了门边", result_event[1]["content"])
     self.assertIn("标准模式生成候选", result_event[1]["summary"])
 
+  def test_chapter_generate_stream_respects_explicit_target_words(self) -> None:
+    def fake_pipeline(_settings, **kwargs):
+      self.assertEqual(kwargs["target_words"], 900)
+      self.assertFalse(kwargs["prefer_project_budget"])
+      self.assertFalse(kwargs["complete_chapter"])
+      return {
+        "headline": "短章节测试",
+        "summary": "已按调用方目标长度生成。",
+        "content": "# 第一章 雨夜靠港\n林追按住铜钥匙，听见门外的脚步声停在雨里。\n",
+        "next_action": "继续推进。",
+      }
+
+    with patch("novel_backend.services.studio_service._run_continuation_pipeline", side_effect=fake_pipeline):
+      events = asyncio.run(
+        collect_stream(
+          chapter_generate_stream(
+            self.settings,
+            ChapterGenerateRequest(
+              project_id=self.project.id,
+              chapter_id="chapter-001",
+              instruction="生成一段短测试正文。",
+              target_words=900,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertEqual(result_event[1]["headline"], "短章节测试")
+
   def test_style_analyze_stream_and_related_storage(self) -> None:
     with patch(
       "novel_backend.services.generation_service._request_chat_completion",

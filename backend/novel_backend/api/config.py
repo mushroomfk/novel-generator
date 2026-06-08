@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from novel_backend.models import AppConfigUpdateRequest
-from novel_backend.services.config_service import load_config, save_config
+from novel_backend.models import AppConfigUpdateRequest, ModelConfigTestRequest
+from novel_backend.services.config_service import load_config, run_model_config_test, save_config
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -19,4 +19,11 @@ def get_config(request: Request):
 def update_config(request: Request, config_update: AppConfigUpdateRequest):
   settings = request.app.state.settings
   payload = save_config(settings, config_update)
+  return {"ok": True, "data": payload.model_dump(mode="json")}
+
+
+@router.post("/test")
+def post_config_test(request: Request, test_request: ModelConfigTestRequest):
+  settings = request.app.state.settings
+  payload = run_model_config_test(settings, test_request)
   return {"ok": True, "data": payload.model_dump(mode="json")}
