@@ -14,6 +14,7 @@
 - 报告完成前必须执行与改动范围匹配的验证。
 - 代码改动优先执行相关单测；影响较大时执行 `npm run verify`。
 - 前端体验改动需要执行相应 UI smoke 或浏览器检查。
+- 需要真实模型调用证据时，优先使用 `.venv/bin/python scripts/verify-real-model-longform.py --allow-real-model-calls`；脚本默认创建临时作品并验证写作模型、本地 Embedding、第二审查模型、章节保存、章节核验和知识检索。
 - 验证失败或无法验证时，在最终回复和 `CHANGELOG.md` 中写明实际状态。
 
 ## 项目知识同步

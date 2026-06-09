@@ -272,6 +272,7 @@ Embedding 检索默认使用随 sidecar 打包的本地 `BAAI/bge-small-zh-v1.5`
 | `npm run backend:test` | 运行 Python 单测 |
 | `npm run build` | 类型检查并构建前端 |
 | `npm run verify` | 执行打包脚本静态检查、backend 单测和前端构建 |
+| `.venv/bin/python scripts/verify-real-model-longform.py --allow-real-model-calls` | 使用当前保存配置和许可证创建临时作品，真实调用写作模型、本地 Embedding 和第二审查模型，完成章节生成、保存、核验和知识检索；默认 1 章，可用 `--chapters 2` 扩展 |
 | `npm run verify:packaging-static` | 检查内置 Embedding 模型文件、sidecar 打包脚本和 Windows 发布工作流关键步骤 |
 | `npm run verify:ui` | 运行浏览器层 smoke |
 | `npm run backend:bundle` | 打包 Python sidecar |
