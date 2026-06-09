@@ -18,6 +18,18 @@
 
 ## 2026-06-09
 
+### Agent 运行状态流文案与样式调整
+
+- 修改摘要：Agent 执行中的聊天消息改成更接近状态流的展示方式，状态行按“已完成 / 正在运行 / 正在思考”显示步骤、耗时和说明；运行耗时统一显示为“已持续”，每类 Agent 动作在没有后端摘要时也会显示简短说明。任务完成后仍只保留结果说明、产物卡片和建议，不展示过程时间线或阶段摘要。
+- 影响范围：Agent 对话运行中前端展示、UI smoke 断言、README、Agent 执行架构说明和项目 Agent 指令；不改变 SSE 事件协议、workflow 文件结构、后端执行逻辑、章节写回或产物保存格式。
+- 验证结果：`npm run build` 通过；`npm run verify:ui` 通过，覆盖 Agent 运行中状态列表、完成后隐藏运行消息、完成后隐藏 action timeline 和阶段摘要，以及既有 Agent / Obsidian / 迁移包前端流程；`npm run verify` 通过，包含打包配置静态检查、428 个后端 unittest 和前端生产构建。
+
+### 桌面 sidecar 退出清理
+
+- 修改摘要：全量验证时发现本机存在多条 `/Applications/稿匣.app/Contents/MacOS/novel-backend` 孤儿进程，父进程均为 1，说明旧桌面 app 退出后可能留下 sidecar。Tauri 壳现在退出时会先请求 `POST /api/app/shutdown`，短暂等待后再结束子进程；macOS 生产包启动时会清理同一 app 包内父进程已失效的旧 `novel-backend`，避免多次启动后积累后台后端进程。本机已终止确认无主进程的旧 sidecar。
+- 影响范围：macOS 桌面壳 sidecar 生命周期、桌面发布静态检查、README、桌面发布回归说明、桌面版方案和项目 Agent 指令；不改变前端 API、后端接口、模型配置、作品数据结构或 Windows 打包脚本。
+- 验证结果：`cargo check` 通过；`npm run verify` 通过，包含打包配置静态检查、428 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖主要浏览器工作流；`npm run verify:desktop` 通过，包含打包配置静态检查、428 个后端 unittest、前端构建、Python sidecar 打包、独立 sidecar 健康检查和本地 Embedding 512 维测试、Tauri debug `.app` / `.dmg` 构建、签名检查、应用内 sidecar 健康检查和 `.app` 启动检查；使用当前保存配置执行真实模型配置测试通过，写作模型 `qwen3-max`、本地 Embedding `BAAI/bge-small-zh-v1.5` 和第二审查模型 `qwen/qwen3.7-max` 均为 passed；真实章节端到端脚本因验证脚本把 `update_chapter_content()` 返回值当成二元组而失败，不能作为通过证据；`cargo fmt --check` 未执行成功，原因是当前 `stable-aarch64-apple-darwin` toolchain 没有可用的 `rustfmt` 组件。
+
 ### 项目记忆人物改名规则精确化
 
 - 修改摘要：章节核验的 `项目记忆规则` 维度现在会把“不要把 A 改名为 B”“A 不能叫成 B”识别为明确的人物替换规则；正文需要出现 A 被改成、写成或叫成 B 这类语境才记为 critical，B 作为正常角色名出场不会单独触发风险。这样能继续拦住长篇中的人物混名，同时减少合法角色同章出现时的误报。
@@ -26,7 +38,7 @@
 
 ### Agent 运行中状态与完成态结果展示
 
-- 修改摘要：Agent 对话在任务执行中改为轻量实时状态列表，按“已运行 / 正在运行 / 正在思考”展示步骤、耗时和摘要；执行完成后，历史消息不再展示已执行计划、状态标签、执行步骤或 `event_blocks` 阶段摘要，只保留结果说明、产物卡片和建议。整书架构执行确认弹窗继续说明新的展示方式。
+- 修改摘要：Agent 对话在任务执行中改为轻量实时状态列表，按“已完成 / 正在运行 / 正在思考”展示步骤、耗时和摘要；执行完成后，历史消息不再展示已执行计划、状态标签、执行步骤或 `event_blocks` 阶段摘要，只保留结果说明、产物卡片和建议。整书架构执行确认弹窗继续说明新的展示方式。
 - 影响范围：Agent 对话前端展示、整书架构执行确认文案、UI smoke 断言、截图脚本、README、Agent 执行架构说明、技能流程回归清单和项目 Agent 指令；不改变 SSE 事件协议、workflow 文件结构、后端执行逻辑或产物保存格式。
 - 验证结果：`npm run build` 通过；`npm run verify:ui` 第一次在新加的固定回复文案等待处失败，章节生成、审校和写回实际已完成，改为用产物卡片和项目正文写回作为完成信号后重跑；第二次在知识检索结果等待处失败，后端检索接口返回 200，重跑后通过；最终 `npm run verify:ui` 通过，覆盖 Agent 执行中状态列表、完成后隐藏 action timeline 和阶段摘要、既有 Agent / Obsidian / 迁移包前端流程；`npm run verify:packaging-static` 通过；`git diff --check` 通过。
 

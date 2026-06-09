@@ -105,6 +105,15 @@ includesAll(macVerify, 'scripts/verify-desktop-release.sh', [
   'npm run tauri -- build --debug',
 ]);
 
+const tauriRuntime = read('src-tauri/src/lib.rs');
+includesAll(tauriRuntime, 'src-tauri/src/lib.rs', [
+  'request_backend_shutdown',
+  'POST /api/app/shutdown HTTP/1.1',
+  'cleanup_orphaned_sidecars',
+  'pid=,ppid=,command=',
+  'novel-backend',
+]);
+
 const windowsVerify = read('scripts/verify-windows-release.ps1');
 includesAll(windowsVerify, 'scripts/verify-windows-release.ps1', [
   'npm run verify:packaging-static',

@@ -353,7 +353,7 @@ function runtimeStatusLabel(status) {
     return sessionStatus.value === 'cancelling' ? '正在停止' : '正在运行';
   }
   if (normalized === 'failed') {
-    return '执行失败';
+    return '运行失败';
   }
   if (normalized === 'cancelled') {
     return '已停止';
@@ -361,7 +361,7 @@ function runtimeStatusLabel(status) {
   if (normalized === 'pending') {
     return '等待运行';
   }
-  return '已运行';
+  return '已完成';
 }
 
 function runtimeStatusDetail(item) {
@@ -382,6 +382,67 @@ function runtimeStatusDetail(item) {
   return '';
 }
 
+function runtimeActionSummary(item) {
+  const explicitSummary = String(item?.summary ?? '').trim();
+  if (explicitSummary) {
+    return explicitSummary;
+  }
+
+  const normalizedStatus = String(item?.status ?? '').trim();
+  const isRunning = normalizedStatus === 'running';
+  const actionKind = String(item?.actionKind ?? '').trim();
+  const labels = {
+    session_prepare: isRunning
+      ? '正在读取项目设定、章节和资料库。'
+      : '项目设定、章节和资料库已经读取。',
+    session_plan: isRunning
+      ? '正在整理本轮任务步骤。'
+      : '本轮任务步骤已经整理完成。',
+    review_knowledge: isRunning
+      ? '正在筛选本轮需要引用的资料。'
+      : '本轮引用资料已经整理完成。',
+    brainstorm: isRunning
+      ? '正在分析当前问题和可选方向。'
+      : '讨论结果已经整理完成。',
+    generate_architecture: isRunning
+      ? '正在写入整书架构和章节目标。'
+      : '整书架构和章节目标已经写回项目。',
+    continue_project: isRunning
+      ? '正在生成后续章节规划。'
+      : '后续章节规划已经生成。',
+    chapter_generate: isRunning
+      ? '正在生成正文并执行章节检查。'
+      : '正文已经生成并完成章节检查。',
+    chapter_workflow: isRunning
+      ? '正在推进章节工作流。'
+      : '章节工作流已经完成。',
+    chapter_review: isRunning
+      ? '正在检查人物、情节和资料约束。'
+      : '人物、情节和资料约束已经检查。',
+    rewrite_chapter: isRunning
+      ? '正在改写正文，并保留剧情事实和信息顺序。'
+      : '正文改写已经完成。',
+    skill_optimize: isRunning
+      ? '正在整理可复用技能。'
+      : '可复用技能已经整理完成。',
+  };
+
+  if (labels[actionKind]) {
+    return labels[actionKind];
+  }
+
+  if (normalizedStatus === 'failed') {
+    return '该步骤没有完成，请查看错误说明。';
+  }
+  if (normalizedStatus === 'cancelled') {
+    return '该步骤已经停止。';
+  }
+  if (normalizedStatus === 'pending') {
+    return '等待前面的步骤完成。';
+  }
+  return isRunning ? '正在处理当前任务。' : '';
+}
+
 const runtimeStatusItems = computed(() => {
   if (!sessionTimeline.value.length) {
     return [
@@ -389,7 +450,7 @@ const runtimeStatusItems = computed(() => {
         id: 'runtime-status-thinking',
         status: 'running',
         label: sessionStatus.value === 'cancelling' ? '正在停止' : '正在思考',
-        detail: sessionStatus.value === 'cancelling' ? sessionElapsedLabel.value : '',
+        detail: `已持续 ${sessionElapsedLabel.value}`,
         summary: sessionStatus.value === 'cancelling'
           ? '正在通知后端停止后续动作。'
           : '正在建立任务状态。',
@@ -402,7 +463,7 @@ const runtimeStatusItems = computed(() => {
     status: String(item.status ?? 'completed').trim() || 'completed',
     label: `${runtimeStatusLabel(item.status)} ${String(item.label ?? '').trim() || '执行步骤'}`,
     detail: runtimeStatusDetail(item),
-    summary: String(item.summary ?? '').trim(),
+    summary: runtimeActionSummary(item),
   }));
 });
 
@@ -2310,7 +2371,7 @@ onBeforeUnmount(() => {
 
             <div class="runtime-message-head">
               <strong>{{ runtimeStripTitle }}</strong>
-              <span>{{ runtimeProgressText }} · 已处理 {{ sessionElapsedLabel }}</span>
+              <span>{{ runtimeProgressText }} · 已持续 {{ sessionElapsedLabel }}</span>
             </div>
 
             <p class="runtime-message-copy">
@@ -2375,7 +2436,7 @@ onBeforeUnmount(() => {
         <div class="runtime-strip-head">
           <div class="runtime-strip-meta">
             <span class="runtime-strip-badge">{{ runtimeProgressText }}</span>
-            <span class="runtime-strip-elapsed">已处理 {{ sessionElapsedLabel }}</span>
+            <span class="runtime-strip-elapsed">已持续 {{ sessionElapsedLabel }}</span>
           </div>
         <button
           class="runtime-strip-stop"
@@ -3005,10 +3066,8 @@ onBeforeUnmount(() => {
 }
 
 .stream-card-runtime {
-  width: min(760px, 100%);
-  gap: 12px;
-  border-left: 2px solid #9bbcf6;
-  padding-left: 14px;
+  width: min(800px, 100%);
+  gap: 14px;
 }
 
 .stream-head {
@@ -3131,25 +3190,25 @@ onBeforeUnmount(() => {
 
 .runtime-status-list {
   display: grid;
-  gap: 12px;
-  padding: 2px 0 0;
+  gap: 18px;
+  padding: 4px 0 0;
 }
 
 .runtime-status-row {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 12px;
   align-items: start;
   color: #8b949e;
 }
 
 .runtime-status-icon {
   position: relative;
-  width: 16px;
-  height: 16px;
-  margin-top: 3px;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
   border: 2px solid currentColor;
-  border-radius: 4px;
+  border-radius: 5px;
 }
 
 .runtime-status-icon::before {
@@ -3185,7 +3244,7 @@ onBeforeUnmount(() => {
 
 .runtime-status-copy {
   display: grid;
-  gap: 4px;
+  gap: 7px;
   min-width: 0;
 }
 
@@ -3199,13 +3258,13 @@ onBeforeUnmount(() => {
 .runtime-status-line strong {
   min-width: 0;
   color: #8b949e;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   line-height: 1.55;
 }
 
 .runtime-status-row-running .runtime-status-line strong {
-  color: #4b5563;
+  color: #7b8490;
 }
 
 .runtime-status-row-failed .runtime-status-line strong,
@@ -3221,9 +3280,15 @@ onBeforeUnmount(() => {
 
 .runtime-status-copy p {
   margin: 0;
-  color: #4b5563;
-  font-size: 14px;
-  line-height: 1.75;
+  color: #24292f;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.7;
+}
+
+.runtime-status-row-failed .runtime-status-copy p,
+.runtime-status-row-cancelled .runtime-status-copy p {
+  color: #b42318;
 }
 
 @keyframes runtime-status-pulse {

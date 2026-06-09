@@ -42,7 +42,7 @@
    - 执行前会记录预检结果、动作进入条件、失败策略和预期产物
    - 执行中会刷新 action heartbeat；子任务会单独写入 `.gaoxia/runs/{task_id}/subtasks/*.json`
    - 执行后会校验 action 产物是否满足契约，并把 workflow 状态作为 `workflow_run` 产物返回
-   - 执行中前端会用实时状态列表展示“已运行 / 正在运行 / 正在思考”、步骤耗时和摘要；执行结束时仍会写入最终 `session_result` event block，但聊天历史只保留结果说明、产物卡片和建议，不展示计划卡、状态标签、执行步骤或阶段摘要
+   - 执行中前端会用实时状态列表展示“已完成 / 正在运行 / 正在思考”、步骤耗时和摘要；执行结束时仍会写入最终 `session_result` event block，但聊天历史只保留结果说明、产物卡片和建议，不展示计划卡、状态标签、执行步骤或阶段摘要
    - `GET /api/studio/agent/{project_id}/runs/{task_id}` 可读取 workflow 摘要；`POST /api/studio/agent/{project_id}/runs/{task_id}/interrupt` 会写入中断请求，Agent 执行循环在动作边界停止后续动作
    - 项目迁移包遇到项目目录外的 Obsidian Vault 时，会保留 workflow 状态结构，但会把其中的 Obsidian 资料分析 action / subtask 摘要改成迁移提示
 

@@ -1669,6 +1669,11 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByRole('button', { name: '确认执行' }).click();
     await page.getByTestId('agent-runtime-message').waitFor({ timeout: 10000 });
     await page.getByTestId('agent-runtime-status-list').first().waitFor({ timeout: 10000 });
+    await page
+      .locator('[data-testid="agent-runtime-status-row"]:visible')
+      .filter({ hasText: /正在运行|正在思考|已完成/u })
+      .first()
+      .waitFor({ timeout: 10000 });
     await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
     await page.getByTestId('agent-runtime-message').waitFor({ state: 'hidden', timeout: 10000 });
     const visibleAgentTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
