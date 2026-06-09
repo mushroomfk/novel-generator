@@ -22,7 +22,7 @@
 
 - 修改摘要：Agent 对话在任务执行中新增聊天流实时状态卡，展示当前步骤、耗时、上下文和 action timeline；执行完成后，历史消息不再长期展开完整执行步骤，只保留结果说明、最终 `session_result` 阶段摘要和产物卡片。整书架构执行确认弹窗同步说明新的展示方式。
 - 影响范围：Agent 对话前端展示、整书架构执行确认文案、UI smoke 断言、README、Agent 执行架构说明、技能流程回归清单和项目 Agent 指令；不改变 SSE 事件协议、workflow 文件结构、后端执行逻辑或产物保存格式。
-- 验证结果：`npm run build` 通过；`npm run verify:ui` 通过，覆盖 Agent 执行中状态卡、完成后隐藏 action timeline、最终结果阶段摘要和既有 Agent / Obsidian / 迁移包前端流程。
+- 验证结果：`npm run build` 通过；`npm run verify:ui` 通过，覆盖 Agent 执行中状态卡、完成后隐藏 action timeline、最终结果阶段摘要和既有 Agent / Obsidian / 迁移包前端流程；`npm run verify:desktop` 通过，包含打包配置静态检查、428 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri debug `.app` / `.dmg` 构建、签名检查、应用内 sidecar 健康检查和 `.app` 启动检查。
 
 ### 真实多章节模型验证与修订策略加强
 
