@@ -47,7 +47,7 @@ class ReviewModelConfig(BaseModel):
 class ChapterAutoRepairConfig(BaseModel):
   enabled: bool = True
   score_threshold: int = Field(default=65, ge=0, le=100)
-  max_rounds: int = Field(default=1, ge=0, le=3)
+  max_rounds: int = Field(default=2, ge=0, le=3)
 
 
 class ModelRuntimeConfig(BaseModel):

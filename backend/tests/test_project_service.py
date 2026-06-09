@@ -1975,6 +1975,76 @@ required_phrases: [银潮灯]
     self.assertEqual(repaired_status["obsidian_required_issue_count"], 0)
     self.assertEqual(repaired_status["must_repair_issue_count"], 0)
 
+  def test_auto_repair_uses_default_second_round_when_first_round_still_has_required_issue(self) -> None:
+    summary = self.create_demo_project("Obsidian 多轮自动修订")
+    vault_dir = Path(self._temp_dir.name) / "repair-vault-default-second-round"
+    vault_dir.mkdir()
+    (vault_dir / "第二章任务.md").write_text(
+      """---
+type: clue
+status: canonical
+chapter_range: 2-2
+required_phrases: [银潮灯]
+---
+# 第二章任务
+
+第二章必须让银潮灯进入主线。
+""",
+      encoding="utf-8",
+    )
+    with patch("novel_backend.services.project_service.embed_texts", side_effect=RuntimeError("embedding disabled")):
+      update_project_obsidian_config(
+        self.settings,
+        summary.id,
+        ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+      )
+
+    detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-002",
+      ChapterUpdateRequest(content="# 第二章 旧码头\n林追推开仓门，只看见一排没有点亮的油灯。\n"),
+    )
+    review_status = summarize_chapter_review_status(detail, "chapter-002")
+    self.assertEqual(review_status["obsidian_required_issue_count"], 1)
+    self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    repair_payloads = [
+      {
+        "summary": "第一次修订调整气氛，但仍遗漏必写项。",
+        "changes": ["增加仓门细节"],
+        "revised_content": "# 第二章 旧码头\n林追推开仓门，潮气扑面，只看见一排没有点亮的油灯。\n",
+      },
+      {
+        "summary": "第二次修订加入 Obsidian 必写设定。",
+        "changes": ["让银潮灯进入当前章"],
+        "revised_content": "# 第二章 旧码头\n林追推开仓门，潮气扑面，最深处的银潮灯忽然亮起，照出旧船队留下的潮痕。\n",
+      },
+    ]
+
+    with patch(
+      "novel_backend.services.chapter_auto_repair_service._invoke_model",
+      side_effect=[json.dumps(item, ensure_ascii=False) for item in repair_payloads],
+    ) as repair_model:
+      repaired_detail, review_error, repair_result = auto_repair_chapter_after_review(
+        self.settings,
+        summary.id,
+        "chapter-002",
+        detail,
+      )
+
+    self.assertEqual(review_error, "")
+    self.assertEqual(repair_model.call_count, 2)
+    self.assertTrue(repair_result.attempted)
+    self.assertTrue(repair_result.applied)
+    self.assertEqual(repair_result.rounds_attempted, 2)
+    self.assertEqual(repair_result.rounds_applied, 2)
+    repaired_chapter = next(item for item in repaired_detail.chapters if item.id == "chapter-002")
+    self.assertIn("银潮灯", repaired_chapter.content)
+    repaired_status = summarize_chapter_review_status(repaired_detail, "chapter-002")
+    self.assertEqual(repaired_status["obsidian_required_issue_count"], 0)
+    self.assertEqual(repaired_status["must_repair_issue_count"], 0)
+
   def test_auto_repair_uses_project_memory_state_rule_issues(self) -> None:
     summary = self.create_demo_project("项目记忆自动修订")
     update_project_memory(

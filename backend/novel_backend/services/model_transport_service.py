@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import ssl
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-_RETRY_DELAYS = (0.8, 2.0, 4.0)
+DEFAULT_MODEL_RETRY_DELAYS = (0.8, 2.0, 4.0, 8.0, 16.0)
+_MAX_RETRY_DELAY_COUNT = 8
+_MAX_RETRY_DELAY_SECONDS = 60.0
 _RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 _RETRYABLE_TRANSPORT_PATTERNS = (
   "unexpected_eof",
@@ -80,12 +83,40 @@ def _transport_error_reason(error: object) -> object:
   return error
 
 
-def _should_retry(attempt: int) -> bool:
-  return attempt < len(_RETRY_DELAYS)
+def _parse_retry_delays(raw_value: str) -> tuple[float, ...]:
+  values: list[float] = []
+  for raw_item in raw_value.replace(";", ",").split(","):
+    item = raw_item.strip()
+    if not item:
+      continue
+    try:
+      delay = float(item)
+    except ValueError:
+      return DEFAULT_MODEL_RETRY_DELAYS
+    if delay < 0:
+      return DEFAULT_MODEL_RETRY_DELAYS
+    values.append(min(delay, _MAX_RETRY_DELAY_SECONDS))
+    if len(values) >= _MAX_RETRY_DELAY_COUNT:
+      break
+  return tuple(values) if values else DEFAULT_MODEL_RETRY_DELAYS
 
 
-def _wait_before_retry(attempt: int) -> None:
-  time.sleep(_RETRY_DELAYS[attempt])
+def model_retry_delays() -> tuple[float, ...]:
+  return _parse_retry_delays(os.getenv("NOVEL_MODEL_RETRY_DELAYS", ""))
+
+
+def _should_retry(attempt: int, retry_delays: tuple[float, ...]) -> bool:
+  return attempt < len(retry_delays)
+
+
+def _wait_before_retry(attempt: int, retry_delays: tuple[float, ...]) -> None:
+  time.sleep(retry_delays[attempt])
+
+
+def _failure_message(message: str, attempts: int) -> str:
+  if attempts <= 1:
+    return message
+  return f"{message}（已尝试 {attempts} 次）"
 
 
 def request_json(
@@ -112,7 +143,8 @@ def request_json(
   )
 
   raw_text = ""
-  for attempt in range(len(_RETRY_DELAYS) + 1):
+  retry_delays = model_retry_delays()
+  for attempt in range(len(retry_delays) + 1):
     request = _build_request(
       endpoint,
       method=method,
@@ -128,10 +160,12 @@ def request_json(
     except urllib_error.HTTPError as error:
       error_text = error.read().decode("utf-8", errors="ignore")
       message = error_text or str(error)
-      if error.code in _RETRYABLE_HTTP_STATUS and _should_retry(attempt):
-        _wait_before_retry(attempt)
+      if error.code in _RETRYABLE_HTTP_STATUS and _should_retry(attempt, retry_delays):
+        _wait_before_retry(attempt, retry_delays)
         continue
-      raise RuntimeError(f"{failure_label}: {error.code} {message}") from error
+      raise RuntimeError(
+        _failure_message(f"{failure_label}: {error.code} {message}", attempt + 1)
+      ) from error
     except (
       urllib_error.URLError,
       TimeoutError,
@@ -143,10 +177,10 @@ def request_json(
       ssl.SSLError,
     ) as error:
       reason = _transport_error_reason(error)
-      if is_retryable_transport_error(reason) and _should_retry(attempt):
-        _wait_before_retry(attempt)
+      if is_retryable_transport_error(reason) and _should_retry(attempt, retry_delays):
+        _wait_before_retry(attempt, retry_delays)
         continue
-      raise RuntimeError(f"{failure_label}: {reason}") from error
+      raise RuntimeError(_failure_message(f"{failure_label}: {reason}", attempt + 1)) from error
 
   if not raw_text.strip():
     if allow_empty_response:

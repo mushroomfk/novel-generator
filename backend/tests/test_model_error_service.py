@@ -13,6 +13,7 @@ from novel_backend.services.generation_service import _invoke_model
 from novel_backend.services.log_service import get_prompt_history_records
 from novel_backend.services.model_error_service import classify_model_error
 from novel_backend.services.model_http_service import request_json_with_retries
+from novel_backend.services.model_transport_service import DEFAULT_MODEL_RETRY_DELAYS
 
 
 class _FakeHTTPResponse:
@@ -105,7 +106,49 @@ class ModelErrorServiceTestCase(unittest.TestCase):
 
     self.assertEqual(payload, {"ok": True})
     self.assertEqual(urlopen.call_count, 4)
-    self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.8, 1.6, 3.2])
+    self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.8, 2.0, 4.0])
+
+  def test_request_json_with_retries_allows_five_transient_ssl_errors(self) -> None:
+    ssl_eof = urllib_error.URLError(
+      "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
+    )
+    with patch(
+      "novel_backend.services.model_http_service.urllib_request.urlopen",
+      side_effect=[ssl_eof, ssl_eof, ssl_eof, ssl_eof, ssl_eof, _FakeHTTPResponse('{"ok": true}')],
+    ) as urlopen, patch("novel_backend.services.model_http_service.time.sleep") as sleep:
+      payload = request_json_with_retries(
+        "https://example.com/v1/chat/completions",
+        headers={"Authorization": "Bearer test-key"},
+        payload={"model": "demo", "messages": []},
+        error_prefix="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_payload_message="模型返回格式不正确",
+      )
+
+    self.assertEqual(payload, {"ok": True})
+    self.assertEqual(urlopen.call_count, 6)
+    self.assertEqual([call.args[0] for call in sleep.call_args_list], list(DEFAULT_MODEL_RETRY_DELAYS))
+
+  def test_request_json_with_retries_reports_attempt_count_after_retry_exhausted(self) -> None:
+    ssl_eof = urllib_error.URLError(
+      "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
+    )
+    with (
+      patch(
+        "novel_backend.services.model_http_service.urllib_request.urlopen",
+        side_effect=[ssl_eof] * 6,
+      ),
+      patch("novel_backend.services.model_http_service.time.sleep"),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "已尝试 6 次"):
+        request_json_with_retries(
+          "https://example.com/v1/chat/completions",
+          headers={"Authorization": "Bearer test-key"},
+          payload={"model": "demo", "messages": []},
+          error_prefix="模型请求失败",
+          invalid_json_message="模型返回的不是合法 JSON",
+          invalid_payload_message="模型返回格式不正确",
+        )
 
   def test_invoke_model_records_structured_error_history(self) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:

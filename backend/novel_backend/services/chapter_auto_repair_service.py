@@ -22,7 +22,7 @@ class ChapterAutoRepairResult:
   rounds_attempted: int = 0
   rounds_applied: int = 0
   score_threshold: int = 65
-  max_rounds: int = 1
+  max_rounds: int = 2
   reason: str = ""
   summary: str = ""
   changes: list[str] = field(default_factory=list)

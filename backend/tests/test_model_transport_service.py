@@ -7,7 +7,11 @@ from io import BytesIO
 from urllib import error as urllib_error
 from unittest.mock import patch
 
-from novel_backend.services.model_transport_service import is_retryable_transport_error, request_json
+from novel_backend.services.model_transport_service import (
+  DEFAULT_MODEL_RETRY_DELAYS,
+  is_retryable_transport_error,
+  request_json,
+)
 
 
 class FakeResponse:
@@ -75,6 +79,56 @@ class ModelTransportServiceTestCase(unittest.TestCase):
     self.assertEqual(payload, {"ok": True})
     self.assertEqual(urlopen.call_count, 4)
     self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.8, 2.0, 4.0])
+
+  def test_request_json_retries_five_transient_ssl_errors(self) -> None:
+    ssl_error = ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+
+    with (
+      patch(
+        "novel_backend.services.model_transport_service.urllib_request.urlopen",
+        side_effect=[
+          urllib_error.URLError(ssl_error),
+          urllib_error.URLError(ssl_error),
+          urllib_error.URLError(ssl_error),
+          urllib_error.URLError(ssl_error),
+          urllib_error.URLError(ssl_error),
+          FakeResponse('{"ok": true}'),
+        ],
+      ) as urlopen,
+      patch("novel_backend.services.model_transport_service.time.sleep") as sleep,
+    ):
+      payload = request_json(
+        "https://example.com/v1/chat/completions",
+        "test-key",
+        {"model": "demo"},
+        failure_label="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_format_message="模型返回格式不正确",
+      )
+
+    self.assertEqual(payload, {"ok": True})
+    self.assertEqual(urlopen.call_count, 6)
+    self.assertEqual([call.args[0] for call in sleep.call_args_list], list(DEFAULT_MODEL_RETRY_DELAYS))
+
+  def test_request_json_reports_attempt_count_after_retry_exhausted(self) -> None:
+    ssl_error = ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+
+    with (
+      patch(
+        "novel_backend.services.model_transport_service.urllib_request.urlopen",
+        side_effect=[urllib_error.URLError(ssl_error)] * 6,
+      ),
+      patch("novel_backend.services.model_transport_service.time.sleep"),
+    ):
+      with self.assertRaisesRegex(RuntimeError, "已尝试 6 次"):
+        request_json(
+          "https://example.com/v1/chat/completions",
+          "test-key",
+          {"model": "demo"},
+          failure_label="模型请求失败",
+          invalid_json_message="模型返回的不是合法 JSON",
+          invalid_format_message="模型返回格式不正确",
+        )
 
   def test_retryable_transport_error_matches_remote_disconnect(self) -> None:
     self.assertTrue(is_retryable_transport_error("Remote end closed connection without response"))

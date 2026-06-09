@@ -18,6 +18,12 @@
 
 ## 2026-06-09
 
+### 真实多章节模型验证与修订策略加强
+
+- 修改摘要：真实调用当前保存配置执行临时四章项目验证，确认写作模型 `qwen3-max`、打包内本地知识检索模型 `BAAI/bge-small-zh-v1.5` 和第二审查模型 `qwen/qwen3.7-max` 均可用；完整章生成链路曾在 SSL EOF 下失败，随后把聊天模型请求和设置页模型测试的可重试网络错误默认重试次数增至 5 次，并支持 `NOVEL_MODEL_RETRY_DELAYS` 调整等待间隔。章节自动修订默认次数从 1 轮改为 2 轮，并新增多轮修订回归测试。
+- 影响范围：写作模型调用、第二审查模型调用、模型设置测试、章节自动修订默认配置、连续性合同问题修订、README、核心引擎说明、项目 Agent 指令和相关单测；不改变模型名、接口地址、API Key 配置、本地 Embedding、项目文件格式或章节核验维度结构。
+- 验证结果：真实模型配置测试 passed：写作模型 `qwen3-max` 3.758 秒，本地 Embedding 512 维 0.527 秒，第二审查模型 `qwen/qwen3.7-max` 2.182 秒；真实临时项目完整生成第 1 章 1363 字符，保存后核验 86/100（良好），`项目记忆规则` 94/100 且无违规；真实生成第 2 章 1585 字符，自动修订后保存 1870 字符，核验 80/100（需关注），`项目记忆规则` 94/100 且无违规，脚本限制 1 轮自动修订时仍残留 4 个连续性合同类必须修订问题；知识检索返回蓝图、情节骨架、核心种子、人物设定和章节正文命中。`.venv/bin/python -m unittest backend.tests.test_config_service backend.tests.test_model_transport_service backend.tests.test_model_error_service backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_chapter_scoped_obsidian_required_phrase backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_default_second_round_when_first_round_still_has_required_issue backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_project_memory_state_rule_issues backend.tests.test_project_service.ProjectServiceTestCase.test_auto_repair_uses_project_memory_reveal_rule_issues -v` 通过，33 个用例通过；`npm run backend:test` 通过，427 个后端 unittest 通过；`npm run verify` 通过，包含打包配置静态检查、427 个后端 unittest 和前端生产构建。
+
 ### 模型请求临时断连重试增强
 
 - 修改摘要：聊天模型请求和设置页模型测试对 SSL EOF、远端中途断开、临时连接错误的自动重试次数从 2 次增加到 3 次；真实模型章节生成测试曾遇到 `SSL UNEXPECTED_EOF_WHILE_READING`，重试后才成功生成并完成审校，这次调整用于降低国内网络抖动导致整条生成链路中断的概率。

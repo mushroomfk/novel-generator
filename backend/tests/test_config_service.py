@@ -40,7 +40,7 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertIsNone(config.review_model.temperature)
     self.assertTrue(config.chapter_auto_repair.enabled)
     self.assertEqual(config.chapter_auto_repair.score_threshold, 65)
-    self.assertEqual(config.chapter_auto_repair.max_rounds, 1)
+    self.assertEqual(config.chapter_auto_repair.max_rounds, 2)
     self.assertEqual(config.model_runtime.max_chat_concurrency, 1)
     self.assertEqual(config.model_runtime.max_retrieval_concurrency, 1)
     self.assertEqual(config.model_runtime.chapter_candidate_mode, "standard")

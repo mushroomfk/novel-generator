@@ -6,10 +6,9 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from novel_backend.services.model_error_service import is_transient_model_network_error
-from novel_backend.services.model_transport_service import prepare_model_request_payload
+from novel_backend.services.model_transport_service import model_retry_delays, prepare_model_request_payload
 
 DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL_REQUEST_RETRY_DELAYS = (0.8, 1.6, 3.2)
 
 
 def request_json_with_retries(
@@ -21,13 +20,14 @@ def request_json_with_retries(
   invalid_json_message: str,
   invalid_payload_message: str,
   timeout: int = DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS,
-  retry_delays: tuple[float, ...] = DEFAULT_MODEL_REQUEST_RETRY_DELAYS,
+  retry_delays: tuple[float, ...] | None = None,
 ) -> dict[str, object]:
   safe_payload = prepare_model_request_payload(endpoint, payload)
   body = json.dumps(safe_payload, ensure_ascii=False).encode("utf-8")
   last_error: BaseException | None = None
+  active_retry_delays = model_retry_delays() if retry_delays is None else retry_delays
 
-  for attempt_index in range(len(retry_delays) + 1):
+  for attempt_index in range(len(active_retry_delays) + 1):
     request = urllib_request.Request(endpoint, data=body, method="POST")
     for key, value in headers.items():
       request.add_header(key, value)
@@ -43,16 +43,16 @@ def request_json_with_retries(
     except urllib_error.URLError as error:
       last_error = error
       reason = error.reason
-      if attempt_index < len(retry_delays) and is_transient_model_network_error(reason):
-        time.sleep(retry_delays[attempt_index])
+      if attempt_index < len(active_retry_delays) and is_transient_model_network_error(reason):
+        time.sleep(active_retry_delays[attempt_index])
         continue
-      raise RuntimeError(f"{error_prefix}: {reason}") from error
+      raise RuntimeError(f"{error_prefix}: {reason}（已尝试 {attempt_index + 1} 次）") from error
     except (TimeoutError, ConnectionError, OSError) as error:
       last_error = error
-      if attempt_index < len(retry_delays) and is_transient_model_network_error(error):
-        time.sleep(retry_delays[attempt_index])
+      if attempt_index < len(active_retry_delays) and is_transient_model_network_error(error):
+        time.sleep(active_retry_delays[attempt_index])
         continue
-      raise RuntimeError(f"{error_prefix}: {error}") from error
+      raise RuntimeError(f"{error_prefix}: {error}（已尝试 {attempt_index + 1} 次）") from error
   else:
     raise RuntimeError(f"{error_prefix}: {last_error}")
 
