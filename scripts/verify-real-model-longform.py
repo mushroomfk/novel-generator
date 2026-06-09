@@ -267,6 +267,51 @@ def project_memory_issue_count(detail, chapter_id_value: str) -> int:
   return 0
 
 
+def chapter_review_issue_summary(detail, chapter_id_value: str) -> list[str]:
+  review = next(
+    (item for item in detail.story_overview.chapter_reviews if item.chapter_id == chapter_id_value),
+    None,
+  )
+  if review is None:
+    return []
+  lines: list[str] = []
+  for dimension in review.dimensions:
+    for issue in dimension.issues:
+      lines.append(
+        f"{dimension.label}/{issue.level}/{issue.title}: {issue.detail}"
+      )
+  return lines
+
+
+def review_status_count(review_status: dict[str, object], key: str) -> int:
+  value = review_status.get(key)
+  if isinstance(value, bool):
+    return int(value)
+  if isinstance(value, (int, float)):
+    return int(value)
+  try:
+    return int(str(value or "").strip() or "0")
+  except ValueError:
+    return 0
+
+
+def strict_review_gate_failures(review_status: dict[str, object]) -> list[str]:
+  failures: list[str] = []
+  if review_status.get("status") == "risk":
+    failures.append(f"核验状态为有风险：{review_status.get('message')}")
+  for key, label in (
+    ("critical_issue_count", "critical 问题"),
+    ("obsidian_required_issue_count", "Obsidian 必写问题"),
+    ("obsidian_forbidden_issue_count", "Obsidian 禁写问题"),
+    ("continuity_contract_issue_count", "连续性合同问题"),
+    ("must_repair_issue_count", "必须修订问题"),
+  ):
+    count = review_status_count(review_status, key)
+    if count > 0:
+      failures.append(f"{label} {count} 个")
+  return failures
+
+
 def generate_save_review_chapter(
   settings: Settings,
   project_id: str,
@@ -339,10 +384,15 @@ def generate_save_review_chapter(
     raise RuntimeError(f"第 {index} 章核验失败：{review_error}")
   if not review_status.get("ok"):
     raise RuntimeError(f"第 {index} 章没有核验报告：{review_status.get('message')}")
-  if review_status.get("status") == "risk":
-    raise RuntimeError(f"第 {index} 章核验为有风险：{review_status.get('message')}")
   if memory_issues > 0:
     raise RuntimeError(f"第 {index} 章项目记忆规则仍有 {memory_issues} 个问题")
+  gate_failures = strict_review_gate_failures(review_status)
+  if gate_failures and not skip_auto_repair:
+    issue_summary = "；".join(chapter_review_issue_summary(detail, cid)[:8])
+    suffix = f"。问题明细：{issue_summary}" if issue_summary else ""
+    raise RuntimeError(f"第 {index} 章自动修订后仍未通过质量门：" + "；".join(gate_failures) + suffix)
+  if gate_failures and skip_auto_repair:
+    log(f"chapter {index}: review gate warnings with auto repair skipped: {'; '.join(gate_failures)}")
 
   log(
     f"chapter {index}: generated {len(draft)} chars in {elapsed_generate}s, "

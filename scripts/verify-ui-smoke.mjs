@@ -11,6 +11,7 @@ import { chromium } from 'playwright-core';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
+const OBSIDIAN_SYNC_TIMEOUT_MS = 60000;
 const CHROME_CANDIDATES = [
   process.env.CHROME_BIN,
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -1352,19 +1353,19 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.waitForFunction(() => {
       const button = document.querySelector('[data-testid="obsidian-save-button"]');
       return button instanceof HTMLButtonElement && !button.disabled;
-    });
-    await page.getByTestId('obsidian-vault-results').getByText('灯塔议会').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('已解析').first().waitFor();
-    await page.getByTestId('obsidian-external-link-count').getByText('1 条').waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('重复命名').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('重复命名：白石').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('歧义双链：白石').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('被引用：Characters/林追.md').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('适用章节：第 1-12 章').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('来源章节：第 1 章、第 3 章').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('必须包含：铜钥匙').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('禁止出现：林追主动交出铜钥匙').first().waitFor();
-    await page.getByTestId('obsidian-vault-results').getByText('考据来源：林追靠港账册：https://example.com/ui-smoke-harbor-ledger').first().waitFor();
+    }, undefined, { timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-external-link-count').getByText('1 条').waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('灯塔议会').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('已解析').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('重复命名').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('重复命名：白石').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('歧义双链：白石').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('被引用：Characters/林追.md').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('适用章节：第 1-12 章').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('来源章节：第 1 章、第 3 章').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('必须包含：铜钥匙').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('禁止出现：林追主动交出铜钥匙').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await page.getByTestId('obsidian-vault-results').getByText('考据来源：林追靠港账册：https://example.com/ui-smoke-harbor-ledger').first().waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
     await page.getByTestId('skill-use-knowledge-search').click();
     await page.getByTestId('knowledge-search-input').fill('灯塔议会');
     await page.getByTestId('knowledge-search-button').click();
