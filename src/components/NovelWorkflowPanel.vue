@@ -347,6 +347,65 @@ const runtimeStripContext = computed(() => {
     : '当前结果会写回项目';
 });
 
+function runtimeStatusLabel(status) {
+  const normalized = String(status ?? '').trim();
+  if (normalized === 'running') {
+    return sessionStatus.value === 'cancelling' ? '正在停止' : '正在运行';
+  }
+  if (normalized === 'failed') {
+    return '执行失败';
+  }
+  if (normalized === 'cancelled') {
+    return '已停止';
+  }
+  if (normalized === 'pending') {
+    return '等待运行';
+  }
+  return '已运行';
+}
+
+function runtimeStatusDetail(item) {
+  if (item.status === 'running') {
+    return `已持续 ${sessionElapsedLabel.value}`;
+  }
+
+  const materialCount = Number(item.materialCount ?? 0);
+  if (materialCount > 0) {
+    return `${materialCount} 份资料`;
+  }
+
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  if (changes.length > 0) {
+    return changes.slice(0, 2).join('、');
+  }
+
+  return '';
+}
+
+const runtimeStatusItems = computed(() => {
+  if (!sessionTimeline.value.length) {
+    return [
+      {
+        id: 'runtime-status-thinking',
+        status: 'running',
+        label: sessionStatus.value === 'cancelling' ? '正在停止' : '正在思考',
+        detail: sessionStatus.value === 'cancelling' ? sessionElapsedLabel.value : '',
+        summary: sessionStatus.value === 'cancelling'
+          ? '正在通知后端停止后续动作。'
+          : '正在建立任务状态。',
+      },
+    ];
+  }
+
+  return sessionTimeline.value.map((item, index) => ({
+    id: `${item.step || index + 1}-${item.actionKind || 'action'}-${item.label || index}`,
+    status: String(item.status ?? 'completed').trim() || 'completed',
+    label: `${runtimeStatusLabel(item.status)} ${String(item.label ?? '').trim() || '执行步骤'}`,
+    detail: runtimeStatusDetail(item),
+    summary: String(item.summary ?? '').trim(),
+  }));
+});
+
 const sessionElapsedLabel = computed(() => {
   const totalSeconds = Math.max(0, Number(sessionElapsedSeconds.value) || 0);
   if (totalSeconds < 60) {
@@ -1537,20 +1596,19 @@ function isCompletedExecutionMessage(message) {
   return Boolean(message?.role === 'assistant' && message.mode === 'execution');
 }
 
-function isResultEventBlock(block) {
-  const eventType = String(block?.eventType ?? block?.event_type ?? '').trim();
-  return ['session_result', 'session_error', 'session_finished', 'final_result'].includes(eventType)
-    || eventType.endsWith('_summary');
+function hasCompletedExecutionAfter(messageIndex) {
+  return discussionHistory.value
+    .slice(messageIndex + 1)
+    .some((message) => isCompletedExecutionMessage(message));
+}
+
+function shouldHideProcessMessage(message, messageIndex) {
+  return Boolean(message?.role === 'assistant' && message.mode === 'plan' && hasCompletedExecutionAfter(messageIndex));
 }
 
 function messageEventBlocks(message) {
   const blocks = Array.isArray(message.eventBlocks) ? message.eventBlocks : [];
-  if (!isCompletedExecutionMessage(message)) {
-    return blocks;
-  }
-
-  const resultBlocks = blocks.filter((block) => isResultEventBlock(block));
-  return resultBlocks.length ? resultBlocks : blocks.slice(-1);
+  return isCompletedExecutionMessage(message) ? [] : blocks;
 }
 
 function isPendingPlanMessage(message) {
@@ -2137,104 +2195,108 @@ onBeforeUnmount(() => {
             </div>
           </article>
 
-          <article
+          <template
             v-for="(item, index) in discussionHistory"
             :key="`${item.role}-${index}-${item.content.slice(0, 24)}`"
-            :class="[
-              'stream-card',
-              item.role === 'user'
-                ? 'stream-card-user'
-                : item.role === 'system'
-                  ? 'stream-card-system'
-                  : 'stream-card-assistant',
-            ]"
           >
-            <div class="stream-head">
-              <span>{{ item.role === 'user' ? '你' : item.role === 'system' ? '系统' : 'AI' }}</span>
-              <em v-if="messageModeLabel(item)">{{ messageModeLabel(item) }}</em>
-            </div>
-
-            <p class="message-content">{{ item.content }}</p>
-
-            <div
-              v-if="item.state"
-              class="state-pill-row"
+            <article
+              v-if="!shouldHideProcessMessage(item, index)"
+              :class="[
+                'stream-card',
+                item.role === 'user'
+                  ? 'stream-card-user'
+                  : item.role === 'system'
+                    ? 'stream-card-system'
+                    : 'stream-card-assistant',
+              ]"
             >
-              <span
-                v-for="pill in statePills(item.state)"
-                :key="pill"
-                class="state-pill"
+              <div class="stream-head">
+                <span>{{ item.role === 'user' ? '你' : item.role === 'system' ? '系统' : 'AI' }}</span>
+                <em v-if="messageModeLabel(item)">{{ messageModeLabel(item) }}</em>
+              </div>
+
+              <p class="message-content">{{ item.content }}</p>
+
+              <div
+                v-if="item.state && !isCompletedExecutionMessage(item)"
+                class="state-pill-row"
               >
-                {{ pill }}
-              </span>
-            </div>
+                <span
+                  v-for="pill in statePills(item.state)"
+                  :key="pill"
+                  class="state-pill"
+                >
+                  {{ pill }}
+                </span>
+              </div>
 
-            <AgentPlanCard
-              v-if="item.plan"
-              :active="isPendingPlanMessage(item)"
-              :plan="item.plan"
-              :status-text="planStatusLabel(item)"
-            >
-              <template
-                v-if="isPlanMessageActive(item)"
-                #actions
+              <AgentPlanCard
+                v-if="item.plan && !isCompletedExecutionMessage(item)"
+                :active="isPendingPlanMessage(item)"
+                :plan="item.plan"
+                :status-text="planStatusLabel(item)"
+              >
+                <template
+                  v-if="isPlanMessageActive(item)"
+                  #actions
+                >
+                  <button
+                    class="primary-button small-button plan-execute-button"
+                    data-testid="agent-plan-confirm-button"
+                    type="button"
+                    @click="openPlanConfirmModal"
+                  >
+                    执行当前计划
+                  </button>
+                </template>
+              </AgentPlanCard>
+
+              <AgentActionTimeline
+                v-if="messageTimelineItems(item).length"
+                :items="messageTimelineItems(item)"
+              />
+
+              <AgentEventBlockSummary
+                v-if="messageEventBlocks(item).length"
+                :blocks="messageEventBlocks(item)"
+              />
+
+              <AgentArtifactSummary
+                v-if="item.artifacts?.length"
+                :artifacts="item.artifacts"
+                @open-obsidian-maintenance="openObsidianMaintenanceFromArtifact"
+              />
+
+              <div
+                v-if="item.canSaveDiscussionSummary"
+                class="message-action-row"
               >
                 <button
-                  class="primary-button small-button plan-execute-button"
-                  data-testid="agent-plan-confirm-button"
+                  :disabled="discussionSavePending || discussionSummarySaved(item)"
+                  class="secondary-button small-button"
                   type="button"
-                  @click="openPlanConfirmModal"
+                  @click="saveDiscussionSummary(item)"
                 >
-                  执行当前计划
+                  {{ discussionSummarySaved(item) ? '已记为讨论结论' : discussionSavePending ? '写入中…' : '记为讨论结论' }}
                 </button>
-              </template>
-            </AgentPlanCard>
+              </div>
 
-            <AgentActionTimeline
-              v-if="messageTimelineItems(item).length"
-              :items="messageTimelineItems(item)"
-            />
-
-            <AgentEventBlockSummary
-              v-if="messageEventBlocks(item).length"
-              :blocks="messageEventBlocks(item)"
-            />
-
-            <AgentArtifactSummary
-              v-if="item.artifacts?.length"
-              :artifacts="item.artifacts"
-              @open-obsidian-maintenance="openObsidianMaintenanceFromArtifact"
-            />
-
-            <div
-              v-if="item.canSaveDiscussionSummary"
-              class="message-action-row"
-            >
-              <button
-                :disabled="discussionSavePending || discussionSummarySaved(item)"
-                class="secondary-button small-button"
-                type="button"
-                @click="saveDiscussionSummary(item)"
+              <div
+                v-if="item.suggestions?.length"
+                class="suggestion-row"
               >
-                {{ discussionSummarySaved(item) ? '已记为讨论结论' : discussionSavePending ? '写入中…' : '记为讨论结论' }}
-              </button>
-            </div>
-
-            <div
-              v-if="item.suggestions?.length"
-              class="suggestion-row"
-            >
-              <button
-                v-for="suggestion in item.suggestions"
-                :key="suggestion"
-                class="suggestion-button"
-                type="button"
-                @click="handleSuggestionClick(suggestion)"
-              >
-                {{ suggestion }}
-              </button>
-            </div>
-          </article>
+                <button
+                  v-for="suggestion in item.suggestions"
+                  :key="suggestion"
+                  class="suggestion-button"
+                  type="button"
+                  @click="handleSuggestionClick(suggestion)"
+                >
+                  {{ suggestion }}
+                </button>
+              </div>
+            </article>
+          </template>
 
           <article
             v-if="activeDiscussionIsRunning"
@@ -2256,16 +2318,29 @@ onBeforeUnmount(() => {
               <span>{{ runtimeStripContext }}</span>
             </p>
 
-            <AgentActionTimeline
-              v-if="sessionTimeline.length"
-              :items="sessionTimeline"
-            />
-            <p
-              v-else
-              class="runtime-message-empty"
+            <div
+              class="runtime-status-list"
+              data-testid="agent-runtime-status-list"
             >
-              正在建立任务状态…
-            </p>
+              <div
+                v-for="item in runtimeStatusItems"
+                :key="item.id"
+                :class="['runtime-status-row', `runtime-status-row-${item.status}`]"
+                data-testid="agent-runtime-status-row"
+              >
+                <span
+                  class="runtime-status-icon"
+                  aria-hidden="true"
+                ></span>
+                <div class="runtime-status-copy">
+                  <div class="runtime-status-line">
+                    <strong>{{ item.label }}</strong>
+                    <span v-if="item.detail">{{ item.detail }}</span>
+                  </div>
+                  <p v-if="item.summary">{{ item.summary }}</p>
+                </div>
+              </div>
+            </div>
           </article>
 
           <p
@@ -2993,13 +3068,6 @@ onBeforeUnmount(() => {
   line-height: 1.7;
 }
 
-.runtime-message-empty {
-  margin: 0;
-  color: #7d8790;
-  font-size: 13px;
-  line-height: 1.7;
-}
-
 .state-pill-row,
 .suggestion-row,
 .reference-row,
@@ -3059,6 +3127,114 @@ onBeforeUnmount(() => {
   background: #fff0f0;
   color: #b42318;
   font-size: 13px;
+}
+
+.runtime-status-list {
+  display: grid;
+  gap: 12px;
+  padding: 2px 0 0;
+}
+
+.runtime-status-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  color: #8b949e;
+}
+
+.runtime-status-icon {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  margin-top: 3px;
+  border: 2px solid currentColor;
+  border-radius: 4px;
+}
+
+.runtime-status-icon::before {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.12;
+}
+
+.runtime-status-row-running .runtime-status-icon::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+  animation: runtime-status-pulse 1.2s ease-in-out infinite;
+}
+
+.runtime-status-row-completed {
+  color: #9aa1aa;
+}
+
+.runtime-status-row-failed,
+.runtime-status-row-cancelled {
+  color: #b42318;
+}
+
+.runtime-status-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.runtime-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.runtime-status-line strong {
+  min-width: 0;
+  color: #8b949e;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.55;
+}
+
+.runtime-status-row-running .runtime-status-line strong {
+  color: #4b5563;
+}
+
+.runtime-status-row-failed .runtime-status-line strong,
+.runtime-status-row-cancelled .runtime-status-line strong {
+  color: #b42318;
+}
+
+.runtime-status-line span {
+  color: #a0a7b0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.runtime-status-copy p {
+  margin: 0;
+  color: #4b5563;
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+@keyframes runtime-status-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 1;
+  }
 }
 
 .runtime-strip {

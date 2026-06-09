@@ -42,7 +42,7 @@
    - 执行前会记录预检结果、动作进入条件、失败策略和预期产物
    - 执行中会刷新 action heartbeat；子任务会单独写入 `.gaoxia/runs/{task_id}/subtasks/*.json`
    - 执行后会校验 action 产物是否满足契约，并把 workflow 状态作为 `workflow_run` 产物返回
-   - 执行中前端会用实时状态卡展示 action timeline；执行结束时会写入最终 `session_result` event block，聊天历史只保留结果说明、最终结果阶段摘要和产物卡片
+   - 执行中前端会用实时状态列表展示“已运行 / 正在运行 / 正在思考”、步骤耗时和摘要；执行结束时仍会写入最终 `session_result` event block，但聊天历史只保留结果说明、产物卡片和建议，不展示计划卡、状态标签、执行步骤或阶段摘要
    - `GET /api/studio/agent/{project_id}/runs/{task_id}` 可读取 workflow 摘要；`POST /api/studio/agent/{project_id}/runs/{task_id}/interrupt` 会写入中断请求，Agent 执行循环在动作边界停止后续动作
    - 项目迁移包遇到项目目录外的 Obsidian Vault 时，会保留 workflow 状态结构，但会把其中的 Obsidian 资料分析 action / subtask 摘要改成迁移提示
 
@@ -304,7 +304,7 @@ Obsidian Markdown 和 Canvas 会从文件名或路径推断章节范围，例如
 用途：
 
 - `execution_trace` 给执行链路
-- `event_blocks` 给计划和阶段性事件；执行中前端按实时状态展示 action timeline，执行完成的历史消息只展示最终 `session_result` 结果阶段
+- `event_blocks` 给计划和阶段性事件；执行中前端按实时状态列表展示步骤，执行完成的历史消息不再展示 `event_blocks`
 - `artifacts` 给结果产物和历史回看
 - 写回章节后，如果章节核验报告可用，Agent 会把 `chapter_review` 作为产物返回，前端可以直接展示核验摘要、评分和问题数。
 - 写回章节后，如果 Obsidian 维护队列因为当前保存产生了新草稿或更新草稿，Agent 会把 `obsidian_maintenance` 作为产物返回，前端可以直接展示待审草稿和目标路径，也可以从产物卡片打开按来源章节和 `suggestion_ids` 筛选后的维护队列。
@@ -450,16 +450,15 @@ Agent `review_knowledge` 继承目标章节时，同样会读取这套章节安�
 - `AgentPlanCard`
   - 展示计划标题、摘要、步骤、动作标签
 - 运行中状态卡
-  - 只在当前线程执行时显示，展示当前步骤、耗时、任务上下文和 action timeline
+  - 只在当前线程执行时显示，展示当前步骤、耗时、任务上下文和实时状态列表
 - `AgentActionTimeline`
-  - 执行中展示每一步的状态、任务包、摘要、变更
-  - 执行中展示 action 下的子任务列表、角色、能力、运行状态和子任务摘要
+  - 保留给未完成或历史兼容消息使用；当前执行中的聊天卡改用轻量状态列表
 - `AgentEventBlockSummary`
-  - 完成后的执行消息只展示最终结果阶段摘要；计划和执行阶段的细节不再长期停留在聊天历史里
+  - 保留给非执行完成消息使用；完成后的执行消息不再展示阶段摘要
 - `AgentArtifactSummary`
   - 展示产物标题、类别、摘要、预览
 
-运行中卡片也改成了同一套时间线展示，不再只是「第几步 + 一句文本」。
+运行中卡片展示轻量状态列表；完成后的执行消息回到结果说明和产物卡片。
 
 另外补了一条交互规则：
 

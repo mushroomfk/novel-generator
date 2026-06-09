@@ -456,8 +456,8 @@ async function main() {
 
     await page.getByTestId('workspace-composer-input').fill('续写这一章，把追兵压近一点。');
     await page.locator('.composer-submit-button').click();
+    await page.getByTestId('agent-runtime-status-list').first().waitFor({ timeout: 12000 }).catch(() => null);
     await page.getByText('已经生成并写回项目').first().waitFor({ timeout: 25000 });
-    await page.getByTestId('agent-timeline').first().waitFor();
     await page.screenshot({ path: path.join(OUT_DIR, 'readme-agent-flow.png'), fullPage: false });
 
     await page.getByTestId('open-skills-button').click();

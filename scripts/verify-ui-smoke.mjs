@@ -1300,12 +1300,15 @@ async function runSmoke(previewUrl, backendUrl) {
       const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
-    await page.getByTestId('agent-plan-card').waitFor();
-    await page.getByTestId('agent-plan-card').getByText(/生成第 1 章正文|第 1 章《.*》正文/u).first().waitFor();
-    await page.getByTestId('agent-event-block-summary').filter({ hasText: '计划阶段' }).first().waitFor();
-    await page.getByTestId('agent-timeline').first().waitFor();
-    await page.getByTestId('agent-artifact-card').first().waitFor();
-    await page.getByTestId('agent-event-block-summary').filter({ hasText: '结果阶段' }).first().waitFor();
+    await page.getByTestId('agent-artifact-card').first().waitFor({ timeout: 60000 });
+    const visibleChapterTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
+    if (visibleChapterTimelineCount > 0) {
+      throw new Error('Agent 执行完成后不应继续显示执行步骤列表');
+    }
+    const visibleChapterEventSummaryCount = await page.locator('[data-testid="agent-event-block-summary"]:visible').count();
+    if (visibleChapterEventSummaryCount > 0) {
+      throw new Error('Agent 执行完成后不应继续显示阶段摘要');
+    }
     await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来', { timeoutMs: 60000 });
     await waitForChapterPreviewContent(page, '潮声后面有人跟来');
     await page.locator('[data-testid^="agent-session-row-"]').first().waitFor();
@@ -1665,7 +1668,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByRole('dialog', { name: '确认执行整书架构' }).waitFor();
     await page.getByRole('button', { name: '确认执行' }).click();
     await page.getByTestId('agent-runtime-message').waitFor({ timeout: 10000 });
-    await page.getByTestId('agent-timeline').first().waitFor({ timeout: 10000 });
+    await page.getByTestId('agent-runtime-status-list').first().waitFor({ timeout: 10000 });
     await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
     await page.getByTestId('agent-runtime-message').waitFor({ state: 'hidden', timeout: 10000 });
     const visibleAgentTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
@@ -1673,7 +1676,10 @@ async function runSmoke(previewUrl, backendUrl) {
       throw new Error('Agent 执行完成后不应继续显示执行步骤列表');
     }
     await page.getByTestId('agent-artifact-card').first().waitFor();
-    await page.getByTestId('agent-event-block-summary').filter({ hasText: '结果阶段' }).first().waitFor();
+    const visibleAgentEventSummaryCount = await page.locator('[data-testid="agent-event-block-summary"]:visible').count();
+    if (visibleAgentEventSummaryCount > 0) {
+      throw new Error('Agent 执行完成后不应继续显示阶段摘要');
+    }
     await waitForProjectDocumentContent(backendUrl, seededProject.id, 'blueprint', '第 3 章《夜潮账册》');
 
     log('检查 Agent 讨论结果渲染');
