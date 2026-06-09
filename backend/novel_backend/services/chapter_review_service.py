@@ -178,6 +178,7 @@ _PROJECT_MEMORY_STATE_RULES = (
 _PROJECT_MEMORY_REVEAL_ROLES = ("主谋", "真凶", "幕后主使", "幕后黑手", "凶手", "反派")
 _PROJECT_MEMORY_REVEAL_ACTIONS = ("揭示", "揭开", "揭露", "暴露", "公开", "透露", "点破", "说明", "说出")
 _PROJECT_MEMORY_TRANSFER_ACTIONS = ("交给", "交出", "交还", "移交", "转交", "交付", "送给", "递给", "献给", "交到", "卖给")
+_PROJECT_MEMORY_REPLACEMENT_ACTIONS = ("改名为", "改成", "写成", "叫成", "变成", "称为")
 _PROJECT_MEMORY_NEGATED_STATE_PREFIXES = (
   "没有",
   "没",
@@ -1358,7 +1359,8 @@ def _memory_negative_fragment(sentence: str) -> str:
 
 def _explicit_replacement_terms(fragment: str) -> list[str]:
   terms: list[str] = []
-  for match in re.finditer(r"(?:改名为|改成|写成|叫成|变成|称为)([\u4e00-\u9fffA-Za-z0-9_·]{2,24})", fragment):
+  action_pattern = "|".join(re.escape(item) for item in _PROJECT_MEMORY_REPLACEMENT_ACTIONS)
+  for match in re.finditer(rf"(?:{action_pattern})([\u4e00-\u9fffA-Za-z0-9_·]{{2,24}})", fragment):
     term = match.group(1).strip()
     if term and term not in _PROJECT_MEMORY_NEGATIVE_GENERIC_TERMS:
       terms.append(term)
@@ -1512,6 +1514,63 @@ def _explicit_transfer_match(chapter_text: str, rule_sentence: str) -> str:
   return ""
 
 
+def _replacement_subject_target_pairs(rule_sentence: str) -> list[tuple[str, str, str]]:
+  action_pattern = "|".join(re.escape(item) for item in _PROJECT_MEMORY_REPLACEMENT_ACTIONS)
+  pairs: list[tuple[str, str, str]] = []
+  for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
+    index = rule_sentence.find(marker)
+    if index < 0:
+      continue
+    prefix = rule_sentence[:index].strip(" ，,、：:")
+    fragment_after_marker = rule_sentence[index:]
+    for match in re.finditer(
+      rf"(?:把|将|让|使)?([\u4e00-\u9fffA-Za-z0-9_·]{{2,24}})(?:被)?({action_pattern})([\u4e00-\u9fffA-Za-z0-9_·]{{2,24}})",
+      fragment_after_marker,
+    ):
+      subject = _clean_project_memory_subject(match.group(1))
+      action = match.group(2)
+      target = _clean_project_memory_identity(match.group(3))
+      if subject and target:
+        pairs.append((subject, action, target))
+
+    prefix_subjects = [_clean_project_memory_subject(item) for item in [*_quoted_terms(prefix), *_tokens(prefix, limit=4)]]
+    targets = _explicit_replacement_terms(fragment_after_marker)
+    for subject in _ordered_unique(item for item in prefix_subjects if item):
+      for target in targets:
+        pairs.append((subject, "改名为", target))
+  return list(dict.fromkeys(pairs))
+
+
+def _chapter_replaces_identity(chapter_text: str, subject: str, target: str) -> tuple[str, str] | None:
+  if not subject or not target:
+    return None
+  action_pattern = "|".join(re.escape(item) for item in _PROJECT_MEMORY_REPLACEMENT_ACTIONS)
+  patterns = (
+    rf"{re.escape(subject)}[^。！？!?；;\n]{{0,20}}(?:被|让人)?({action_pattern})[^。！？!?；;\n]{{0,8}}{re.escape(target)}",
+    rf"(?:把|将|让|使){re.escape(subject)}[^。！？!?；;\n]{{0,8}}({action_pattern})[^。！？!?；;\n]{{0,8}}{re.escape(target)}",
+  )
+  for pattern in patterns:
+    for match in re.finditer(pattern, chapter_text or ""):
+      action_match = re.search(action_pattern, match.group(0))
+      if not action_match:
+        continue
+      action_start = match.start() + action_match.start()
+      prefix = (chapter_text or "")[max(0, action_start - 16) : action_start]
+      if any(marker in prefix for marker in _PROJECT_MEMORY_NEGATED_STATE_PREFIXES):
+        continue
+      return action_match.group(0), match.group(0)
+  return None
+
+
+def _explicit_replacement_match(chapter_text: str, rule_sentence: str) -> str:
+  for subject, action, target in _replacement_subject_target_pairs(rule_sentence):
+    match = _chapter_replaces_identity(chapter_text, subject, target)
+    if match:
+      actual_action, _segment = match
+      return f"{subject} / {actual_action or action} / {target}"
+  return ""
+
+
 def _memory_rule_subject_candidates(sentence: str, terms: tuple[str, ...]) -> list[str]:
   candidates = _quoted_terms(sentence)
   for marker in _PROJECT_MEMORY_NEGATIVE_MARKERS:
@@ -1572,10 +1631,13 @@ def _memory_rule_violation_match(chapter_text: str, rule_sentence: str) -> str:
   transfer_match = _explicit_transfer_match(chapter_text, rule_sentence)
   if transfer_match:
     return transfer_match
+  replacement_match = _explicit_replacement_match(chapter_text, rule_sentence)
+  if replacement_match:
+    return replacement_match
   state_match = _explicit_state_rule_match(chapter_text, rule_sentence)
   if state_match:
     return state_match
-  for term in [*_quoted_terms(fragment), *_explicit_replacement_terms(fragment)]:
+  for term in _quoted_terms(fragment):
     if term and term in chapter_text:
       return term
   tokens = [

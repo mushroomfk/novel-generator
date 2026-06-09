@@ -1166,7 +1166,7 @@ foreshadows:
       self.settings,
       summary.id,
       "chapter-001",
-      ChapterUpdateRequest(content="# 第一章 雾港\n林追打开密押日志，顾临低声说沈砚就是主谋。\n"),
+      ChapterUpdateRequest(content="# 第一章 雾港\n顾临低声说沈砚就是主谋，旁边的船工把林澈叫成林追。\n"),
     )
 
     review = next(item for item in detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
@@ -1174,11 +1174,22 @@ foreshadows:
     self.assertEqual(memory_dimension.status, "risk")
     self.assertTrue(any("触犯项目记忆警告：别提前揭底" in item.title for item in memory_dimension.issues))
     self.assertTrue(any("沈砚" in item.detail and "主谋" in item.detail for item in memory_dimension.issues))
-    self.assertTrue(any("林追" in item.detail for item in memory_dimension.issues))
+    self.assertTrue(any("林澈 / 叫成 / 林追" in item.detail for item in memory_dimension.issues))
 
     review_status = summarize_chapter_review_status(detail, "chapter-001")
     self.assertGreaterEqual(review_status["critical_issue_count"], 1)
     self.assertTrue(chapter_review_needs_auto_repair(review_status, score_threshold=65))
+
+    safe_detail = update_chapter_content(
+      self.settings,
+      summary.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雾港\n林追打开密押日志，林澈在码头另一侧记录船号。\n"),
+    )
+    safe_review = next(item for item in safe_detail.story_overview.chapter_reviews if item.chapter_id == "chapter-001")
+    safe_memory_dimension = next(item for item in safe_review.dimensions if item.id == "project_memory")
+    self.assertNotEqual(safe_memory_dimension.status, "risk")
+    self.assertFalse(safe_memory_dimension.issues)
 
   def test_chapter_review_catches_project_memory_reveal_rule_with_subject_before_marker(self) -> None:
     summary = self.create_demo_project("项目记忆主谋核验")

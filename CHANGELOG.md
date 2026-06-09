@@ -18,6 +18,12 @@
 
 ## 2026-06-09
 
+### 项目记忆人物改名规则精确化
+
+- 修改摘要：章节核验的 `项目记忆规则` 维度现在会把“不要把 A 改名为 B”“A 不能叫成 B”识别为明确的人物替换规则；正文需要出现 A 被改成、写成或叫成 B 这类语境才记为 critical，B 作为正常角色名出场不会单独触发风险。这样能继续拦住长篇中的人物混名，同时减少合法角色同章出现时的误报。
+- 影响范围：后端章节核验、项目记忆规则反查、自动修订触发依据、README、核心引擎说明、技能流程回归清单、测试反馈清单和项目 Agent 指令；不改变项目记忆文件格式、章节保存接口、前端展示结构、Obsidian 规则或模型配置。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_forbidden_rules backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_reveal_rule_with_subject_before_marker backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_custom_identity_reveal_rules backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_transfer_rules backend.tests.test_project_service.ProjectServiceTestCase.test_chapter_review_catches_project_memory_state_change_rules` 通过，5 个用例通过；`npm run backend:test` 通过，428 个后端 unittest 通过；`npm run verify:packaging-static` 通过；`npm run build` 通过。
+
 ### Agent 运行中状态与完成态结果展示
 
 - 修改摘要：Agent 对话在任务执行中新增聊天流实时状态卡，展示当前步骤、耗时、上下文和 action timeline；执行完成后，历史消息不再长期展开完整执行步骤，只保留结果说明、最终 `session_result` 阶段摘要和产物卡片。整书架构执行确认弹窗同步说明新的展示方式。
