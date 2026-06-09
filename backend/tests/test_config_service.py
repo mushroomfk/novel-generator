@@ -84,6 +84,22 @@ class ConfigServiceTestCase(unittest.TestCase):
     self.assertEqual(config.model_runtime.background_requires_idle_seconds, 15)
     self.assertEqual(config.model_runtime.chapter_candidate_mode, "deep")
 
+  def test_load_config_migrates_legacy_single_round_auto_repair(self) -> None:
+    saved = save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(model_name="demo-model"),
+        chapter_auto_repair=ChapterAutoRepairConfig(enabled=True, score_threshold=65, max_rounds=1),
+      ),
+    )
+    self.assertEqual(saved.chapter_auto_repair.max_rounds, 1)
+
+    config = load_config(self.settings)
+
+    self.assertEqual(config.chapter_auto_repair.max_rounds, 2)
+    reloaded = load_config(self.settings)
+    self.assertEqual(reloaded.chapter_auto_repair.max_rounds, 2)
+
   def test_save_model_config_keeps_local_embedding_for_aliyun_model(self) -> None:
     config = save_config(
       self.settings,

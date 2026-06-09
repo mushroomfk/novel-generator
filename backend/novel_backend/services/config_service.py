@@ -607,6 +607,14 @@ def load_config(settings: Settings) -> AppConfig:
     )
 
   parsed = AppConfig.model_validate(payload)
+  if parsed.chapter_auto_repair.enabled and parsed.chapter_auto_repair.max_rounds < 2:
+    parsed = parsed.model_copy(
+      update={
+        "chapter_auto_repair": parsed.chapter_auto_repair.model_copy(update={"max_rounds": 2}),
+        "updated_at": _now_iso(),
+      }
+    )
+    atomic_write_json(app_config_path(settings), parsed.model_dump(mode="json"))
   return parsed
 
 
