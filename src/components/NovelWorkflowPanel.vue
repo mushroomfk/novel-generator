@@ -1522,6 +1522,10 @@ function messageTimelineItems(message) {
     return [];
   }
 
+  if (isCompletedExecutionMessage(message)) {
+    return [];
+  }
+
   if (Array.isArray(message.executionTrace) && message.executionTrace.length > 0) {
     return message.executionTrace;
   }
@@ -1529,8 +1533,24 @@ function messageTimelineItems(message) {
   return [];
 }
 
+function isCompletedExecutionMessage(message) {
+  return Boolean(message?.role === 'assistant' && message.mode === 'execution');
+}
+
+function isResultEventBlock(block) {
+  const eventType = String(block?.eventType ?? block?.event_type ?? '').trim();
+  return ['session_result', 'session_error', 'session_finished', 'final_result'].includes(eventType)
+    || eventType.endsWith('_summary');
+}
+
 function messageEventBlocks(message) {
-  return Array.isArray(message.eventBlocks) ? message.eventBlocks : [];
+  const blocks = Array.isArray(message.eventBlocks) ? message.eventBlocks : [];
+  if (!isCompletedExecutionMessage(message)) {
+    return blocks;
+  }
+
+  const resultBlocks = blocks.filter((block) => isResultEventBlock(block));
+  return resultBlocks.length ? resultBlocks : blocks.slice(-1);
 }
 
 function isPendingPlanMessage(message) {
@@ -2216,6 +2236,38 @@ onBeforeUnmount(() => {
             </div>
           </article>
 
+          <article
+            v-if="activeDiscussionIsRunning"
+            class="stream-card stream-card-assistant stream-card-runtime"
+            data-testid="agent-runtime-message"
+          >
+            <div class="stream-head">
+              <span>AI</span>
+              <em>{{ sessionStatus === 'cancelling' ? '停止中' : '正在执行' }}</em>
+            </div>
+
+            <div class="runtime-message-head">
+              <strong>{{ runtimeStripTitle }}</strong>
+              <span>{{ runtimeProgressText }} · 已处理 {{ sessionElapsedLabel }}</span>
+            </div>
+
+            <p class="runtime-message-copy">
+              <span>{{ runtimeStripLead }}</span>
+              <span>{{ runtimeStripContext }}</span>
+            </p>
+
+            <AgentActionTimeline
+              v-if="sessionTimeline.length"
+              :items="sessionTimeline"
+            />
+            <p
+              v-else
+              class="runtime-message-empty"
+            >
+              正在建立任务状态…
+            </p>
+          </article>
+
           <p
             v-if="discussionSaveMessage"
             class="stream-note"
@@ -2453,7 +2505,7 @@ onBeforeUnmount(() => {
 
           <div class="architecture-confirm-stack">
             <p class="architecture-confirm-copy">
-              会按照当前讨论结论执行整书架构。执行过程和结果都会回到聊天窗口里显示。
+              会按照当前讨论结论执行整书架构。执行中显示状态，完成后聊天窗口只保留结果和说明。
             </p>
 
             <label class="execution-field">
@@ -2537,7 +2589,7 @@ onBeforeUnmount(() => {
 
           <div class="architecture-confirm-stack">
             <p class="architecture-confirm-copy">
-              执行过程和结果会继续回到聊天窗口里显示。
+              执行中显示状态，完成后聊天窗口只保留结果和说明。
             </p>
 
             <ol
@@ -2877,6 +2929,13 @@ onBeforeUnmount(() => {
   border: 1px solid #e5e8ec;
 }
 
+.stream-card-runtime {
+  width: min(760px, 100%);
+  gap: 12px;
+  border-left: 2px solid #9bbcf6;
+  padding-left: 14px;
+}
+
 .stream-head {
   display: flex;
   justify-content: space-between;
@@ -2901,6 +2960,44 @@ onBeforeUnmount(() => {
   font-size: 14px;
   line-height: 1.85;
   white-space: pre-wrap;
+}
+
+.runtime-message-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.runtime-message-head strong {
+  min-width: 0;
+  color: #1f2328;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.runtime-message-head span {
+  flex: 0 0 auto;
+  color: #7d8790;
+  font-size: 12px;
+}
+
+.runtime-message-copy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  color: #566171;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.runtime-message-empty {
+  margin: 0;
+  color: #7d8790;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .state-pill-row,
