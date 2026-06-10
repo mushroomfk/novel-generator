@@ -18,10 +18,13 @@ $BuildRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("novel-sidecar-build-"
 $DistDir = Join-Path $BuildRoot "dist"
 $WorkDir = Join-Path $BuildRoot "work"
 $SpecDir = Join-Path $BuildRoot "spec"
+$PyInstallerConfigDir = Join-Path $BuildRoot "config"
 $EntryPoint = Join-Path $RootDir "backend\novel_backend\main.py"
+$PreviousPyInstallerConfigDir = $env:PYINSTALLER_CONFIG_DIR
 
 try {
-  New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir, $SpecDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $DistDir, $WorkDir, $SpecDir, $PyInstallerConfigDir | Out-Null
+  $env:PYINSTALLER_CONFIG_DIR = $PyInstallerConfigDir
 
   $PyInstallerArgs = @(
     "--noconfirm",
@@ -73,6 +76,11 @@ try {
   Write-Host "Generated $OutputPath"
 }
 finally {
+  if ($null -eq $PreviousPyInstallerConfigDir) {
+    Remove-Item Env:PYINSTALLER_CONFIG_DIR -ErrorAction SilentlyContinue
+  } else {
+    $env:PYINSTALLER_CONFIG_DIR = $PreviousPyInstallerConfigDir
+  }
   if (Test-Path $BuildRoot) {
     Remove-Item -Recurse -Force $BuildRoot
   }

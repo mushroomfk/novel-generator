@@ -3,7 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="稿匣"
-APP_BUNDLE="$ROOT_DIR/src-tauri/target/debug/bundle/macos/${APP_NAME}.app"
+TAURI_BUILD_PROFILE="${TAURI_BUILD_PROFILE:-release}"
+
+if [[ "$TAURI_BUILD_PROFILE" != "release" && "$TAURI_BUILD_PROFILE" != "debug" ]]; then
+  echo "TAURI_BUILD_PROFILE 只支持 release 或 debug: $TAURI_BUILD_PROFILE" >&2
+  exit 1
+fi
+
+APP_BUNDLE="$ROOT_DIR/src-tauri/target/${TAURI_BUILD_PROFILE}/bundle/macos/${APP_NAME}.app"
 APP_SIDECAR="$APP_BUNDLE/Contents/MacOS/novel-backend"
 BUILD_LOG_DIR="$(mktemp -d /tmp/novel-desktop-release.XXXXXX)"
 APP_SIGN_REPAIR_SCRIPT="$ROOT_DIR/scripts/repair-tauri-app-signature.sh"
@@ -21,6 +28,35 @@ require_file() {
   local path="$1"
   if [[ ! -e "$path" ]]; then
     echo "缺少文件: $path" >&2
+    exit 1
+  fi
+}
+
+tauri_build() {
+  local profile="$1"
+  local rustflags="${RUSTFLAGS:-}"
+  rustflags="${rustflags} --remap-path-prefix=${ROOT_DIR}=/workspace --remap-path-prefix=${HOME}=/home"
+
+  if [[ "$profile" == "debug" ]]; then
+    (cd "$ROOT_DIR" && RUSTFLAGS="$rustflags" npm run tauri -- build --debug)
+  else
+    (cd "$ROOT_DIR" && RUSTFLAGS="$rustflags" npm run tauri -- build)
+  fi
+}
+
+assert_no_build_paths() {
+  local binary="$1"
+  local label="$2"
+
+  if ! command -v strings >/dev/null 2>&1; then
+    return 0
+  fi
+  if strings "$binary" | grep -F "$HOME" >/dev/null; then
+    echo "${label} 包含开发机用户目录路径: $HOME" >&2
+    exit 1
+  fi
+  if strings "$binary" | grep -F "$ROOT_DIR" >/dev/null; then
+    echo "${label} 包含工作区绝对路径: $ROOT_DIR" >&2
     exit 1
   fi
 }
@@ -218,8 +254,12 @@ fi
 log "验证 sidecar 健康检查"
 smoke_backend_binary "$SIDE_CAR_BIN" "sidecar"
 
-log "构建 Tauri 调试包"
-(cd "$ROOT_DIR" && npm run tauri -- build --debug)
+if [[ "$TAURI_BUILD_PROFILE" == "debug" ]]; then
+  log "构建 Tauri debug 包"
+else
+  log "构建 Tauri release 包"
+fi
+tauri_build "$TAURI_BUILD_PROFILE"
 
 require_file "$APP_BUNDLE"
 require_file "$APP_SIDECAR"
@@ -228,7 +268,7 @@ if [[ ! -x "$APP_SIDECAR" ]]; then
   exit 1
 fi
 
-DMG_PATH="$(find "$ROOT_DIR/src-tauri/target/debug/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
+DMG_PATH="$(find "$ROOT_DIR/src-tauri/target/${TAURI_BUILD_PROFILE}/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
 if [[ -z "$DMG_PATH" ]]; then
   echo "没有找到 dmg 产物" >&2
   exit 1
@@ -237,8 +277,12 @@ require_file "$DMG_PATH"
 
 if command -v codesign >/dev/null 2>&1; then
   log "修复并检查 .app 签名"
-  bash "$APP_SIGN_REPAIR_SCRIPT" "$APP_NAME"
+  bash "$APP_SIGN_REPAIR_SCRIPT" "$APP_NAME" "$TAURI_BUILD_PROFILE"
 fi
+
+log "检查 .app 是否包含开发机路径"
+assert_no_build_paths "$(app_executable_path)" ".app 主程序"
+assert_no_build_paths "$APP_SIDECAR" ".app sidecar"
 
 log "验证应用内 sidecar 健康检查"
 smoke_backend_binary "$APP_SIDECAR" "app-sidecar"

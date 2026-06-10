@@ -24,11 +24,18 @@ _RETRYABLE_TRANSPORT_PATTERNS = (
   "broken pipe",
   "temporarily unavailable",
   "temporary failure",
+  "temporary failure in name resolution",
+  "nodename nor servname provided",
+  "name or service not known",
+  "failed to resolve",
+  "gaierror",
+  "dns",
   "timed out",
   "timeout",
   "ssl",
   "tls",
   "_ssl.c",
+  "域名解析",
 )
 _CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 _OPTIONAL_SAMPLING_KEYS = ("temperature", "top_p")

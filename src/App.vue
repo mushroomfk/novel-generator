@@ -499,7 +499,7 @@ async function handleExistingNovelImportSubmit(payload) {
     conversationSessionKey.value += 1;
     await refreshDashboard();
     await nextTick();
-    showNotice(`已接管《${result.project.name}》：${result.report.applied_chapter_count} 章，拆章置信度 ${Math.round((result.report.confidence ?? 0) * 100)}%`);
+    showNotice(`已接管《${result.project.name}》：已导入 ${result.report.applied_chapter_count} 章`);
   } catch (error) {
     showNotice(error instanceof Error ? error.message : '旧稿接管失败', 'error');
   } finally {

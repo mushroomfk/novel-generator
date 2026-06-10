@@ -88,7 +88,7 @@
 - 章节连续性合同和项目记忆规则：章节生成、候选审校、章节核验和自动修订共用同一份连续性证据。生成第 50/80 章这类中段章节时，后端会把目标位置、人物状态、滚动摘要、蓝图锚点、近期章节尾段、叙事状态账本、剧情债务、人物弧线、Obsidian 约束和资料证据整理为合同；生成提示词会把合同视为优先约束，章节核验新增 `章节连续性合同` 维度，明确合同项缺失会计入自动修订触发条件，自动修订提示也会读取这份合同，默认最多修订 2 轮，已启用但仍保存为旧 1 轮的配置会在读取时升级为 2 轮。章节核验还会反查作者项目记忆里的“硬规则 / 警告”禁写表达，例如“不要提前揭示某人是主谋”“某人不能被提前揭示为主谋 / 真凶 / 卧底 / 潮师”“不要把 A 改名为 B”“铜钥匙不能被交给白石商会”“顾临不能死亡 / 叛变”或“林追不会主动暴露身份”，命中时在 `项目记忆规则` 维度记为 critical，并参与自动修订判断；改名类规则需要正文出现 A 被改成、写成或叫成 B 这类语境才算违规，B 正常出场不会单独触发；正文写成“没有暴露身份”“并不是主谋”“并不是卧底”或“没有把铜钥匙交给白石商会”这类否定状态表述时不算违规；作者修改项目记忆后，已有章节核验会标为过期，刷新后按新规则重新检查
 - 章节核验界面：架构总览新增“章节核验”页签，会显示每章核验分数、状态、维度、问题、建议和过期标记；项目记忆规则命中项会在对应维度里直接展示，方便作者定位长篇人物、线索和情节连续性风险
 - 资料解析：PDF 导入在 `qwen-doc-turbo` 不可用或失败后，会优先尝试 LiteParse 本地解析并按页加入 `【第 N 页】` 标记；LiteParse 未安装、解析失败或无正文时回到 `pypdf`，只有本地文本为空时才尝试 LiteParse OCR，OCR 语言可用 `NOVEL_LITEPARSE_OCR_LANGUAGE` 配置
-- 模型接入：使用 OpenAI-compatible `chat/completions`，可接入 OpenAI、DashScope、火山方舟等兼容服务；传输层会移除部分兼容服务容易拒收的可选采样参数，并对 SSL EOF、远端中途断开、临时连接错误和可重试 5xx / 429 默认最多重试 5 次，等待间隔可用 `NOVEL_MODEL_RETRY_DELAYS` 调整
+- 模型接入：使用 OpenAI-compatible `chat/completions`，可接入 OpenAI、DashScope、火山方舟等兼容服务；传输层会移除部分兼容服务容易拒收的可选采样参数，并对 SSL EOF、DNS 解析失败、远端中途断开、临时连接错误和可重试 5xx / 429 默认最多重试 5 次，等待间隔可用 `NOVEL_MODEL_RETRY_DELAYS` 调整
 - 章节写作安全：架构总览的关系、事件和世界要素只读取 `.gaoxia/story_overview_model.json` 里的模型版全书总览；模型总览不可用、生成失败或结果没有通过证据校验时，界面会显示模型总览状态和错误，不会从本地架构文件抽取结构化节点。章节生成、改稿、诊断上下文和项目级文风 / XP 提示不会读取模型总览缓存，项目记忆和续写 / 改稿类项目蒸馏包也不会从模型总览里的全书实体反写；没有目标章节时，续写、改稿、仿写和人物任务默认不带入 Obsidian 后段笔记，整书架构任务仍可使用全书资料，避免后段设定通过总览缓存或蒸馏报告进入早期章节
 - 检索增强：关键词检索、embedding、rerank、Obsidian 图谱笔记和联网考据可组合使用，适配资料库和作者参考库；Obsidian 会解析 `summary / description / abstract / keywords / search_terms / 关键词` 等摘要 / 检索词 Properties、正文内联属性 `summary:: / keywords::`，也支持 Dataview 常见的 `[summary:: ...]`、`(keywords:: ...)` 段落内写法；双链、Markdown 内链、反向链接、未解析链接、歧义链接、必须包含和禁止出现短语都会参与同步，这些短语既可以写在 frontmatter，也可以写成正文里的“必须出现：…”、“禁止出现：…”、同名小节或 `required_phrases:: / forbidden_phrases::` 内联属性；frontmatter 字段名支持大小写、空格、连字符和下划线等常见属性写法，frontmatter 或正文内联属性里的 `source_notes / related_characters / related_notes / depends_on / foreshadows / payoffs / reveals / related_locations / related_props / related_organizations` 等关系字段会参与图谱解析，并把依赖、伏笔、兑现、揭示、相关地点等关系语义保留到知识索引、章节上下文和界面预览；Canvas file 节点关系进入章节上下文时，会优先显示目标笔记标题和可见来源笔记标题，而不是原始文件路径；章节上下文只展示目标章节可见的关系目标，当前笔记正文或摘要里指向未来笔记的 `[[双链]]` 或 Markdown 内链会改写为“未开放设定”，真正未解析或歧义的双链仍作为图谱风险提示，避免早期章节通过关系标题、正文链接或 Markdown 链接路径看到后段笔记；笔记还可声明 `chapter_range / chapter_start / chapter_end / reveal_after_chapter`、正文里的“适用章节”“第几章后可用”、`chapter_range:: / reveal_after_chapter::` 内联属性，开放范围可写成 `chapter_range: 58+`、`chapter_range:: 第59章以后`，或 Obsidian 正文 / 属性标签 `#章节/58-60`、`#第58章`、`#第58章起`、`#Ch58-60`、`#Ch58+`、`#适用章节／40～42`、`#剧透/57`、`#剧透／39`、`#第57章后可用`，用于控制当前章节能否引用；写作上下文会按当前任务、目标章节、当前章和上一章尾段带入相关笔记及一跳关联，选笔记时会把标题、路径、别名、标签、双链、Markdown 内链、摘要、关键词、章节范围、必需 / 禁止短语和中文词组重合度一起纳入匹配，明确绑定目标章节的笔记会提高选择优先级，并把命中笔记整理为本章 Obsidian 设定检查清单；相关笔记里的必需 / 禁止短语会提升为本章 Obsidian 写作约束；普通知识检索、Agent 资料分析、任务蒸馏、连续性证据包和章节核验都会按目标章节过滤未来 Obsidian 设定，知识检索预览、连续性证据正文和反向关联也会按目标章节处理；有目标章节时，知识检索和证据检索会先读取更大的候选池再按章节过滤，章节上下文触发的知识检索也会传入目标章节，Obsidian 检索命中如果无法对应到当前总览里的可见笔记，会被丢弃，避免未来笔记或旧索引通过图谱摘要进入早期章节，也避免后段笔记太多时把当前章节可用资料挤出结果；技能库、架构总览和联网考据会把当前选中章节传给后端，有选中章节时只显示或引用该章节安全预览，联网考据提示也会标明目标章节；若 `review_knowledge` 后面紧跟章节生成、改稿或一致性检查，它会继承后续章节作为 Obsidian 过滤范围，并按任务说明和目标章节优先读取当前章绑定笔记；若后面是整书架构，则保持全书资料视角；叙事状态账本会把目标章节可见的 Obsidian 来源、必写项、禁写项、图谱风险和本章执行状态并入章节任务卡，记录哪些必写项已满足、哪些仍缺失、哪些禁写项已触犯；未完成或触犯的 Obsidian 要求会转成后续章节可见的高优先级叙事债务，修订满足后关闭；启用 Obsidian 时，账本还会根据未入 Vault 的剧情债务、人物弧线和图谱问题生成维护建议，给出建议笔记路径和带来源 ID、来源章节、相关人物字段、人物双链或来源笔记路径的 Markdown 草稿；剧情债务和人物草稿会按来源章节写入 `reveal_after_chapter`，多个来源章节时按最晚来源章开放，发布后按目标章节过滤，不会把后段自动维护笔记带入早期章节；这些建议会进入 Agent 规划上下文，路由 / 规划给模型看的建议明细也会按目标章节筛选；多章节指令会优先按生成、改稿、拆场或诊断的动作目标章节判断，不会简单使用句子里的第一个章节号；没有明确目标章节的非架构任务只保留维护摘要，不暴露后段建议标题、路径或动作；Agent 路由 / 规划和自学习状态读取当前项目详情时，会用最新 Obsidian 摘要刷新维护建议，并可自动写入中高优先级待审草稿；重复出现的未解析双链会生成 `Graph/` 待审草稿，草稿会继承来源笔记的章节范围和剧透边界；若来源章节范围不连续，或多个开放式来源起点不同，会改用较晚可见的剧透边界，不合成过宽章节范围；重名和歧义链接会生成修复提醒；已解析双链如果来源笔记可见范围没有被目标笔记可见范围覆盖，会形成章节范围不匹配风险；带未解析或歧义双链的笔记不会被计入孤立笔记；中高优先级建议会在章节保存、Obsidian 同步或章节上下文生成时自动写入项目 `.gaoxia/obsidian_drafts/` 待审草稿，用户仍可显式保存或更新草稿；自动草稿未被人工改动时，后续图谱来源列表、来源内容或章节边界变化会更新草稿里的 `source_notes` 和范围字段，人工改动过的草稿不会被自动覆盖；保存草稿遇到同路径既有人工内容时也会保留原文并记录状态；用户显式发布时才写入配置的 Vault，目标路径必须在 Vault 内且不会覆盖已有笔记，发布后会重新同步 Obsidian 摘要和 `knowledge.db`，新笔记里的人物双链、Markdown 内链、图谱草稿别名和 frontmatter 来源关系会进入已解析 / 未解析链接统计，并按继承的章节边界控制可见范围；模型叙事编辑在生成下一章合同时会读取当前章和下一章的 Obsidian 约束；章节核验会反查当前章节可用的相关 Obsidian 笔记，正文触犯禁止短语时给出风险项，正文提到笔记、连续性证据命中笔记，或少量连续章节范围明确绑定的笔记缺少必需短语时给出警告；这些必写 / 禁写问题会计入自动修订触发条件；重复命名不会被强行解析到任意笔记；Vault 文件变化会通过来源签名触发同步摘要刷新，章节核验使用目标章节可见的 Obsidian 签名，未来章节专用笔记变化不会让早期章节核验过期
 - Obsidian 章节计划类层级标签范围：`#章节计划/58`、`#章节合同/58-60`、`#场景卡/59`、`#scene-plan/59` 这类标签会同时参与类型推断和章节范围解析；不需要再额外维护 `chapter_range`。普通 `#人物/主角`、`#剧情债务/伏笔` 仍只按类型或关系语义处理，不会被当成章节范围。
@@ -170,8 +170,8 @@ flowchart LR
 当前是公开预览版。
 
 - 已可本地运行前端、Python backend 和 Tauri 桌面壳
-- 已验证 macOS arm64 调试包、测试分发流程和 Windows x64 CI 安装包构建
-- Windows 0.1.2 安装包已发布到 GitHub Release，仍需要 Windows 实机安装和卸载验收
+- 已验证 macOS arm64 桌面链路、测试分发流程和 Windows x64 CI 安装包构建；当前对外 macOS 验证脚本默认使用 release 产物
+- 当前测试版版本号为 0.1.3；Windows 测试包需要由当前分支重新触发 GitHub Actions 构建后再做实机安装和卸载验收
 - 后端单测覆盖项目服务、生成服务、资料导入、许可证、技能流程和记忆系统
 - 浏览器层 UI smoke 覆盖建作品、写章节、Agent 计划执行、整书架构和技能检索主链路
 - 正式分发仍需要补充 Developer ID 签名、公证、安装包渠道和版本升级策略
@@ -271,14 +271,21 @@ Embedding 检索默认使用随 sidecar 打包的本地 `BAAI/bge-small-zh-v1.5`
 | `npm run dev:all` | 同时启动 backend 和前端 |
 | `npm run backend:test` | 运行 Python 单测 |
 | `npm run build` | 类型检查并构建前端 |
-| `npm run verify` | 执行打包脚本静态检查、backend 单测和前端构建 |
+| `npm run verify` | 执行打包脚本静态检查、前端静态回归、API 冒烟、backend 单测和前端构建 |
+| `npm run verify:release-audit` | 串联完整本地回归、本地长篇链路、《围城》原文导入上下文和当前模型配置预检；任一必需项失败会返回非零退出码 |
+| `npm run verify:frontend-static` | 不启动端口，检查旧稿接管界面文案和 Agent 运行状态 UI 的关键源码约定 |
+| `npm run verify:api-smoke` | 不启动端口、不调用写作模型，使用 FastAPI 测试客户端验证主要 API 路由、旧稿接管、资料检索、章节核验、快照、整书导出和迁移包导入导出 |
+| `npm run verify:local-smoke` | 不启动端口、不调用写作模型，使用临时数据目录验证本地 Embedding、旧稿接管、接续上下文、资料导入 / 检索、章节写入和本地章节核验 |
+| `npm run verify:model-preflight` | 不输出 API Key、不发起模型请求，检查当前保存的写作模型和第二审查模型配置、接口域名和 DNS 解析 |
 | `.venv/bin/python scripts/verify-real-model-longform.py --allow-real-model-calls` | 使用当前保存配置和许可证创建临时作品，真实调用写作模型、本地 Embedding 和第二审查模型，完成章节生成、保存、核验和知识检索；默认 1 章，可用 `--chapters 2` 扩展 |
-| `.venv/bin/python scripts/verify-weicheng-original-continuation.py --allow-real-model-calls --target-words 900` | 读取指定原文文件，验证旧稿接管拆章、接续章上下文、真实第 10 章续写、章节核验、混淆检查和保存后知识检索；默认原文路径是本机《围城》续写资源，可用 `--source-file` 替换 |
-| `npm run verify:packaging-static` | 检查内置 Embedding 模型文件、sidecar 打包脚本和 Windows 发布工作流关键步骤 |
+| `.venv/bin/python scripts/verify-weicheng-original-continuation.py --local-only` | 不调用写作模型，读取默认《围城》原文，验证旧稿接管拆章、章节写入、知识索引和第 10 章接续上下文 |
+| `.venv/bin/python scripts/verify-weicheng-original-continuation.py --allow-real-model-calls --target-words 900` | 读取指定原文文件，先验证旧稿接管和第 10 章上下文，再真实生成第 10 章，验证章节核验、混淆检查和保存后知识检索；默认原文路径是本机《围城》续写资源，可用 `--source-file` 替换 |
+| `npm run verify:packaging-static` | 检查内置 Embedding 模型文件、API / local smoke、模型预检、发布审计、前端静态回归、sidecar 打包脚本和 Windows 发布工作流关键步骤 |
 | `npm run verify:ui` | 运行浏览器层 smoke |
 | `npm run backend:bundle` | 打包 Python sidecar |
 | `npm run backend:bundle:windows` | 在 Windows 打包 Python sidecar |
-| `npm run verify:desktop` | 检查桌面发布链路，包含 sidecar 和 `.app` 启动 |
+| `npm run verify:desktop` | 检查 macOS 桌面发布链路，默认构建 release `.app/.dmg`，包含 sidecar、本地 Embedding、签名、开发机路径扫描和 `.app` 启动；需要临时验证 debug 包时可设 `TAURI_BUILD_PROFILE=debug` |
+| `npm run package:test:macos` | 整理 macOS 测试包，默认读取 release DMG，并写入安装说明、反馈清单、SHA256 和包信息 |
 | `npm run verify:desktop:windows` | 在 Windows 检查 sidecar 和安装包构建链路 |
 | `npm run verify:release` | 执行 UI smoke 和桌面发布检查 |
 | `npm run docs:screenshots` | 生成 README 演示截图 |

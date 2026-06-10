@@ -20,7 +20,7 @@ Windows Desktop Release
 4. 执行 `npm run verify:desktop:windows`
 5. 上传 Windows 安装包和 sidecar
 
-`npm run verify:desktop:windows` 会先执行 `npm run verify:packaging-static`，检查内置 Embedding 模型文件、Windows sidecar 打包脚本、Windows 发布验证脚本和 GitHub Actions 工作流关键步骤。macOS 本机也可以执行 `npm run verify:packaging-static` 做同样的静态检查，但它不会生成 Windows 安装包，也不能替代 Windows runner 或 Windows 实机验证。
+`npm run verify:desktop:windows` 会先执行 `npm run verify:packaging-static`，检查内置 Embedding 模型文件、前端静态回归、API / local smoke、模型预检、Windows sidecar 打包脚本、Windows 发布验证脚本和 GitHub Actions 工作流关键步骤。macOS 本机也可以执行 `npm run verify:packaging-static` 做同样的静态检查，但它不会生成 Windows 安装包，也不能替代 Windows runner 或 Windows 实机验证。
 
 上传产物包括：
 
@@ -32,21 +32,21 @@ Windows Desktop Release
 从 GitHub Actions 下载的 Windows 测试产物整理到：
 
 ```text
-release/test-release/windows/稿匣_0.1.2_测试包/
+release/test-release/windows/稿匣_0.1.3_测试包/
 ```
 
 目录包含：
 
-- `稿匣_0.1.2_x64-setup.exe`
+- `稿匣_0.1.3_x64-setup.exe`
 - `novel-backend-x86_64-pc-windows-msvc.exe`
 - `SHA256SUMS.txt`
 - `安装说明-先看这个.md`
 - `测试反馈清单.md`
 - `包信息.txt`
 
-共享给测试用户时优先提供 `稿匣_0.1.2_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
+共享给测试用户时优先提供 `稿匣_0.1.3_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
 
-截至 2026-06-09，已知的 `0.1.2` Windows 测试包由 GitHub Actions run `26353093355` 在提交 `7051ada1de89275d7f508325c060ad75c721cbdc` 上生成，并已上传到 GitHub Release `v0.1.2`。如果当前工作区有新的本地改动，必须重新触发 `Windows Desktop Release` 或在 Windows 本机执行 `npm run verify:desktop:windows`，才能确认新的后端逻辑和内置模型已经进入 Windows 安装包。
+截至 2026-06-10，`0.1.3` Windows 测试包需要由当前分支重新触发 `Windows Desktop Release`，或在 Windows 本机执行 `npm run verify:desktop:windows` 后整理；只有新的 workflow run 通过后，才能确认当前后端逻辑和内置模型已经进入 Windows 安装包。
 
 ## 本地 Windows 打包
 

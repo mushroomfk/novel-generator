@@ -124,6 +124,12 @@ class AgentServiceTestCase(unittest.TestCase):
     )
     self._guard_search_patcher.start()
     self.addCleanup(self._guard_search_patcher.stop)
+    self._narrative_model_patcher = patch(
+      "novel_backend.services.project_narrative_state_service._invoke_narrative_editor_model",
+      side_effect=RuntimeError("skip narrative model editor in agent tests"),
+    )
+    self._narrative_model_patcher.start()
+    self.addCleanup(self._narrative_model_patcher.stop)
 
   def tearDown(self) -> None:
     self._temp_dir.cleanup()

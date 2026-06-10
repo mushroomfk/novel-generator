@@ -52,6 +52,7 @@ BUILD_ROOT="$(mktemp -d /tmp/novel-sidecar-build.XXXXXX)"
 DIST_DIR="$BUILD_ROOT/dist"
 WORK_DIR="$BUILD_ROOT/work"
 SPEC_DIR="$BUILD_ROOT/spec"
+export PYINSTALLER_CONFIG_DIR="$BUILD_ROOT/config"
 
 cleanup() {
   rm -rf "$BUILD_ROOT"
@@ -87,6 +88,7 @@ if [[ -x "$VENV_PYTHON" ]] && "$VENV_PYTHON" -c "import importlib.util; raise Sy
   )
 fi
 
+mkdir -p "$PYINSTALLER_CONFIG_DIR"
 "$VENV_PYINSTALLER" "${PYINSTALLER_ARGS[@]}" "$ROOT_DIR/backend/novel_backend/main.py"
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"

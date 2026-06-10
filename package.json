@@ -1,7 +1,7 @@
 {
   "name": "novel-generator",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Local desktop writing workbench for long-form novel projects.",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -36,8 +36,13 @@
     "dev:all": "npm-run-all --parallel backend:dev dev",
     "package:test:macos": "bash scripts/prepare-macos-test-release.sh",
     "release:test:macos": "npm run verify:desktop && npm run package:test:macos",
-    "verify": "npm run verify:packaging-static && npm run backend:test && npm run build",
+    "verify": "npm run verify:packaging-static && npm run verify:frontend-static && npm run verify:api-smoke && npm run backend:test && npm run build",
     "verify:packaging-static": "node scripts/verify-packaging-static.mjs",
+    "verify:frontend-static": "node scripts/verify-frontend-static.mjs",
+    "verify:api-smoke": ".venv/bin/python scripts/verify-api-release-smoke.py",
+    "verify:local-smoke": ".venv/bin/python scripts/verify-local-release-smoke.py",
+    "verify:model-preflight": ".venv/bin/python scripts/verify-model-preflight.py",
+    "verify:release-audit": "node scripts/verify-release-audit.mjs",
     "verify:ui": "node scripts/verify-ui-smoke.mjs",
     "verify:desktop": "bash scripts/verify-desktop-release.sh",
     "verify:desktop:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-release.ps1",

@@ -506,6 +506,7 @@ def main() -> int:
     description="Import the Weicheng original text, continue chapter 10 with real models, and check continuity confusion."
   )
   parser.add_argument("--allow-real-model-calls", action="store_true", help="Required because this script calls paid model APIs.")
+  parser.add_argument("--local-only", action="store_true", help="Only verify split, import, knowledge index, and chapter 10 context.")
   parser.add_argument("--source-file", default=DEFAULT_SOURCE_FILE, help="Path to original-text.md.")
   parser.add_argument("--source-data-dir", default=str(default_data_dir()), help="Existing app data dir containing app_config.json.")
   parser.add_argument("--target-words", type=int, default=900, help="Target length hint for generated continuation.")
@@ -513,8 +514,8 @@ def main() -> int:
   parser.add_argument("--keep-temp-dir", action="store_true", help="Keep temporary data dir after the run.")
   args = parser.parse_args()
 
-  if not args.allow_real_model_calls:
-    print("Refusing to call real models. Re-run with --allow-real-model-calls.", file=sys.stderr)
+  if not args.allow_real_model_calls and not args.local_only:
+    print("Refusing to call real models. Re-run with --allow-real-model-calls or use --local-only.", file=sys.stderr)
     return 2
 
   source_file = Path(args.source_file).expanduser().resolve()
@@ -522,7 +523,7 @@ def main() -> int:
     print(f"Missing source file: {source_file}", file=sys.stderr)
     return 2
   source_data_dir = Path(args.source_data_dir).expanduser().resolve()
-  if not (source_data_dir / "app_config.json").exists():
+  if not args.local_only and not (source_data_dir / "app_config.json").exists():
     print(f"Missing app_config.json in {source_data_dir}", file=sys.stderr)
     return 2
 
@@ -537,19 +538,21 @@ def main() -> int:
     "source_file": str(source_file),
     "source_data_dir": str(source_data_dir),
     "temp_data_dir": str(temp_root),
+    "local_only": bool(args.local_only),
   }
   try:
     copied = copy_runtime_files(source_data_dir, settings)
-    log("copied runtime files: " + ", ".join(copied))
+    log("copied runtime files: " + (", ".join(copied) if copied else "none"))
     initialize_app_storage(settings)
 
     license_status = validate_license(settings)
     summary["license"] = license_status.model_dump(mode="json")
-    if not license_status.valid:
+    if not args.local_only and not license_status.valid:
       raise RuntimeError(f"许可证不可用：{license_status.reason}")
-    log(f"license: valid, expires_at={license_status.expires_at or 'permanent'}")
-
-    summary["model_config_test"] = ensure_model_config_passed(settings)
+    if license_status.valid:
+      log(f"license: valid, expires_at={license_status.expires_at or 'permanent'}")
+    else:
+      log(f"license: skipped for local-only, reason={license_status.reason}")
 
     source_text = source_file.read_text(encoding="utf-8")
     summary["split"] = assert_original_split(source_text)
@@ -558,6 +561,13 @@ def main() -> int:
     project_id = str(import_summary["project_id"])
     seed_memory(settings, project_id)
     summary["import_verification"] = verify_imported_project(settings, project_id)
+
+    if args.local_only:
+      summary["finished_at"] = now_iso()
+      print(json.dumps(summary, ensure_ascii=False, indent=2))
+      return 0
+
+    summary["model_config_test"] = ensure_model_config_passed(settings)
     summary["continuation"] = generate_and_verify_continuation(
       settings,
       project_id,

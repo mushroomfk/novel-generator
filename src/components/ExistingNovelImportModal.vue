@@ -287,10 +287,6 @@ function submit() {
                 <dt>章节</dt>
                 <dd>{{ report.applied_chapter_count }} / {{ report.target_chapters }}</dd>
               </div>
-              <div>
-                <dt>置信度</dt>
-                <dd>{{ Math.round((report.confidence ?? 0) * 100) }}%</dd>
-              </div>
               <div v-if="report.next_chapter_index">
                 <dt>下一章</dt>
                 <dd>第 {{ report.next_chapter_index }} 章</dd>
@@ -324,7 +320,7 @@ function submit() {
               v-if="report.chapters?.length"
               class="report-section report-chapter-list"
             >
-              <strong>章节识别</strong>
+              <strong>已导入章节</strong>
               <div>
                 <span
                   v-for="chapter in report.chapters.slice(0, 12)"
@@ -339,10 +335,9 @@ function submit() {
           <template v-else>
             <h4>处理内容</h4>
             <ul>
-              <li>按章节标题拆分旧稿</li>
+              <li>导入旧稿正文</li>
               <li>文件导入只支持 .txt</li>
-              <li>逐章写入项目章节</li>
-              <li>生成接管报告和章节清单</li>
+              <li>写入项目章节正文</li>
               <li>刷新本地知识库索引</li>
             </ul>
           </template>

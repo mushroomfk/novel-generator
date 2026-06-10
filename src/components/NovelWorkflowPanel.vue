@@ -2313,12 +2313,12 @@ onBeforeUnmount(() => {
               </AgentPlanCard>
 
               <AgentActionTimeline
-                v-if="messageTimelineItems(item).length"
+                v-if="!isCompletedExecutionMessage(item) && messageTimelineItems(item).length"
                 :items="messageTimelineItems(item)"
               />
 
               <AgentEventBlockSummary
-                v-if="messageEventBlocks(item).length"
+                v-if="!isCompletedExecutionMessage(item) && messageEventBlocks(item).length"
                 :blocks="messageEventBlocks(item)"
               />
 

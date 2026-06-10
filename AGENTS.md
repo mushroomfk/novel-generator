@@ -14,7 +14,10 @@
 - 报告完成前必须执行与改动范围匹配的验证。
 - 代码改动优先执行相关单测；影响较大时执行 `npm run verify`。
 - 前端体验改动需要执行相应 UI smoke 或浏览器检查。
-- 需要真实模型调用证据时，优先使用 `.venv/bin/python scripts/verify-real-model-longform.py --allow-real-model-calls`；脚本默认创建临时作品并验证写作模型、本地 Embedding、第二审查模型、章节保存、章节核验和知识检索。验证旧稿接管后是否能承接原文续写时，可使用 `.venv/bin/python scripts/verify-weicheng-original-continuation.py --allow-real-model-calls --target-words 900`，脚本会读取指定原文、导入旧稿、真实生成第 10 章并检查人物 / 情节混淆。
+- 当前环境无法启动本地端口或真实模型不可达时，可执行 `npm run verify:api-smoke` 和 `npm run verify:local-smoke` 取得无端口集成证据；`verify:api-smoke` 覆盖主要 API 路由、旧稿接管、资料检索、章节核验、快照、整书导出和迁移包导入导出，`verify:local-smoke` 覆盖本地 Embedding、接续上下文、章节写入和本地章节核验；它们不能替代 UI smoke、桌面包启动检查或真实模型长篇验证。
+- 排查真实模型失败时，可先执行 `npm run verify:model-preflight`；它只检查当前保存配置里的模型名、接口域名、API Key 是否存在和 DNS 解析，不输出 API Key，也不发起模型请求。
+- 发布前聚合检查可执行 `npm run verify:release-audit`；它串联 `npm run verify`、`npm run verify:local-smoke`、`.venv/bin/python scripts/verify-weicheng-original-continuation.py --local-only` 和 `npm run verify:model-preflight`，任何必需项失败都会返回非零退出码；它不替代 UI smoke、桌面包启动检查或真实模型长篇验证。
+- 需要真实模型调用证据时，优先使用 `.venv/bin/python scripts/verify-real-model-longform.py --allow-real-model-calls`；脚本默认创建临时作品并验证写作模型、本地 Embedding、第二审查模型、章节保存、章节核验和知识检索。验证旧稿接管后是否能承接原文续写时，可使用 `.venv/bin/python scripts/verify-weicheng-original-continuation.py --allow-real-model-calls --target-words 900`，脚本会读取指定原文、导入旧稿、真实生成第 10 章并检查人物 / 情节混淆；真实模型不可达但需要先确认原文导入、知识索引和第 10 章上下文时，可执行同脚本的 `--local-only` 模式。
 - 验证失败或无法验证时，在最终回复和 `CHANGELOG.md` 中写明实际状态。
 
 ## 项目知识同步
@@ -27,9 +30,9 @@
 ## 当前项目事实
 
 - 本项目是本地长篇小说生成器，前端使用 Vue 3 + Vite，后端使用 FastAPI，桌面壳使用 Tauri 2。
-- 桌面壳启动时会拉起本地 Python sidecar，并把实际 backend 地址下发给前端；退出时先请求 `POST /api/app/shutdown`，再结束 sidecar。macOS 生产包启动时会清理同一 app 包内父进程已失效的旧 `novel-backend` 进程，避免多次启动后留下孤儿 sidecar。
+- 桌面壳启动时会拉起本地 Python sidecar，并把实际 backend 地址下发给前端；退出时先请求 `POST /api/app/shutdown`，再结束 sidecar。macOS 生产包启动时会清理同一 app 包内父进程已失效的旧 `novel-backend` 进程，避免多次启动后留下孤儿 sidecar。macOS 桌面发布验证默认使用 Tauri release 产物，并扫描 `.app` 主程序和 sidecar，避免开发机绝对路径进入对外测试包；需要临时验证 debug 包时使用 `TAURI_BUILD_PROFILE=debug npm run verify:desktop`。
 - 作品文件、章节、设定、Obsidian 配置和执行历史保存在作品目录；资料索引使用 `SQLite / FTS5`。
-- 模型设置面向普通作者只暴露写作模型预设、自定义接口、API Key 和篇幅能力；第二审查模型、自动修订和运行调度在高级区展开；设置页不再显示 Embedding 配置入口。Embedding 默认使用随 sidecar 打包的本地 `local-fastembed` / `BAAI/bge-small-zh-v1.5`，模型文件位于 `backend/novel_backend/assets/embedding_models/fast-bge-small-zh-v1.5`，维度 512，不需要用户填写 Embedding API Key；旧配置或直接后端 API 传入云端 OpenAI-compatible `/embeddings` 时仍可兼容读取。“测试当前配置”会用当前表单值测试写作模型、内置知识检索模型和已启用的第二审查模型，不需要先保存。`ModelConfig.temperature` 和 `ReviewModelConfig.temperature` 只作为旧配置兼容字段保留，新设置页不再写入；聊天模型请求在传输层会移除 `temperature / top_p` 这类可选采样项，避免部分 OpenAI-compatible 模型拒收；SSL EOF、远端中途断开、临时连接错误和可重试 5xx / 429 会自动重试，聊天模型请求和设置页模型测试默认最多重试 5 次，可用 `NOVEL_MODEL_RETRY_DELAYS` 配置等待间隔；自动修订默认最多 2 轮，已启用但仍保存为旧 1 轮的配置会在读取时升级为 2 轮。
+- 模型设置面向普通作者只暴露写作模型预设、自定义接口、API Key 和篇幅能力；第二审查模型、自动修订和运行调度在高级区展开；设置页不再显示 Embedding 配置入口。Embedding 默认使用随 sidecar 打包的本地 `local-fastembed` / `BAAI/bge-small-zh-v1.5`，模型文件位于 `backend/novel_backend/assets/embedding_models/fast-bge-small-zh-v1.5`，维度 512，不需要用户填写 Embedding API Key；旧配置或直接后端 API 传入云端 OpenAI-compatible `/embeddings` 时仍可兼容读取。“测试当前配置”会用当前表单值测试写作模型、内置知识检索模型和已启用的第二审查模型，不需要先保存。`ModelConfig.temperature` 和 `ReviewModelConfig.temperature` 只作为旧配置兼容字段保留，新设置页不再写入；聊天模型请求在传输层会移除 `temperature / top_p` 这类可选采样项，避免部分 OpenAI-compatible 模型拒收；SSL EOF、DNS 解析失败、远端中途断开、临时连接错误和可重试 5xx / 429 会自动重试，聊天模型请求和设置页模型测试默认最多重试 5 次，可用 `NOVEL_MODEL_RETRY_DELAYS` 配置等待间隔；自动修订默认最多 2 轮，已启用但仍保存为旧 1 轮的配置会在读取时升级为 2 轮。
 - 旧稿接管用于把已经写了一部分的小说变成系统章节正文；前端入口是作品列表顶部“旧稿”，文件上传只支持 `.txt`，也可以直接粘贴正文；后端接口是 `POST /api/projects/takeover/import`、`GET /api/projects/{project_id}/takeover` 和 `POST /api/projects/{project_id}/takeover/resume`。接管状态、原稿副本、拆章结果和接管报告保存在 `.gaoxia/takeover/`；导入会逐章写入 `chapters/`，把接续位置、上一章结尾、最近章节和写作边界写入 `core_seed.txt`、`plot_structure.txt`、`character_state.txt`、`blueprint.txt`、`global_summary.txt` 与 `checkpoint.json`，再刷新知识库。恢复接管时会保留已有非空章节正文，不用旧稿覆盖作者已改内容；前端会在读取前拒绝 30MB 以上旧稿文件；当前项目章节上限是 1000 章。旧稿接管不等同于资料导入，导入阶段不逐章触发模型核验。
 - Agent 执行消息会保存 `execution_trace / event_blocks / artifacts`；前端在任务执行中显示实时状态列表，按“已完成 / 正在运行 / 正在思考”展示步骤、耗时和摘要；任务结束后聊天历史只保留结果说明、产物卡片和建议，不再展示计划卡、状态标签、执行步骤或 `event_blocks` 阶段摘要。Agent workflow 状态支持按 `task_id` 查询；前端停止长任务时会向后端写入中断请求，执行循环在动作边界把后续动作标记为 `CANCELLED`。
 - Agent 主对话请求支持长文本输入；`AgentMessage.content` 和线程消息都可保存最多 1000000 字符，前端保留最新用户长输入并压缩旧历史；超过 20000 字符的用户输入会由后端先筛掉明显无关、技术日志或网页样板段落，再按约 50000 字符分段导入项目资料库，本轮计划和执行会携带这些资料引用；路由、规划、brainstorm、技能整理和执行轨迹使用“摘要 + 原文头尾 + 资料引用”的压缩文本，避免把完整长文本直接送进模型上下文。

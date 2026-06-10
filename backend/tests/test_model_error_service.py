@@ -66,6 +66,14 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertTrue(classified.retryable)
     self.assertEqual(classify_model_error("Remote end closed connection without response").kind, "network_connection")
 
+  def test_classifies_dns_resolution_failure_as_retryable_network_connection(self) -> None:
+    error = "[Errno 8] nodename nor servname provided, or not known"
+
+    classified = classify_model_error(error)
+
+    self.assertEqual(classified.kind, "network_connection")
+    self.assertTrue(classified.retryable)
+
   def test_request_json_retries_transient_ssl_eof(self) -> None:
     ssl_eof = urllib_error.URLError(
       "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000)"
@@ -128,6 +136,25 @@ class ModelErrorServiceTestCase(unittest.TestCase):
     self.assertEqual(payload, {"ok": True})
     self.assertEqual(urlopen.call_count, 6)
     self.assertEqual([call.args[0] for call in sleep.call_args_list], list(DEFAULT_MODEL_RETRY_DELAYS))
+
+  def test_request_json_with_retries_retries_dns_resolution_failure(self) -> None:
+    dns_error = urllib_error.URLError("[Errno 8] nodename nor servname provided, or not known")
+    with patch(
+      "novel_backend.services.model_http_service.urllib_request.urlopen",
+      side_effect=[dns_error, _FakeHTTPResponse('{"ok": true}')],
+    ) as urlopen, patch("novel_backend.services.model_http_service.time.sleep") as sleep:
+      payload = request_json_with_retries(
+        "https://example.com/v1/chat/completions",
+        headers={"Authorization": "Bearer test-key"},
+        payload={"model": "demo", "messages": []},
+        error_prefix="模型请求失败",
+        invalid_json_message="模型返回的不是合法 JSON",
+        invalid_payload_message="模型返回格式不正确",
+      )
+
+    self.assertEqual(payload, {"ok": True})
+    self.assertEqual(urlopen.call_count, 2)
+    sleep.assert_called_once_with(0.8)
 
   def test_request_json_with_retries_reports_attempt_count_after_retry_exhausted(self) -> None:
     ssl_eof = urllib_error.URLError(

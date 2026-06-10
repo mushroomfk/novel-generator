@@ -3,7 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="${1:-稿匣}"
-APP_BUNDLE="$ROOT_DIR/src-tauri/target/debug/bundle/macos/${APP_NAME}.app"
+TAURI_BUILD_PROFILE="${2:-${TAURI_BUILD_PROFILE:-release}}"
+
+if [[ "$TAURI_BUILD_PROFILE" != "release" && "$TAURI_BUILD_PROFILE" != "debug" ]]; then
+  echo "TAURI_BUILD_PROFILE 只支持 release 或 debug: $TAURI_BUILD_PROFILE" >&2
+  exit 1
+fi
+
+APP_BUNDLE="$ROOT_DIR/src-tauri/target/${TAURI_BUILD_PROFILE}/bundle/macos/${APP_NAME}.app"
 APP_SIDECAR="$APP_BUNDLE/Contents/MacOS/novel-backend"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then

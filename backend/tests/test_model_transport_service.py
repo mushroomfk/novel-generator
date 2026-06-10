@@ -132,6 +132,7 @@ class ModelTransportServiceTestCase(unittest.TestCase):
 
   def test_retryable_transport_error_matches_remote_disconnect(self) -> None:
     self.assertTrue(is_retryable_transport_error("Remote end closed connection without response"))
+    self.assertTrue(is_retryable_transport_error("[Errno 8] nodename nor servname provided, or not known"))
 
   def test_request_json_retries_http_503_then_returns_payload(self) -> None:
     http_error = urllib_error.HTTPError(

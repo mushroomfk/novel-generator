@@ -89,6 +89,12 @@ _NETWORK_CONNECTION_PATTERNS = (
   "unexpected_eof",
   "eof occurred",
   "_ssl.c",
+  "nodename nor servname provided",
+  "name or service not known",
+  "temporary failure in name resolution",
+  "failed to resolve",
+  "gaierror",
+  "dns",
   "remote end closed connection",
   "remote disconnected",
   "server disconnected",
@@ -97,6 +103,7 @@ _NETWORK_CONNECTION_PATTERNS = (
   "connection closed",
   "connection refused",
   "connection unexpectedly closed",
+  "域名解析",
 )
 _FORMAT_PATTERNS = (
   "invalid request",

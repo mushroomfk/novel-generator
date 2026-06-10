@@ -20,6 +20,7 @@ from novel_backend.models import (
   AgentPlan,
   AgentPlanAction,
   BrainstormMessage,
+  ChapterReviewReport,
   ChapterRewriteRequest,
   ChapterUpdateRequest,
   CreateProjectRequest,
@@ -62,6 +63,22 @@ from novel_backend.services.project_narrative_state_service import (
 
 
 class SelfEvolutionServiceTestCase(unittest.TestCase):
+  def _fake_chapter_review(self, _settings, detail, chapter_id: str, *, style_name: str = "") -> ChapterReviewReport:
+    chapter = next(item for item in detail.chapters if item.id == chapter_id)
+    return ChapterReviewReport(
+      chapter_id=chapter.id,
+      chapter_index=chapter.index,
+      chapter_title=chapter.title,
+      version="complete",
+      engine="self-evolution-test",
+      status="good",
+      overall_score=88,
+      summary="测试环境跳过模型审查。",
+      style_name=style_name,
+      updated_at="2026-05-23T00:00:00+00:00",
+      source_signature=f"self-evolution-test:{chapter.id}:{style_name}",
+    )
+
   def setUp(self) -> None:
     self._temp_dir = tempfile.TemporaryDirectory()
     self.settings = Settings(data_dir=Path(self._temp_dir.name))
@@ -74,6 +91,18 @@ class SelfEvolutionServiceTestCase(unittest.TestCase):
         model_name="demo-model",
       ),
     )
+    self._narrative_model_patcher = patch(
+      "novel_backend.services.project_narrative_state_service._invoke_narrative_editor_model",
+      side_effect=RuntimeError("skip narrative model editor in self-evolution tests"),
+    )
+    self._narrative_model_patcher.start()
+    self.addCleanup(self._narrative_model_patcher.stop)
+    self._chapter_review_patcher = patch(
+      "novel_backend.services.project_service.build_chapter_review",
+      side_effect=self._fake_chapter_review,
+    )
+    self._chapter_review_patcher.start()
+    self.addCleanup(self._chapter_review_patcher.stop)
     self.project = create_project(
       self.settings,
       CreateProjectRequest(
