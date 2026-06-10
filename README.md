@@ -171,7 +171,7 @@ flowchart LR
 
 - 已可本地运行前端、Python backend 和 Tauri 桌面壳
 - 已验证 macOS arm64 桌面链路、测试分发流程和 Windows x64 CI 安装包构建；当前对外 macOS 验证脚本默认使用 release 产物
-- 当前测试版版本号为 0.1.3；Windows 测试包需要由当前分支重新触发 GitHub Actions 构建后再做实机安装和卸载验收
+- 当前测试版版本号为 0.1.3；macOS arm64 和 Windows x64 测试包已生成，Windows 仍需要实机安装和卸载验收
 - 后端单测覆盖项目服务、生成服务、资料导入、许可证、技能流程和记忆系统
 - 浏览器层 UI smoke 覆盖建作品、写章节、Agent 计划执行、整书架构和技能检索主链路
 - 正式分发仍需要补充 Developer ID 签名、公证、安装包渠道和版本升级策略
