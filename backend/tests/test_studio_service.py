@@ -68,6 +68,7 @@ from novel_backend.services.studio_service import (
   blueprint_stream,
   brainstorm_stream,
   character_replica_stream,
+  chapter_generate_prompt_preview,
   chapter_generate_stream,
   chapter_rewrite_stream,
   continue_project_stream,
@@ -1007,11 +1008,39 @@ class StudioServiceTestCase(unittest.TestCase):
     self.assertIn("那股看不见的人气已经贴到了门边", result_event[1]["content"])
     self.assertIn("标准模式生成候选", result_event[1]["summary"])
 
+  def test_chapter_generate_prompt_preview_returns_editable_prompt_without_model_call(self) -> None:
+    update_chapter_content(
+      self.settings,
+      self.project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追握住铜钥匙，听见门外脚步停住。\n"),
+    )
+
+    with patch("novel_backend.services.generation_service._request_chat_completion") as request_mock:
+      preview = chapter_generate_prompt_preview(
+        self.settings,
+        ChapterGenerateRequest(
+          project_id=self.project.id,
+          chapter_id="chapter-001",
+          instruction="让追兵先在门外逼近，不要马上撞进来。",
+          characters_involved="林追",
+          key_items="铜钥匙",
+        ),
+      )
+
+    request_mock.assert_not_called()
+    self.assertEqual(preview.chapter_id, "chapter-001")
+    self.assertIn("连续性证据包", preview.editable_prompt)
+    self.assertIn("让追兵先在门外逼近", preview.editable_prompt)
+    self.assertIn("[system]", preview.prompt_text)
+    self.assertEqual(preview.messages[-1].role, "user")
+
   def test_chapter_generate_stream_respects_explicit_target_words(self) -> None:
     def fake_pipeline(_settings, **kwargs):
       self.assertEqual(kwargs["target_words"], 900)
       self.assertFalse(kwargs["prefer_project_budget"])
       self.assertFalse(kwargs["complete_chapter"])
+      self.assertEqual(kwargs["prompt_override"], "用户改写后的完整提示词")
       return {
         "headline": "短章节测试",
         "summary": "已按调用方目标长度生成。",
@@ -1029,6 +1058,7 @@ class StudioServiceTestCase(unittest.TestCase):
               chapter_id="chapter-001",
               instruction="生成一段短测试正文。",
               target_words=900,
+              prompt_override="用户改写后的完整提示词",
             ),
           )
         )

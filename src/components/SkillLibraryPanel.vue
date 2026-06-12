@@ -35,6 +35,8 @@ import {
   listStyles,
   listStudioSkills,
   listXpPresets,
+  previewChapterGeneratePrompt,
+  previewChapterWorkflowPrompt,
   rollbackStyleCalibration,
   rollbackSkillVersion,
   saveStyle,
@@ -255,6 +257,18 @@ const chapterGenerateForm = reactive({
   keyItems: '',
   sceneLocation: '',
   timeConstraint: '',
+});
+
+const chapterPromptPreviewState = reactive({
+  open: false,
+  loading: false,
+  error: '',
+  message: '',
+  title: '确认章节提示词',
+  confirmLabel: '确认生成',
+  kind: '',
+  payload: null,
+  items: [],
 });
 
 const rewriteForm = reactive({
@@ -533,6 +547,9 @@ const filteredSelfEvolutionObsidianMaintenance = computed(() => {
     return haystack.includes(query);
   });
 });
+const filteredSelfEvolutionObsidianStageable = computed(() => (
+  filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canStageObsidianMaintenanceInBatch(item))
+));
 const filteredSelfEvolutionObsidianPublishable = computed(() => (
   filteredSelfEvolutionObsidianMaintenance.value.filter((item) => canPublishObsidianMaintenanceInBatch(item))
 ));
@@ -1404,6 +1421,13 @@ function obsidianMaintenanceSourceChapterText(item) {
   return `来源章节：${indexes.map((index) => `第 ${index} 章`).join('、')}`;
 }
 
+function canStageObsidianMaintenanceInBatch(item) {
+  if (!item?.draft_markdown) {
+    return false;
+  }
+  return !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item));
+}
+
 function canPublishObsidianMaintenanceInBatch(item) {
   if (!item?.draft_path) {
     return false;
@@ -1633,9 +1657,7 @@ async function stageVisibleObsidianMaintenanceSuggestions() {
     toolError.value = '先在左侧打开一部作品';
     return;
   }
-  const suggestionIds = filteredSelfEvolutionObsidianMaintenance.value
-    .filter((item) => item?.draft_markdown)
-    .filter((item) => !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item)))
+  const suggestionIds = filteredSelfEvolutionObsidianStageable.value
     .map((item) => String(item?.id ?? '').trim())
     .filter(Boolean);
   if (!suggestionIds.length) {
@@ -2465,6 +2487,69 @@ async function handleDeleteCharacterReplicaProfile() {
   setToolMessage('人物卡已删除');
 }
 
+function chapterIdForIndex(index) {
+  const chapter = (props.project?.chapters ?? []).find((item) => Number(item.index) === Number(index));
+  return chapter?.id || `chapter-${String(index).padStart(3, '0')}`;
+}
+
+function resetChapterPromptPreviewState() {
+  chapterPromptPreviewState.open = false;
+  chapterPromptPreviewState.loading = false;
+  chapterPromptPreviewState.error = '';
+  chapterPromptPreviewState.message = '';
+  chapterPromptPreviewState.title = '确认章节提示词';
+  chapterPromptPreviewState.confirmLabel = '确认生成';
+  chapterPromptPreviewState.kind = '';
+  chapterPromptPreviewState.payload = null;
+  chapterPromptPreviewState.items = [];
+}
+
+async function copyChapterPromptPreview(item) {
+  const text = String(item?.editablePrompt ?? '').trim();
+  if (!text) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    chapterPromptPreviewState.message = '提示词已复制';
+  } catch {
+    chapterPromptPreviewState.message = '复制失败，可以手动选择文本复制';
+  }
+}
+
+async function openChapterPromptPreviewDialog({ kind, title, confirmLabel, payload, items }) {
+  chapterPromptPreviewState.open = true;
+  chapterPromptPreviewState.loading = false;
+  chapterPromptPreviewState.error = '';
+  chapterPromptPreviewState.message = '';
+  chapterPromptPreviewState.kind = kind;
+  chapterPromptPreviewState.title = title;
+  chapterPromptPreviewState.confirmLabel = confirmLabel;
+  chapterPromptPreviewState.payload = payload;
+  chapterPromptPreviewState.items = items.map((item) => ({
+    key: item.key,
+    title: item.title,
+    chapterId: item.chapterId || '',
+    chapterIndex: item.chapterIndex || 0,
+    editablePrompt: item.editablePrompt || '',
+    promptText: item.promptText || '',
+  }));
+}
+
+async function previewSingleChapterPrompt(kind, payload) {
+  const preview = kind === 'chapter-workflow'
+    ? await previewChapterWorkflowPrompt(payload)
+    : await previewChapterGeneratePrompt(payload);
+  return {
+    key: `${kind}-${preview.chapter_id || payload.chapter_id}`,
+    title: preview.title || '章节提示词',
+    chapterId: preview.chapter_id || payload.chapter_id,
+    chapterIndex: Number(preview.chapter_index || 0),
+    editablePrompt: preview.editable_prompt || '',
+    promptText: preview.prompt_text || '',
+  };
+}
+
 async function handleActiveChapterWorkflowRun() {
   if (!ensureProjectAndChapter({ chapter: true })) {
     return;
@@ -2474,13 +2559,32 @@ async function handleActiveChapterWorkflowRun() {
     toolError.value = '当前技能没有可执行的章节工作流';
     return;
   }
-  await runStream(streamChapterWorkflow, {
+  const payload = {
     project_id: props.project.id,
     chapter_id: props.selectedChapter.id,
     mode: config.mode,
     instruction: config.form.instruction.trim(),
     target_words: config.form.targetWords,
-  });
+  };
+  if (config.mode !== 'draft') {
+    await runStream(streamChapterWorkflow, payload);
+    return;
+  }
+  try {
+    chapterPromptPreviewState.loading = true;
+    const item = await previewSingleChapterPrompt('chapter-workflow', payload);
+    await openChapterPromptPreviewDialog({
+      kind: 'chapter-workflow',
+      title: '确认续写提示词',
+      confirmLabel: '确认续写',
+      payload,
+      items: [item],
+    });
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '章节提示词预览失败';
+  } finally {
+    chapterPromptPreviewState.loading = false;
+  }
 }
 
 async function handleConsistencyRun() {
@@ -2511,7 +2615,7 @@ async function handleChapterGenerateRun() {
   if (!ensureProjectAndChapter({ chapter: true })) {
     return;
   }
-  await runStream(streamChapterGenerate, {
+  const payload = {
     project_id: props.project.id,
     chapter_id: props.selectedChapter.id,
     instruction: chapterGenerateForm.instruction.trim(),
@@ -2521,7 +2625,22 @@ async function handleChapterGenerateRun() {
     key_items: chapterGenerateForm.keyItems.trim(),
     scene_location: chapterGenerateForm.sceneLocation.trim(),
     time_constraint: chapterGenerateForm.timeConstraint.trim(),
-  });
+  };
+  try {
+    chapterPromptPreviewState.loading = true;
+    const item = await previewSingleChapterPrompt('chapter-generate', payload);
+    await openChapterPromptPreviewDialog({
+      kind: 'chapter-generate',
+      title: '确认生成提示词',
+      confirmLabel: '确认生成',
+      payload,
+      items: [item],
+    });
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '章节提示词预览失败';
+  } finally {
+    chapterPromptPreviewState.loading = false;
+  }
 }
 
 async function handleRewriteRun(mode = activeRewriteConfig.value?.mode) {
@@ -2551,18 +2670,98 @@ async function handleBatchRun() {
   if (!ensureProjectAndChapter()) {
     return;
   }
-  await runStream(
-    streamBatchGenerate,
-    {
-      project_id: props.project.id,
-      start_chapter: Number(batchForm.startChapter),
-      end_chapter: Number(batchForm.endChapter),
-      instruction: batchForm.instruction.trim(),
-      style_name: batchForm.styleName.trim(),
-      xp_preset: batchForm.xpPreset.trim(),
-    },
-    refreshProjectDetail,
-  );
+  const startChapter = Number(batchForm.startChapter);
+  const endChapter = Number(batchForm.endChapter);
+  if (endChapter < startChapter) {
+    toolError.value = '结束章节不能小于起始章节';
+    return;
+  }
+  const chapterCount = endChapter - startChapter + 1;
+  if (chapterCount > 5) {
+    toolError.value = '逐章确认提示词时，单次批量生成最多处理 5 章。请缩小章节范围。';
+    return;
+  }
+  const payload = {
+    project_id: props.project.id,
+    start_chapter: startChapter,
+    end_chapter: endChapter,
+    instruction: batchForm.instruction.trim(),
+    style_name: batchForm.styleName.trim(),
+    xp_preset: batchForm.xpPreset.trim(),
+  };
+  try {
+    chapterPromptPreviewState.loading = true;
+    const items = await Promise.all(
+      Array.from({ length: chapterCount }, (_, offset) => startChapter + offset)
+        .map(async (chapterIndex) => {
+          const chapterId = chapterIdForIndex(chapterIndex);
+          const preview = await previewChapterGeneratePrompt({
+            project_id: props.project.id,
+            chapter_id: chapterId,
+            instruction: payload.instruction,
+            style_name: payload.style_name,
+            xp_preset: payload.xp_preset,
+          });
+          return {
+            key: `batch-${chapterId}`,
+            title: preview.title || `第 ${chapterIndex} 章`,
+            chapterId,
+            chapterIndex,
+            editablePrompt: preview.editable_prompt || '',
+            promptText: preview.prompt_text || '',
+          };
+        }),
+    );
+    await openChapterPromptPreviewDialog({
+      kind: 'batch-generate',
+      title: '确认批量生成提示词',
+      confirmLabel: '确认批量生成',
+      payload,
+      items,
+    });
+  } catch (error) {
+    toolError.value = error instanceof Error ? error.message : '批量章节提示词预览失败';
+  } finally {
+    chapterPromptPreviewState.loading = false;
+  }
+}
+
+async function handleConfirmChapterPromptPreview() {
+  const kind = chapterPromptPreviewState.kind;
+  const payload = chapterPromptPreviewState.payload;
+  const items = chapterPromptPreviewState.items;
+  if (!kind || !payload || !items.length || isToolRunning.value) {
+    return;
+  }
+
+  resetChapterPromptPreviewState();
+  if (kind === 'chapter-workflow') {
+    await runStream(streamChapterWorkflow, {
+      ...payload,
+      prompt_override: items[0].editablePrompt.trim(),
+    });
+    return;
+  }
+  if (kind === 'chapter-generate') {
+    await runStream(streamChapterGenerate, {
+      ...payload,
+      prompt_override: items[0].editablePrompt.trim(),
+    });
+    return;
+  }
+  if (kind === 'batch-generate') {
+    const promptOverrides = Object.fromEntries(
+      items.map((item) => [item.chapterId, item.editablePrompt.trim()]),
+    );
+    await runStream(
+      streamBatchGenerate,
+      {
+        ...payload,
+        prompt_overrides: promptOverrides,
+      },
+      refreshProjectDetail,
+    );
+  }
 }
 
 async function handleContinueRun() {
@@ -2900,8 +3099,8 @@ function syncObsidianFormFromState(state, options = {}) {
     return;
   }
   const config = state?.config ?? {};
-  obsidianForm.enabled = Boolean(config.enabled);
-  obsidianForm.vaultPath = config.vault_path ?? '';
+  obsidianForm.enabled = true;
+  obsidianForm.vaultPath = config.vault_path || 'Vault';
   obsidianForm.includePatterns = arrayToLines(config.include_patterns, '**/*.md\n**/*.canvas');
   obsidianForm.excludePatterns = arrayToLines(config.exclude_patterns, '.obsidian/**\n.trash/**\ntemplates/**');
   obsidianForm.allowedStatuses = arrayToLines(config.allowed_statuses, 'canonical\n正式\n已确认\nactive\npublished\nusable');
@@ -2913,8 +3112,8 @@ function syncObsidianFormFromState(state, options = {}) {
 
 function obsidianPayloadFromForm() {
   return {
-    enabled: obsidianForm.enabled,
-    vault_path: obsidianForm.vaultPath.trim(),
+    enabled: true,
+    vault_path: obsidianForm.vaultPath.trim() || 'Vault',
     include_patterns: linesToArray(obsidianForm.includePatterns),
     exclude_patterns: linesToArray(obsidianForm.excludePatterns),
     allowed_statuses: linesToArray(obsidianForm.allowedStatuses),
@@ -3859,12 +4058,12 @@ async function handleStyleReferenceFilesSelected(event) {
                 >
               </label>
               <button
-                :disabled="isToolRunning"
+                :disabled="isToolRunning || chapterPromptPreviewState.loading"
                 class="primary-button"
                 type="button"
                 @click="handleActiveChapterWorkflowRun"
               >
-                {{ isToolRunning ? activeChapterWorkflowConfig.runningLabel : activeChapterWorkflowConfig.submitLabel }}
+                {{ isToolRunning ? activeChapterWorkflowConfig.runningLabel : chapterPromptPreviewState.loading ? '读取提示词…' : activeChapterWorkflowConfig.submitLabel }}
               </button>
             </div>
           </template>
@@ -3992,12 +4191,12 @@ async function handleStyleReferenceFilesSelected(event) {
                 </label>
               </div>
               <button
-                :disabled="isToolRunning"
+                :disabled="isToolRunning || chapterPromptPreviewState.loading"
                 class="primary-button"
                 type="button"
                 @click="handleChapterGenerateRun"
               >
-                {{ isToolRunning ? '生成中…' : '生成正文' }}
+                {{ isToolRunning ? '生成中…' : chapterPromptPreviewState.loading ? '读取提示词…' : '生成正文' }}
               </button>
             </div>
           </template>
@@ -4094,12 +4293,12 @@ async function handleStyleReferenceFilesSelected(event) {
                 </label>
               </div>
               <button
-                :disabled="isToolRunning"
+                :disabled="isToolRunning || chapterPromptPreviewState.loading"
                 class="primary-button"
                 type="button"
                 @click="handleBatchRun"
               >
-                {{ isToolRunning ? '批量处理中…' : '开始批量生成' }}
+                {{ isToolRunning ? '批量处理中…' : chapterPromptPreviewState.loading ? '读取提示词…' : '开始批量生成' }}
               </button>
             </div>
           </template>
@@ -4590,75 +4789,12 @@ async function handleStyleReferenceFilesSelected(event) {
               @change.capture="markObsidianFormTouched"
               @input.capture="markObsidianFormTouched"
             >
-              <label class="toggle-row">
-                <input
-                  v-model="obsidianForm.enabled"
-                  data-testid="obsidian-enabled-checkbox"
-                  type="checkbox"
-                >
-                <span>启用 Obsidian</span>
-              </label>
               <label class="form-field">
-                <span>Vault 路径</span>
+                <span>Vault 文件夹</span>
                 <input
                   v-model="obsidianForm.vaultPath"
                   data-testid="obsidian-vault-path-input"
-                  placeholder="/Users/name/Documents/My Vault"
-                >
-              </label>
-              <label class="form-field">
-                <span>纳入路径</span>
-                <textarea
-                  v-model="obsidianForm.includePatterns"
-                  rows="3"
-                />
-              </label>
-              <label class="form-field">
-                <span>排除路径</span>
-                <textarea
-                  v-model="obsidianForm.excludePatterns"
-                  rows="4"
-                />
-              </label>
-              <div class="two-column-fields">
-                <label class="form-field">
-                  <span>允许状态</span>
-                  <textarea
-                    v-model="obsidianForm.allowedStatuses"
-                    rows="5"
-                  />
-                </label>
-                <label class="form-field">
-                  <span>排除状态</span>
-                  <textarea
-                    v-model="obsidianForm.excludedStatuses"
-                    rows="5"
-                  />
-                </label>
-              </div>
-              <div class="inline-toggle-group">
-                <label class="toggle-row">
-                  <input
-                    v-model="obsidianForm.includeWithoutStatus"
-                    type="checkbox"
-                  >
-                  <span>收录未标状态笔记</span>
-                </label>
-                <label class="toggle-row">
-                  <input
-                    v-model="obsidianForm.requireUsableByAi"
-                    type="checkbox"
-                  >
-                  <span>只收录显式允许 AI 的笔记</span>
-                </label>
-              </div>
-              <label class="form-field compact-field">
-                <span>笔记上限</span>
-                <input
-                  v-model.number="obsidianForm.maxNotes"
-                  max="10000"
-                  min="1"
-                  type="number"
+                  placeholder="Vault"
                 >
               </label>
               <div class="button-row">
@@ -4678,9 +4814,69 @@ async function handleStyleReferenceFilesSelected(event) {
                   type="button"
                   @click="runObsidianSync"
                 >
-                  重新同步
+                  同步 Vault
                 </button>
               </div>
+              <details class="advanced-settings">
+                <summary>高级同步规则</summary>
+                <div class="advanced-settings-body">
+                  <label class="form-field">
+                    <span>纳入路径</span>
+                    <textarea
+                      v-model="obsidianForm.includePatterns"
+                      rows="3"
+                    />
+                  </label>
+                  <label class="form-field">
+                    <span>排除路径</span>
+                    <textarea
+                      v-model="obsidianForm.excludePatterns"
+                      rows="4"
+                    />
+                  </label>
+                  <div class="two-column-fields">
+                    <label class="form-field">
+                      <span>允许状态</span>
+                      <textarea
+                        v-model="obsidianForm.allowedStatuses"
+                        rows="5"
+                      />
+                    </label>
+                    <label class="form-field">
+                      <span>排除状态</span>
+                      <textarea
+                        v-model="obsidianForm.excludedStatuses"
+                        rows="5"
+                      />
+                    </label>
+                  </div>
+                  <div class="inline-toggle-group">
+                    <label class="toggle-row">
+                      <input
+                        v-model="obsidianForm.includeWithoutStatus"
+                        type="checkbox"
+                      >
+                      <span>收录未标状态笔记</span>
+                    </label>
+                    <label class="toggle-row">
+                      <input
+                        v-model="obsidianForm.requireUsableByAi"
+                        type="checkbox"
+                      >
+                      <span>只收录显式允许 AI 的笔记</span>
+                    </label>
+                  </div>
+                  <label class="form-field compact-field">
+                    <span>笔记上限</span>
+                    <input
+                      v-model.number="obsidianForm.maxNotes"
+                      max="10000"
+                      min="1"
+                      type="number"
+                    >
+                  </label>
+                </div>
+              </details>
             </div>
           </template>
 
@@ -6431,10 +6627,10 @@ async function handleStyleReferenceFilesSelected(event) {
                         class="secondary-button small-button"
                         data-testid="self-evolution-obsidian-stage-visible-button"
                         type="button"
-                        :disabled="selfEvolutionState.stagingAllObsidianMaintenance || !filteredSelfEvolutionObsidianMaintenance.length"
+                        :disabled="selfEvolutionState.stagingAllObsidianMaintenance || filteredSelfEvolutionObsidianStageable.length === 0"
                         @click="stageVisibleObsidianMaintenanceSuggestions"
                       >
-                        {{ selfEvolutionState.stagingAllObsidianMaintenance ? '保存中…' : '保存当前结果草稿' }}
+                        {{ selfEvolutionState.stagingAllObsidianMaintenance ? '保存中…' : `保存当前结果草稿 (${filteredSelfEvolutionObsidianStageable.length})` }}
                       </button>
                       <button
                         class="primary-button small-button"
@@ -7276,6 +7472,91 @@ async function handleStyleReferenceFilesSelected(event) {
         </section>
       </div>
     </section>
+
+    <div
+      v-if="chapterPromptPreviewState.open"
+      class="modal-overlay"
+      @click.self="resetChapterPromptPreviewState"
+    >
+      <section
+        class="modal-dialog prompt-preview-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="确认章节提示词"
+      >
+        <header class="prompt-preview-dialog-head">
+          <div>
+            <p class="stage-kicker">章节提示词</p>
+            <h3>{{ chapterPromptPreviewState.title }}</h3>
+          </div>
+          <button
+            class="secondary-button small-button"
+            type="button"
+            @click="resetChapterPromptPreviewState"
+          >
+            关闭
+          </button>
+        </header>
+
+        <p class="empty-result-copy">
+          确认后会使用这里编辑后的内容生成正文。
+        </p>
+        <p
+          v-if="chapterPromptPreviewState.error"
+          class="prompt-preview-error"
+        >
+          {{ chapterPromptPreviewState.error }}
+        </p>
+        <p
+          v-else-if="chapterPromptPreviewState.message"
+          class="prompt-preview-message"
+        >
+          {{ chapterPromptPreviewState.message }}
+        </p>
+
+        <div class="prompt-preview-list">
+          <article
+            v-for="item in chapterPromptPreviewState.items"
+            :key="item.key"
+            class="prompt-preview-item"
+          >
+            <div class="prompt-preview-item-head">
+              <strong>{{ item.title }}</strong>
+              <button
+                class="secondary-button small-button"
+                type="button"
+                @click="copyChapterPromptPreview(item)"
+              >
+                复制提示词
+              </button>
+            </div>
+            <textarea
+              v-model="item.editablePrompt"
+              class="prompt-preview-editor"
+              rows="14"
+            />
+          </article>
+        </div>
+
+        <div class="action-row prompt-preview-actions">
+          <button
+            class="secondary-button"
+            type="button"
+            @click="resetChapterPromptPreviewState"
+          >
+            取消
+          </button>
+          <button
+            :disabled="isToolRunning || chapterPromptPreviewState.items.length === 0"
+            class="primary-button"
+            type="button"
+            @click="handleConfirmChapterPromptPreview"
+          >
+            {{ isToolRunning ? '执行中…' : chapterPromptPreviewState.confirmLabel }}
+          </button>
+        </div>
+      </section>
+    </div>
   </section>
 </template>
 
@@ -7371,6 +7652,88 @@ async function handleStyleReferenceFilesSelected(event) {
 
 .small-button {
   padding: 7px 11px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(31, 35, 40, 0.38);
+}
+
+.modal-dialog {
+  width: min(920px, 100%);
+  max-height: min(86vh, 820px);
+  overflow: auto;
+  border: 1px solid #d0d7de;
+  border-radius: 16px;
+  background: #ffffff;
+  box-shadow: 0 24px 60px rgba(31, 35, 40, 0.24);
+}
+
+.prompt-preview-dialog {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.prompt-preview-dialog-head,
+.prompt-preview-item-head,
+.prompt-preview-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stage-kicker {
+  margin: 0 0 4px;
+  color: #6e7781;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-preview-dialog h3 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.prompt-preview-list {
+  display: grid;
+  gap: 14px;
+}
+
+.prompt-preview-item {
+  display: grid;
+  gap: 8px;
+}
+
+.prompt-preview-editor {
+  min-height: 300px;
+  max-height: 520px;
+  resize: vertical;
+  font-family: 'SFMono-Regular', ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.prompt-preview-message,
+.prompt-preview-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.prompt-preview-message {
+  color: #57606a;
+}
+
+.prompt-preview-error {
+  color: #b42318;
 }
 
 .overview-copy,
@@ -7606,6 +7969,27 @@ async function handleStyleReferenceFilesSelected(event) {
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+
+.advanced-settings {
+  border: 1px solid #d8dee4;
+  border-radius: 12px;
+  padding: 0;
+  background: #f6f8fa;
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  padding: 11px 13px;
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.advanced-settings-body {
+  display: grid;
+  gap: 12px;
+  padding: 0 13px 13px;
 }
 
 .toggle-row {

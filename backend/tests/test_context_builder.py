@@ -19,7 +19,12 @@ from novel_backend.models import (
   ReviewModelConfig,
 )
 from novel_backend.services.config_service import initialize_app_storage, save_config
-from novel_backend.services.context_builder import build_project_context_bundle, build_prompt_support, explicit_length_target
+from novel_backend.services.context_builder import (
+  _context_budget_limit,
+  build_project_context_bundle,
+  build_prompt_support,
+  explicit_length_target,
+)
 from novel_backend.services.project_distillation_service import build_task_distillation_prompt_block
 from novel_backend.services.project_service import (
   create_project,
@@ -162,6 +167,30 @@ class ContextBuilderTestCase(unittest.TestCase):
     self.assertTrue(any(item.block == "当前章节正文" for item in trimmed_blocks))
     self.assertIn("当前章节正文中间内容已按上下文预算缩短", bundle.context_text)
     self.assertLess(len(bundle.context_text), len(long_body))
+
+  def test_project_context_bundle_keeps_final_text_under_context_limit(self) -> None:
+    with patch("novel_backend.services.context_builder._context_budget_limit", return_value=900):
+      bundle = build_project_context_bundle(
+        self.settings,
+        self.project.id,
+        chapter_id="chapter-001",
+        knowledge_query="铜钥匙",
+        task_instruction="请继续续写这一章。",
+      )
+
+    self.assertIsNotNone(bundle.budget_report)
+    self.assertLessEqual(len(bundle.context_text), bundle.budget_report.limit_chars)
+    self.assertEqual(bundle.budget_report.final_chars, len(bundle.context_text))
+    self.assertFalse(any(item.block == "完整上下文" for item in bundle.budget_report.trimmed_blocks))
+    self.assertGreater(len(bundle.context_lines), 1)
+    self.assertIn("林追不能主动暴露真实身份", bundle.context_text)
+
+  def test_context_budget_limit_expands_with_large_model_capacity_signal(self) -> None:
+    base_limit = _context_budget_limit("continuation", model_max_tokens=8192)
+    expanded_limit = _context_budget_limit("continuation", model_max_tokens=64000)
+
+    self.assertGreater(expanded_limit, base_limit)
+    self.assertLessEqual(expanded_limit, 42_000)
 
   def test_project_context_bundle_includes_reference_blocks_from_imported_source(self) -> None:
     import_project_knowledge(

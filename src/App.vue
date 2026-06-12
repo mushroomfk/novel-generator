@@ -69,6 +69,15 @@ let modelRuntimeTimer = null;
 const dashboardRetryCount = ref(0);
 const maxDashboardRetryCount = 4;
 const architectureReadyKeys = ['core_seed', 'character_design', 'world_building', 'plot_structure', 'blueprint'];
+const storyOverviewStructuredKeys = [
+  'characters',
+  'events',
+  'locations',
+  'props',
+  'skills',
+  'scenes',
+  'organizations',
+];
 
 const sortedProjects = computed(() => (
   [...projects.value].sort(
@@ -205,9 +214,37 @@ function syncProjectSummary(projectDetail) {
   ));
 }
 
+function storyOverviewHasStructuredEntities(overview) {
+  return storyOverviewStructuredKeys.some((key) => (overview?.[key] ?? []).length > 0);
+}
+
+function preserveStoryOverviewStructuredEntities(projectDetail) {
+  const currentDetail = selectedProjectDetail.value;
+  if (!currentDetail || currentDetail.id !== projectDetail?.id) {
+    return projectDetail;
+  }
+
+  const currentOverview = currentDetail.story_overview;
+  const nextOverview = projectDetail.story_overview;
+  if (!storyOverviewHasStructuredEntities(currentOverview) || storyOverviewHasStructuredEntities(nextOverview)) {
+    return projectDetail;
+  }
+
+  return {
+    ...projectDetail,
+    story_overview: {
+      ...nextOverview,
+      ...Object.fromEntries(
+        storyOverviewStructuredKeys.map((key) => [key, currentOverview?.[key] ?? []]),
+      ),
+    },
+  };
+}
+
 function handleProjectDetailUpdated(projectDetail) {
-  selectedProjectDetail.value = projectDetail;
-  syncProjectSummary(projectDetail);
+  const nextProjectDetail = preserveStoryOverviewStructuredEntities(projectDetail);
+  selectedProjectDetail.value = nextProjectDetail;
+  syncProjectSummary(nextProjectDetail);
 }
 
 function updateSelectedProjectSummary(projectSummary) {

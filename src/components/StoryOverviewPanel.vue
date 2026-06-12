@@ -1,11 +1,20 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue';
 import {
+  confirmProjectObsidianMaintenanceMerge,
+  getProjectDetail,
+  getProjectFileContent,
   importProjectKnowledge,
   importProjectKnowledgeFiles,
+  ignoreProjectObsidianMaintenance,
+  publishProjectObsidianMaintenance,
+  reopenProjectObsidianMaintenance,
   runProjectDream,
   searchProjectKnowledge,
+  stageProjectObsidianMaintenance,
+  syncProjectObsidian,
   updateProjectMemory,
+  updateProjectFileContent,
   updateStoryDocument,
 } from '../lib/api.js';
 import { buildImportedFilePayloads, importAcceptValue } from '../lib/importFiles.js';
@@ -50,11 +59,23 @@ const isMemorySaving = ref(false);
 const dreamFocus = ref('');
 const dreamMessage = ref('');
 const isDreamRunning = ref(false);
+const archiveMessage = ref('');
+const archiveActionId = ref('');
+const archiveSyncing = ref(false);
+const archiveGraphMode = ref('chapter');
+const activeArchiveGraphNodePath = ref('');
+const archiveEditorPath = ref('');
+const archiveEditorContent = ref('');
+const archiveEditorLoading = ref(false);
+const archiveEditorSaving = ref(false);
+const focusedDocumentKey = ref('');
 
 const emptyOverview = Object.freeze({
   documents: [],
   materials: [],
   obsidian: null,
+  obsidian_maintenance_summary: {},
+  obsidian_maintenance_suggestions: [],
   memory_entries: [],
   dream_report: null,
   model_overview: {
@@ -109,11 +130,171 @@ const selectedChapter = computed(() => {
   }
   return (props.project?.chapters ?? []).find((item) => item.id === props.selectedChapterId) ?? null;
 });
+const selectedChapterIndex = computed(() => Number(selectedChapter.value?.index ?? 0));
 const characters = computed(() => overview.value.characters ?? []);
 const documents = computed(() => overview.value.documents ?? []);
 const materials = computed(() => overview.value.materials ?? []);
 const obsidian = computed(() => overview.value.obsidian ?? null);
 const obsidianNotes = computed(() => obsidian.value?.notes ?? []);
+const obsidianMaintenanceSummary = computed(() => overview.value.obsidian_maintenance_summary ?? {});
+const obsidianMaintenanceSuggestions = computed(() => (
+  [...(overview.value.obsidian_maintenance_suggestions ?? [])].sort((left, right) => (
+    obsidianMaintenanceRank(right) - obsidianMaintenanceRank(left)
+    || String(left.title ?? '').localeCompare(String(right.title ?? ''), 'zh-CN')
+  ))
+));
+const obsidianMaintenanceActionable = computed(() => (
+  obsidianMaintenanceSuggestions.value.filter((item) => !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item)))
+));
+const obsidianInternalVaultRoot = computed(() => {
+  const rawPath = String(obsidian.value?.config?.vault_path || obsidian.value?.vault_path || '').trim();
+  const normalized = rawPath.replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/+$/u, '');
+  if (!normalized || normalized.startsWith('/') || normalized.includes('..') || normalized.includes(':')) {
+    return '';
+  }
+  return normalized;
+});
+const canEditObsidianNotes = computed(() => Boolean(obsidianInternalVaultRoot.value));
+const storyArchiveMaintenanceKinds = Object.freeze([
+  'create_story_character_note',
+  'create_story_event_note',
+  'create_story_location_note',
+  'create_story_prop_note',
+  'create_story_skill_note',
+  'create_story_scene_note',
+  'create_story_organization_note',
+]);
+const archiveGraphModes = Object.freeze([
+  { id: 'chapter', label: '本章图谱' },
+  { id: 'characters', label: '人物关系' },
+  { id: 'issues', label: '图谱问题' },
+]);
+const chapterVisibleObsidianNotes = computed(() => (
+  obsidianNotes.value.filter((item) => isObsidianNoteVisibleForChapter(item, selectedChapterIndex.value))
+));
+const characterGraphObsidianNotes = computed(() => (
+  obsidianNotes.value
+    .filter((item) => isCharacterArchiveNote(item))
+    .sort(sortObsidianGraphNotes)
+));
+const issueGraphObsidianNotes = computed(() => (
+  obsidianNotes.value
+    .filter((item) => obsidianNoteIssueCount(item) > 0)
+    .sort((left, right) => (
+      obsidianNoteIssueCount(right) - obsidianNoteIssueCount(left)
+      || String(left.title ?? '').localeCompare(String(right.title ?? ''), 'zh-CN')
+    ))
+));
+const archiveGraphKnownNames = computed(() => {
+  const values = [
+    ...(overview.value.characters ?? []).map((item) => item.name),
+    ...(overview.value.events ?? []).map((item) => item.name),
+    ...(overview.value.locations ?? []).map((item) => item.name),
+    ...(overview.value.props ?? []).map((item) => item.name),
+    ...(overview.value.skills ?? []).map((item) => item.name),
+    ...(overview.value.scenes ?? []).map((item) => item.name),
+    ...(overview.value.organizations ?? []).map((item) => item.name),
+    ...obsidianNotes.value.map((item) => item.title),
+  ];
+  return [...new Set(values.map((item) => String(item ?? '').trim()).filter((item) => item.length >= 2))];
+});
+const pendingArchiveGraphNotes = computed(() => (
+  obsidianMaintenanceSuggestions.value
+    .filter((item) => isStoryArchiveMaintenanceSuggestion(item))
+    .filter((item) => isMaintenanceSuggestionVisibleForChapter(item, selectedChapterIndex.value))
+    .map((item) => pendingArchiveGraphNote(item))
+));
+const archiveGraphSourceNotes = computed(() => {
+  const pendingNotes = pendingArchiveGraphNotes.value;
+  if (archiveGraphMode.value === 'characters') {
+    return [
+      ...characterGraphObsidianNotes.value,
+      ...pendingNotes.filter((item) => isCharacterArchiveNote(item)),
+    ].sort(sortObsidianGraphNotes);
+  }
+  if (archiveGraphMode.value === 'issues') {
+    return issueGraphObsidianNotes.value;
+  }
+  return [
+    ...chapterVisibleObsidianNotes.value,
+    ...pendingNotes,
+  ].sort(sortObsidianGraphNotes);
+});
+const archiveGraphNodes = computed(() => (
+  archiveGraphSourceNotes.value.slice(0, 18).map((item) => ({
+    id: archiveGraphNodeId(item),
+    note: item,
+    kind: obsidianGraphKind(item),
+    issueCount: obsidianNoteIssueCount(item),
+    pending: Boolean(item.__pending_maintenance),
+    maintenance: item.__maintenance_item ?? null,
+  }))
+));
+const activeArchiveGraphNode = computed(() => {
+  if (!archiveGraphNodes.value.length) {
+    return null;
+  }
+  return archiveGraphNodes.value.find((item) => item.id === activeArchiveGraphNodePath.value)
+    ?? archiveGraphNodes.value[0];
+});
+const activeArchiveGraphNodeId = computed(() => activeArchiveGraphNode.value?.id ?? '');
+const archiveGraphEdges = computed(() => {
+  const nodeTitles = new Map();
+  const nodePaths = new Map();
+  for (const node of archiveGraphNodes.value) {
+    nodeTitles.set(String(node.note.title ?? '').trim(), node);
+    nodePaths.set(String(node.note.relative_path ?? '').trim(), node);
+  }
+
+  const edges = [];
+  for (const node of archiveGraphNodes.value) {
+    const relationValues = [
+      ...((node.note.resolved_links ?? []).map((value) => ({ value, kind: '链接' }))),
+      ...((node.note.backlinks ?? []).map((value) => ({ value, kind: '反链' }))),
+      ...((node.note.graph_relations ?? []).map((value) => ({ value, kind: '关系' }))),
+    ];
+    for (const relation of relationValues) {
+      const target = resolveObsidianGraphTarget(relation.value, nodeTitles, nodePaths);
+      if (!target || target.id === node.id) {
+        continue;
+      }
+      const edgeId = [node.id, target.id, relation.kind].sort().join('::');
+      if (!edges.some((item) => item.id === edgeId)) {
+        edges.push({
+          id: edgeId,
+          from: node,
+          to: target,
+          kind: relation.kind,
+        });
+      }
+    }
+  }
+  return edges.slice(0, 24);
+});
+const activeArchiveGraphRelations = computed(() => {
+  const node = activeArchiveGraphNode.value;
+  if (!node) {
+    return [];
+  }
+  return archiveGraphEdges.value.filter((item) => item.from.id === node.id || item.to.id === node.id);
+});
+const archiveGraphStats = computed(() => ({
+  nodes: archiveGraphNodes.value.length,
+  relations: archiveGraphEdges.value.length,
+  issues: issueGraphObsidianNotes.value.reduce((sum, item) => sum + obsidianNoteIssueCount(item), 0)
+    + (obsidian.value?.issues?.length ?? 0),
+}));
+const archiveGraphTitle = computed(() => {
+  if (archiveGraphMode.value === 'characters') {
+    return '人物关系图';
+  }
+  if (archiveGraphMode.value === 'issues') {
+    return '图谱问题';
+  }
+  return selectedChapterIndex.value
+    ? `第 ${selectedChapterIndex.value} 章可用图谱`
+    : '全书可用图谱';
+});
 const skills = computed(() => overview.value.skills ?? []);
 const chapterReviews = computed(() => (
   [...(overview.value.chapter_reviews ?? [])].sort((left, right) => (
@@ -133,6 +314,78 @@ const activeCharacter = computed(() => (
   ?? characters.value[0]
   ?? null
 ));
+const documentByKey = computed(() => Object.fromEntries(
+  documents.value.map((item) => [item.key, item]),
+));
+
+function documentFilledStatus(documentKey) {
+  const item = documentByKey.value[documentKey];
+  return item?.content?.trim() ? '原文已写入' : '原文待补充';
+}
+
+const architectureMaintenanceAreas = computed(() => {
+  const writtenChapterCount = props.project?.chapters?.filter((item) => item.exists)?.length ?? 0;
+  const targetChapterCount = props.project?.target_chapters ?? 0;
+  const plotNodeCount = (overview.value.events?.length ?? 0)
+    + (overview.value.scenes?.length ?? 0)
+    + totalTimelineEntries.value;
+  const worldNodeCount = (overview.value.locations?.length ?? 0)
+    + (overview.value.props?.length ?? 0)
+    + (overview.value.organizations?.length ?? 0);
+
+  return [
+    {
+      id: 'core',
+      label: '写作核心',
+      value: documentFilledStatus('core_seed'),
+      note: '核心种子、题材方向和不可偏离的主线',
+      targetTab: 'documents',
+      documentKey: 'core_seed',
+    },
+    {
+      id: 'characters',
+      label: '人物与关系',
+      value: `${characters.value.length} 人`,
+      note: `维护到 ${documentLabel('character_state')}`,
+      targetTab: 'characters',
+      targetKey: 'characters',
+      documentKey: 'character_state',
+    },
+    {
+      id: 'plot',
+      label: '情节与时间线',
+      value: `${plotNodeCount} 条`,
+      note: `维护到 ${documentLabel('plot_structure')}`,
+      targetTab: 'characters',
+      targetKey: 'timeline',
+      documentKey: 'plot_structure',
+    },
+    {
+      id: 'world',
+      label: '世界设定',
+      value: `${worldNodeCount} 项`,
+      note: `维护到 ${documentLabel('world_building')}`,
+      targetTab: 'entities',
+      targetKey: 'locations',
+      documentKey: 'world_building',
+    },
+    {
+      id: 'chapter-plan',
+      label: '章节蓝图',
+      value: `${writtenChapterCount}/${targetChapterCount || 0} 章`,
+      note: documentFilledStatus('blueprint'),
+      targetTab: 'documents',
+      documentKey: 'blueprint',
+    },
+    {
+      id: 'archive',
+      label: '稳定档案',
+      value: `${obsidian.value?.included_count ?? 0} 份`,
+      note: `${obsidianMaintenanceSummary.value?.needs_action ?? 0} 项待处理`,
+      targetTab: 'archive',
+    },
+  ];
+});
 
 function obsidianChapterScope(item) {
   const start = Number(item?.chapter_start ?? 0);
@@ -180,6 +433,360 @@ function obsidianExternalReferences(item) {
     label: '考据链接',
     values: links.slice(0, 3),
   };
+}
+
+function obsidianMaintenanceStatusLabel(item) {
+  const status = item?.status ?? 'open';
+  if (status === 'draft_missing' || item?.draft_missing) {
+    return '草稿缺失';
+  }
+  if (status === 'published_missing' || item?.published_missing) {
+    return 'Vault 笔记缺失';
+  }
+  if (status === 'published_outdated' || item?.published_outdated) {
+    return 'Vault 笔记待更新';
+  }
+  if (item?.vault_moved) {
+    return 'Vault 笔记已移动';
+  }
+  if (status === 'published') {
+    return '已发布';
+  }
+  if (status === 'ignored') {
+    return '已忽略';
+  }
+  if (status === 'staged' && item?.preserved_existing_draft) {
+    return '保留人工草稿';
+  }
+  if (status === 'staged' && item?.manual_draft_edits) {
+    return '人工改动草稿';
+  }
+  if (status === 'staged' && item?.auto_staged) {
+    return '自动草稿';
+  }
+  if (status === 'staged') {
+    return '已保存草稿';
+  }
+  if (status === 'open') {
+    return '待处理';
+  }
+  return status || '待处理';
+}
+
+function obsidianMaintenanceRank(item) {
+  const priority = { high: 30, medium: 20, low: 10 }[item?.priority] ?? 0;
+  const status = obsidianMaintenanceStatusLabel(item);
+  const statusRank = {
+    草稿缺失: 90,
+    'Vault 笔记缺失': 88,
+    'Vault 笔记待更新': 86,
+    待处理: 80,
+    自动草稿: 70,
+    已保存草稿: 68,
+    人工改动草稿: 66,
+    保留人工草稿: 64,
+    'Vault 笔记已移动': 60,
+    已忽略: 20,
+    已发布: 10,
+  }[status] ?? 40;
+  return statusRank + priority;
+}
+
+function obsidianMaintenanceSourceChapters(item) {
+  const values = Array.isArray(item?.source_chapters) ? item.source_chapters : [];
+  const indexes = [];
+  for (const value of values) {
+    const chapterIndex = Number(value || 0);
+    if (Number.isInteger(chapterIndex) && chapterIndex > 0 && !indexes.includes(chapterIndex)) {
+      indexes.push(chapterIndex);
+    }
+  }
+  return indexes;
+}
+
+function obsidianMaintenanceSourceChapterText(item) {
+  const indexes = obsidianMaintenanceSourceChapters(item);
+  if (!indexes.length) {
+    return '';
+  }
+  return `来源章节：${indexes.map((index) => `第 ${index} 章`).join('、')}`;
+}
+
+function canPublishObsidianMaintenance(item) {
+  if (!item?.draft_path) {
+    return false;
+  }
+  if (item?.merge_draft_path || item?.status === 'published' || item?.status === 'published_outdated') {
+    return false;
+  }
+  return ['自动草稿', '已保存草稿', '人工改动草稿', '保留人工草稿', 'Vault 笔记缺失'].includes(
+    obsidianMaintenanceStatusLabel(item),
+  );
+}
+
+function canConfirmObsidianMaintenanceMerge(item) {
+  return Boolean(item?.merge_draft_path);
+}
+
+function canIgnoreObsidianMaintenance(item) {
+  return !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item));
+}
+
+function canReopenObsidianMaintenance(item) {
+  return obsidianMaintenanceStatusLabel(item) === '已忽略';
+}
+
+function obsidianProjectRelativePath(item) {
+  const relativePath = String(item?.relative_path || '').trim().replaceAll('\\', '/').replace(/^\/+/u, '');
+  if (!relativePath || !canEditObsidianNotes.value) {
+    return '';
+  }
+  return `${obsidianInternalVaultRoot.value}/${relativePath}`.replace(/\/+/gu, '/');
+}
+
+function storyArchiveMaintenanceInfo(kind) {
+  const map = {
+    create_story_character_note: { type: 'character', label: '人物' },
+    create_story_event_note: { type: 'event', label: '事件' },
+    create_story_location_note: { type: 'location', label: '地点' },
+    create_story_prop_note: { type: 'prop', label: '道具' },
+    create_story_skill_note: { type: 'skill', label: '技能' },
+    create_story_scene_note: { type: 'scene', label: '场景' },
+    create_story_organization_note: { type: 'organization', label: '组织' },
+  };
+  return map[kind] ?? { type: 'note', label: '档案' };
+}
+
+function isStoryArchiveMaintenanceSuggestion(item) {
+  const kind = String(item?.kind ?? '');
+  if (!storyArchiveMaintenanceKinds.includes(kind)) {
+    return false;
+  }
+  return !['已发布', '已忽略'].includes(obsidianMaintenanceStatusLabel(item));
+}
+
+function archiveMaintenanceEntityTitle(item) {
+  const rawTitle = String(item?.title ?? '').trim();
+  const separatorIndex = rawTitle.lastIndexOf('：');
+  if (separatorIndex >= 0 && separatorIndex < rawTitle.length - 1) {
+    return rawTitle.slice(separatorIndex + 1).trim();
+  }
+  const pathTitle = String(item?.suggested_path ?? '').split('/').pop()?.replace(/\.md$/iu, '').trim();
+  return pathTitle || rawTitle || '待审档案';
+}
+
+function isMaintenanceSuggestionVisibleForChapter(item, chapterIndex) {
+  const indexes = obsidianMaintenanceSourceChapters(item);
+  if (!chapterIndex || !indexes.length) {
+    return true;
+  }
+  return Math.max(...indexes) <= chapterIndex;
+}
+
+function pendingArchiveGraphRelations(item, entityTitle) {
+  const sourceText = [
+    item?.draft_markdown,
+    item?.reason,
+    item?.action,
+    item?.suggested_path,
+  ].join('\n');
+  const relations = [];
+  for (const name of archiveGraphKnownNames.value) {
+    if (name === entityTitle || relations.includes(name)) {
+      continue;
+    }
+    if (sourceText.includes(name)) {
+      relations.push(name);
+    }
+    if (relations.length >= 8) {
+      break;
+    }
+  }
+  return relations;
+}
+
+function pendingArchiveGraphNote(item) {
+  const info = storyArchiveMaintenanceInfo(String(item?.kind ?? ''));
+  const title = archiveMaintenanceEntityTitle(item);
+  const suggestedPath = String(item?.suggested_path ?? '').trim();
+  const sourceChapters = obsidianMaintenanceSourceChapters(item);
+  return {
+    __pending_maintenance: true,
+    __maintenance_item: item,
+    title,
+    note_type: `pending_${info.type}`,
+    relative_path: suggestedPath || `待审档案/${String(item?.id ?? title)}.md`,
+    tags: ['待审档案', info.label, obsidianMaintenanceStatusLabel(item)],
+    preview: item?.reason || item?.action || '自动生成的待审档案。',
+    summary: item?.action || item?.reason || '',
+    source_chapters: sourceChapters,
+    links: [],
+    backlinks: [],
+    resolved_links: [],
+    unresolved_links: [],
+    ambiguous_links: [],
+    graph_relations: pendingArchiveGraphRelations(item, title),
+  };
+}
+
+function archiveGraphNodeId(item) {
+  if (item?.__pending_maintenance) {
+    return `pending:${item.__maintenance_item?.id ?? item.relative_path ?? item.title}`;
+  }
+  return String(item?.relative_path ?? item?.title ?? '');
+}
+
+function pendingArchiveNodeStatus(node) {
+  if (!node?.pending || !node.maintenance) {
+    return '';
+  }
+  return `待审 · ${obsidianMaintenanceStatusLabel(node.maintenance)}`;
+}
+
+function selectArchiveGraphMode(modeId) {
+  archiveGraphMode.value = modeId;
+  activeArchiveGraphNodePath.value = '';
+}
+
+function isObsidianNoteVisibleForChapter(item, chapterIndex) {
+  if (!chapterIndex) {
+    return true;
+  }
+  const revealAfter = Number(item?.reveal_after_chapter ?? 0);
+  if (revealAfter && chapterIndex <= revealAfter) {
+    return false;
+  }
+  const start = Number(item?.chapter_start ?? 0);
+  if (start && chapterIndex < start) {
+    return false;
+  }
+  const end = Number(item?.chapter_end ?? 0);
+  if (end && chapterIndex > end) {
+    return false;
+  }
+  const sourceChapters = Array.isArray(item?.source_chapters)
+    ? item.source_chapters.map((value) => Number(value || 0)).filter((value) => value > 0)
+    : [];
+  return !sourceChapters.length || Math.max(...sourceChapters) <= chapterIndex;
+}
+
+function obsidianGraphText(item) {
+  return [
+    item?.note_type,
+    item?.relative_path,
+    item?.title,
+    ...(item?.tags ?? []),
+  ].join(' / ').toLowerCase();
+}
+
+function obsidianGraphKind(item) {
+  const text = obsidianGraphText(item);
+  if (text.includes('character') || text.includes('人物')) {
+    return { id: 'character', label: '人物' };
+  }
+  if (text.includes('location') || text.includes('地点')) {
+    return { id: 'location', label: '地点' };
+  }
+  if (text.includes('prop') || text.includes('道具')) {
+    return { id: 'prop', label: '道具' };
+  }
+  if (text.includes('organization') || text.includes('组织')) {
+    return { id: 'organization', label: '组织' };
+  }
+  if (text.includes('event') || text.includes('事件')) {
+    return { id: 'event', label: '事件' };
+  }
+  if (text.includes('skill') || text.includes('技能')) {
+    return { id: 'skill', label: '技能' };
+  }
+  if (text.includes('chapter') || text.includes('章节')) {
+    return { id: 'chapter', label: '章节' };
+  }
+  if (text.includes('plan') || text.includes('scene') || text.includes('计划') || text.includes('场景')) {
+    return { id: 'plan', label: '计划' };
+  }
+  if (text.includes('debt') || text.includes('债务') || text.includes('伏笔')) {
+    return { id: 'debt', label: '债务' };
+  }
+  if (text.includes('style') || text.includes('xp') || text.includes('文风') || text.includes('规则')) {
+    return { id: 'rule', label: '规则' };
+  }
+  return { id: 'note', label: '档案' };
+}
+
+function isCharacterArchiveNote(item) {
+  const text = obsidianGraphText(item);
+  return text.includes('character')
+    || text.includes('人物')
+    || text.includes('characters/')
+    || text.includes('characterarcs/')
+    || (item?.links ?? []).some((value) => characters.value.some((character) => String(value).includes(character.name)))
+    || (item?.backlinks ?? []).some((value) => characters.value.some((character) => String(value).includes(character.name)));
+}
+
+function obsidianNoteIssueCount(item) {
+  if (item?.__pending_maintenance) {
+    return 0;
+  }
+  const unresolved = item?.unresolved_links?.length ?? 0;
+  const ambiguous = item?.ambiguous_links?.length ?? 0;
+  const hasRelations = (item?.links?.length ?? 0)
+    + (item?.backlinks?.length ?? 0)
+    + (item?.graph_relations?.length ?? 0)
+    + (item?.resolved_links?.length ?? 0);
+  return unresolved + ambiguous + (hasRelations ? 0 : 1);
+}
+
+function obsidianNoteIssueText(item) {
+  if (item?.__pending_maintenance) {
+    return '';
+  }
+  const parts = [];
+  if (item?.unresolved_links?.length) {
+    parts.push(`未解析 ${item.unresolved_links.length}`);
+  }
+  if (item?.ambiguous_links?.length) {
+    parts.push(`歧义 ${item.ambiguous_links.length}`);
+  }
+  const hasRelations = (item?.links?.length ?? 0)
+    + (item?.backlinks?.length ?? 0)
+    + (item?.graph_relations?.length ?? 0)
+    + (item?.resolved_links?.length ?? 0);
+  if (!hasRelations) {
+    parts.push('孤立');
+  }
+  return parts.join(' · ');
+}
+
+function sortObsidianGraphNotes(left, right) {
+  const leftScore = obsidianGraphRelationScore(left);
+  const rightScore = obsidianGraphRelationScore(right);
+  return rightScore - leftScore || String(left.title ?? '').localeCompare(String(right.title ?? ''), 'zh-CN');
+}
+
+function obsidianGraphRelationScore(item) {
+  return (item?.graph_relations?.length ?? 0) * 4
+    + (item?.resolved_links?.length ?? 0) * 3
+    + (item?.backlinks?.length ?? 0) * 2
+    + (item?.links?.length ?? 0);
+}
+
+function resolveObsidianGraphTarget(value, titleMap, pathMap) {
+  const raw = String(value ?? '').trim();
+  if (!raw) {
+    return null;
+  }
+  if (pathMap.has(raw)) {
+    return pathMap.get(raw);
+  }
+  const normalized = raw.replace(/\.md$/iu, '').split('/').pop();
+  if (titleMap.has(raw)) {
+    return titleMap.get(raw);
+  }
+  if (titleMap.has(normalized)) {
+    return titleMap.get(normalized);
+  }
+  return [...titleMap.entries()].find(([title]) => raw.includes(title) || title.includes(raw))?.[1] ?? null;
 }
 
 const filledDocumentCount = computed(() => (
@@ -273,9 +880,14 @@ const supportSummaryCards = computed(() => ([
     value: `${materials.value.length} 份`,
   },
   {
-    label: 'Obsidian',
-    compactLabel: 'Obsidian',
+    label: '稳定档案',
+    compactLabel: '档案',
     value: `${obsidian.value?.included_count ?? 0} 份`,
+  },
+  {
+    label: '档案维护',
+    compactLabel: '维护',
+    value: `${obsidianMaintenanceSummary.value?.needs_action ?? 0} 项`,
   },
   {
     label: '项目记忆',
@@ -468,6 +1080,16 @@ watch(
 );
 
 watch(
+  [() => props.open, activeTab, () => props.project?.id],
+  ([open, tab, projectId]) => {
+    if (!open || tab !== 'archive' || !projectId) {
+      return;
+    }
+    void refreshArchiveAutomatically();
+  },
+);
+
+watch(
   documents,
   (nextDocuments) => {
     draftDocuments.value = Object.fromEntries(
@@ -544,6 +1166,158 @@ function formatChapterIndexes(indexes) {
   return indexes.map((item) => `第 ${item} 章`).join(' · ');
 }
 
+function entitySectionLabel(kind) {
+  return {
+    events: '事件',
+    locations: '地点',
+    props: '道具',
+    skills: '技能',
+    scenes: '场景',
+    organizations: '组织/势力',
+  }[kind] || '世界要素';
+}
+
+function entityMaintenanceDocumentKey(kind) {
+  if (kind === 'events' || kind === 'scenes') {
+    return 'plot_structure';
+  }
+  if (kind === 'locations' || kind === 'props' || kind === 'organizations') {
+    return 'world_building';
+  }
+  return 'character_state';
+}
+
+function documentLabel(documentKey) {
+  return documents.value.find((item) => item.key === documentKey)?.label ?? '架构原文';
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function overviewMaintenanceMarker(kind, name) {
+  const normalizedName = encodeURIComponent(String(name || 'unknown'))
+    .replace(/%/gu, '_')
+    .replace(/[^A-Za-z0-9_-]/gu, '_');
+  return `${kind}:${normalizedName}`;
+}
+
+function buildMarkedMaintenanceBlock(markerId, title, body) {
+  const start = `<!-- gaoxia-overview-maintenance:${markerId}:start -->`;
+  const end = `<!-- gaoxia-overview-maintenance:${markerId}:end -->`;
+  return `${start}\n## ${title}\n\n${body.trim()}\n${end}`;
+}
+
+function upsertMarkedMaintenanceBlock(source, markerId, block) {
+  const start = `<!-- gaoxia-overview-maintenance:${markerId}:start -->`;
+  const end = `<!-- gaoxia-overview-maintenance:${markerId}:end -->`;
+  const pattern = new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`, 'u');
+  const current = String(source ?? '').trimEnd();
+  if (pattern.test(current)) {
+    return current.replace(pattern, block);
+  }
+  return current ? `${current}\n\n${block}\n` : `${block}\n`;
+}
+
+function listLines(label, values) {
+  const items = orderedUniqueStrings(values);
+  if (!items.length) {
+    return `- ${label}：暂无`;
+  }
+  return [`- ${label}：`, ...items.map((item) => `  - ${item}`)].join('\n');
+}
+
+function characterMaintenanceBody(character) {
+  const timelineLines = (character.timeline ?? [])
+    .map((entry) => `  - ${formatTimelineLabel(entry)}：${entry.summary || '暂无摘要'}`)
+    .join('\n');
+  return [
+    `- 当前状态：${character.current_state || '暂无'}`,
+    `- 基础设定：${character.profile || '暂无'}`,
+    listLines('关系', character.relationships ?? []),
+    listLines('事件', character.events ?? []),
+    listLines('地点', character.locations ?? []),
+    listLines('道具', character.props ?? []),
+    listLines('技能', character.skills ?? []),
+    listLines('组织/势力', character.organizations ?? []),
+    `- 时间线：\n${timelineLines || '  - 暂无'}`,
+  ].join('\n');
+}
+
+function entityMaintenanceBody(kind, item) {
+  return [
+    `- 类型：${entitySectionLabel(kind)}`,
+    `- 名称：${item.name || '未命名'}`,
+    `- 摘要：${item.summary || '暂无'}`,
+    `- 章节：${formatChapterIndexes(item.chapter_indexes ?? [])}`,
+    listLines('关联人物', item.related_characters ?? []),
+  ].join('\n');
+}
+
+function timelineMaintenanceBody(entry, character) {
+  return [
+    `- 人物：${character?.name || '未指定'}`,
+    `- 章节：${formatTimelineLabel(entry)}`,
+    `- 摘要：${entry.summary || '暂无'}`,
+    listLines('关系', entry.relations ?? []),
+    listLines('事件', entry.events ?? []),
+    listLines('地点', entry.locations ?? []),
+    listLines('道具', entry.props ?? []),
+    listLines('技能', entry.skills ?? []),
+    listLines('组织/势力', entry.organizations ?? []),
+  ].join('\n');
+}
+
+async function openOverviewMaintenanceEditor(documentKey, markerId, title, body) {
+  const block = buildMarkedMaintenanceBlock(markerId, title, body);
+  const nextContent = upsertMarkedMaintenanceBlock(documentDraft(documentKey), markerId, block);
+  setDocumentDraft(documentKey, nextContent);
+  activeTab.value = 'documents';
+  focusedDocumentKey.value = documentKey;
+  saveMessage.value = `已整理到${documentLabel(documentKey)}，修改后保存即可进入后续世界架构。`;
+  await nextTick();
+  const target = overviewPanel.value?.querySelector(`[data-document-key="${documentKey}"]`);
+  target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  target?.querySelector('textarea')?.focus();
+}
+
+async function maintainCharacter(character) {
+  if (!character?.name) {
+    return;
+  }
+  await openOverviewMaintenanceEditor(
+    'character_state',
+    overviewMaintenanceMarker('character', character.name),
+    `世界架构维护：人物：${character.name}`,
+    characterMaintenanceBody(character),
+  );
+}
+
+async function maintainEntity(kind, item) {
+  const source = entityLookupByKind.value[kind]?.[item?.name] ?? item;
+  if (!source?.name) {
+    return;
+  }
+  await openOverviewMaintenanceEditor(
+    entityMaintenanceDocumentKey(kind),
+    overviewMaintenanceMarker(kind, source.name),
+    `世界架构维护：${entitySectionLabel(kind)}：${source.name}`,
+    entityMaintenanceBody(kind, source),
+  );
+}
+
+async function maintainTimelineEntry(entry, character) {
+  if (!entry?.id) {
+    return;
+  }
+  await openOverviewMaintenanceEditor(
+    'plot_structure',
+    overviewMaintenanceMarker('timeline', `${character?.name ?? 'unknown'}-${entry.id}`),
+    `世界架构维护：时间线：${character?.name ?? '人物'} / ${formatTimelineLabel(entry)}`,
+    timelineMaintenanceBody(entry, character),
+  );
+}
+
 function orderedUniqueStrings(items) {
   return [...new Set((items ?? []).filter(Boolean))];
 }
@@ -588,6 +1362,32 @@ async function openSummaryTarget(item) {
   await nextTick();
   const target = overviewPanel.value?.querySelector(`[data-overview-target="${item.targetKey}"]`);
   target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+async function focusDocumentCard(documentKey) {
+  focusedDocumentKey.value = documentKey;
+  await nextTick();
+  const target = overviewPanel.value?.querySelector(`[data-document-key="${documentKey}"]`);
+  target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+async function openMaintenanceArea(item) {
+  activeTab.value = item.targetTab;
+  activeEntitySectionId.value = item.targetTab === 'entities' ? item.targetKey : '';
+  if (item.documentKey) {
+    focusedDocumentKey.value = item.documentKey;
+  }
+  await nextTick();
+
+  if (item.targetTab === 'documents' && item.documentKey) {
+    await focusDocumentCard(item.documentKey);
+    return;
+  }
+
+  if (item.targetKey) {
+    const target = overviewPanel.value?.querySelector(`[data-overview-target="${item.targetKey}"]`);
+    target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
 }
 
 const memoryCategoryOptions = ['硬规则', '偏好', '连续性', '警告', '目标'];
@@ -657,6 +1457,119 @@ async function saveMemoryEntries() {
     memorySaveMessage.value = error instanceof Error ? error.message : '项目记忆保存失败';
   } finally {
     isMemorySaving.value = false;
+  }
+}
+
+async function refreshProjectDetailForArchive() {
+  if (!props.project?.id) {
+    return null;
+  }
+  const detail = await getProjectDetail(props.project.id);
+  emit('project-detail-updated', detail);
+  return detail;
+}
+
+async function refreshArchiveAutomatically() {
+  if (!props.project?.id || archiveSyncing.value) {
+    return;
+  }
+  archiveSyncing.value = true;
+  archiveMessage.value = '稳定档案自动同步中…';
+  try {
+    const response = await syncProjectObsidian(props.project.id);
+    if (response?.data) {
+      emit('project-detail-updated', response.data);
+    } else {
+      await refreshProjectDetailForArchive();
+    }
+    archiveMessage.value = '稳定档案已自动融入当前项目';
+  } catch (error) {
+    archiveMessage.value = error instanceof Error ? error.message : '稳定档案自动同步失败';
+  } finally {
+    archiveSyncing.value = false;
+  }
+}
+
+async function openObsidianNote(item) {
+  if (!props.project?.id) {
+    return;
+  }
+  const relativePath = obsidianProjectRelativePath(item);
+  if (!relativePath) {
+    archiveMessage.value = '当前 Vault 不在项目目录内，暂不能在这里直接编辑文件。';
+    return;
+  }
+  archiveEditorLoading.value = true;
+  archiveMessage.value = '';
+  try {
+    const payload = await getProjectFileContent(props.project.id, relativePath);
+    archiveEditorPath.value = payload.path;
+    archiveEditorContent.value = payload.content ?? '';
+    activeTab.value = 'archive';
+  } catch (error) {
+    archiveMessage.value = error instanceof Error ? error.message : '档案读取失败';
+  } finally {
+    archiveEditorLoading.value = false;
+  }
+}
+
+async function saveArchiveNote() {
+  if (!props.project?.id || !archiveEditorPath.value) {
+    return;
+  }
+  archiveEditorSaving.value = true;
+  archiveMessage.value = '';
+  try {
+    await updateProjectFileContent(props.project.id, archiveEditorPath.value, {
+      content: archiveEditorContent.value,
+    });
+    const response = await syncProjectObsidian(props.project.id);
+    if (response?.data) {
+      emit('project-detail-updated', response.data);
+    } else {
+      await refreshProjectDetailForArchive();
+    }
+    archiveMessage.value = '档案笔记已保存并重新索引';
+  } catch (error) {
+    archiveMessage.value = error instanceof Error ? error.message : '档案笔记保存失败';
+  } finally {
+    archiveEditorSaving.value = false;
+  }
+}
+
+async function runObsidianMaintenanceAction(item, action) {
+  if (!props.project?.id) {
+    return;
+  }
+  const suggestionId = String(item?.id ?? '').trim();
+  if (!suggestionId) {
+    archiveMessage.value = '维护建议缺少 ID';
+    return;
+  }
+  archiveActionId.value = `${action}:${suggestionId}`;
+  archiveMessage.value = '';
+  try {
+    if (action === 'stage') {
+      await stageProjectObsidianMaintenance(props.project.id, suggestionId);
+      archiveMessage.value = '维护草稿已保存';
+    } else if (action === 'publish') {
+      await publishProjectObsidianMaintenance(props.project.id, suggestionId);
+      archiveMessage.value = '维护笔记已发布到 Vault';
+    } else if (action === 'confirm') {
+      await confirmProjectObsidianMaintenanceMerge(props.project.id, suggestionId);
+      archiveMessage.value = 'Vault 合并状态已确认';
+    } else if (action === 'ignore') {
+      await ignoreProjectObsidianMaintenance(props.project.id, suggestionId);
+      archiveMessage.value = '维护建议已忽略';
+    } else if (action === 'reopen') {
+      await reopenProjectObsidianMaintenance(props.project.id, suggestionId);
+      archiveMessage.value = '维护建议已恢复处理';
+    }
+    await refreshProjectDetailForArchive();
+  } catch (error) {
+    archiveMessage.value = error instanceof Error ? error.message : '维护动作失败';
+  } finally {
+    archiveActionId.value = '';
   }
 }
 
@@ -893,6 +1806,26 @@ async function importKnowledge() {
           <strong>{{ item.value }}</strong>
         </button>
       </div>
+
+      <section
+        class="architecture-ledger"
+        data-testid="story-overview-maintenance-ledger"
+        aria-label="长篇写作台账"
+      >
+        <button
+          v-for="item in architectureMaintenanceAreas"
+          :key="item.id"
+          class="architecture-ledger-item"
+          :data-testid="`story-overview-maintenance-area-${item.id}`"
+          type="button"
+          @click="openMaintenanceArea(item)"
+        >
+          <span>{{ item.label }}</span>
+          <strong>{{ item.value }}</strong>
+          <em>{{ item.note }}</em>
+        </button>
+      </section>
+
       <nav class="overview-tabs">
         <button
           :class="['overview-tab', { 'overview-tab-active': activeTab === 'characters' }]"
@@ -914,6 +1847,14 @@ async function importKnowledge() {
           @click="activeTab = 'documents'"
         >
           架构原文
+        </button>
+        <button
+          :class="['overview-tab', { 'overview-tab-active': activeTab === 'archive' }]"
+          data-testid="story-overview-archive-tab"
+          type="button"
+          @click="activeTab = 'archive'"
+        >
+          稳定档案
         </button>
         <button
           :class="['overview-tab', { 'overview-tab-active': activeTab === 'memory' }]"
@@ -993,6 +1934,14 @@ async function importKnowledge() {
                     : `时间线 ${activeCharacter.timeline.length} 条`
                 }}
               </span>
+              <button
+                class="document-save overview-maintenance-button"
+                data-testid="story-overview-maintain-character-button"
+                type="button"
+                @click="maintainCharacter(activeCharacter)"
+              >
+                维护人物
+              </button>
             </div>
             <p class="relationship-copy">
               {{ activeCharacter.current_state || activeCharacter.profile || '还没有单独维护的人物状态，当前先按章节内容推断。' }}
@@ -1092,6 +2041,13 @@ async function importKnowledge() {
                 <div class="relationship-node-head">
                   <strong>{{ item.name }}</strong>
                   <span>{{ formatChapterIndexes(item.chapter_indexes) }}</span>
+                  <button
+                    class="document-save overview-maintenance-button"
+                    type="button"
+                    @click="maintainEntity(section.id, item)"
+                  >
+                    维护
+                  </button>
                 </div>
                 <p>{{ item.summary }}</p>
                 <div
@@ -1145,6 +2101,13 @@ async function importKnowledge() {
                 <div class="timeline-head">
                   <strong>{{ formatTimelineLabel(entry) }}</strong>
                   <span>{{ entry.source_label || '章节正文' }}</span>
+                  <button
+                    class="document-save overview-maintenance-button"
+                    type="button"
+                    @click="maintainTimelineEntry(entry, activeCharacter)"
+                  >
+                    维护时间线
+                  </button>
                 </div>
                 <p>{{ entry.summary || '暂无摘要。' }}</p>
                 <div class="chip-row">
@@ -1220,6 +2183,9 @@ async function importKnowledge() {
             <p class="overview-kicker">{{ section.label }}</p>
             <h4>{{ section.items.length }} 个节点</h4>
           </div>
+          <span class="document-filename">
+            维护写入：{{ documentLabel(entityMaintenanceDocumentKey(section.id)) }}
+          </span>
         </header>
 
         <div
@@ -1230,8 +2196,18 @@ async function importKnowledge() {
             v-for="item in section.items"
             :key="item.name"
             class="entity-card"
+            :data-testid="`story-overview-entity-card-${section.id}`"
           >
-            <strong>{{ item.name }}</strong>
+            <div class="entity-card-head">
+              <strong>{{ item.name }}</strong>
+              <button
+                class="document-save overview-maintenance-button"
+                type="button"
+                @click="maintainEntity(section.id, item)"
+              >
+                维护
+              </button>
+            </div>
             <p>{{ item.summary || '暂无补充说明。' }}</p>
             <div class="chip-row">
               <span
@@ -1258,6 +2234,7 @@ async function importKnowledge() {
     <div
       v-else-if="activeTab === 'documents'"
       class="overview-body overview-body-documents"
+      data-testid="story-overview-documents"
     >
       <p
         v-if="saveMessage"
@@ -1269,7 +2246,9 @@ async function importKnowledge() {
       <article
         v-for="item in documents"
         :key="item.key"
-        class="document-card"
+        :class="['document-card', { 'document-card-focused': focusedDocumentKey === item.key }]"
+        :data-document-key="item.key"
+        :data-testid="`story-overview-document-${item.key}`"
       >
         <div class="document-head">
           <div>
@@ -1296,6 +2275,406 @@ async function importKnowledge() {
           </button>
         </div>
       </article>
+    </div>
+
+    <div
+      v-else-if="activeTab === 'archive'"
+      class="overview-body overview-body-archive"
+      data-testid="story-overview-archive"
+    >
+      <section class="archive-shell">
+        <div class="memory-toolbar">
+          <div>
+            <p class="overview-kicker">长篇稳定档案</p>
+            <h4>Vault 笔记、图谱风险和 AI 维护建议</h4>
+          </div>
+          <div class="memory-actions">
+            <span class="archive-auto-sync" data-testid="story-overview-archive-auto-sync">
+              {{ archiveSyncing ? '正在自动融入' : '自动融入写作上下文' }}
+            </span>
+          </div>
+        </div>
+
+        <p
+          v-if="archiveMessage"
+          class="overview-inline-message"
+          data-testid="story-overview-archive-message"
+        >
+          {{ archiveMessage }}
+        </p>
+
+        <div class="archive-metric-grid">
+          <article class="info-card archive-metric-card">
+            <span class="info-label">已索引笔记</span>
+            <strong>{{ obsidian?.included_count ?? 0 }} 份</strong>
+            <p>{{ obsidian?.vault_path || obsidian?.config?.vault_path || 'Vault' }}</p>
+          </article>
+          <article class="info-card archive-metric-card">
+            <span class="info-label">图谱解析</span>
+            <strong>{{ obsidian?.resolved_link_count ?? 0 }} 条</strong>
+            <p>歧义 {{ obsidian?.ambiguous_link_count ?? 0 }} 条 · 未解析 {{ obsidian?.unresolved_link_count ?? 0 }} 条</p>
+          </article>
+          <article class="info-card archive-metric-card">
+            <span class="info-label">AI 维护</span>
+            <strong>{{ obsidianMaintenanceSummary.needs_action || 0 }} 项</strong>
+            <p>高优先级 {{ obsidianMaintenanceSummary.high_priority || 0 }} 项 · 自动草稿 {{ obsidianMaintenanceSummary.auto_staged || 0 }} 项</p>
+          </article>
+        </div>
+
+        <div
+          v-if="obsidian?.warnings?.length"
+          class="empty-card"
+        >
+          {{ obsidian.warnings.join('；') }}
+        </div>
+
+        <section
+          class="document-card archive-graph"
+          data-testid="story-overview-archive-graph"
+        >
+          <div class="document-head">
+            <div>
+              <p class="overview-kicker">写作图谱</p>
+              <h4>{{ archiveGraphTitle }}</h4>
+            </div>
+            <div class="archive-graph-modes">
+              <button
+                v-for="mode in archiveGraphModes"
+                :key="mode.id"
+                :class="['archive-graph-mode', { 'archive-graph-mode-active': archiveGraphMode === mode.id }]"
+                type="button"
+                @click="selectArchiveGraphMode(mode.id)"
+              >
+                {{ mode.label }}
+              </button>
+            </div>
+          </div>
+
+          <div class="archive-graph-stats">
+            <span>节点 {{ archiveGraphStats.nodes }}</span>
+            <span>关系 {{ archiveGraphStats.relations }}</span>
+            <span>问题 {{ archiveGraphStats.issues }}</span>
+          </div>
+
+          <div
+            v-if="archiveGraphNodes.length"
+            class="archive-graph-body"
+          >
+            <div class="archive-graph-board">
+              <button
+                v-for="node in archiveGraphNodes"
+                :key="node.id"
+                :class="[
+                  'archive-graph-node',
+                  `archive-graph-node-${node.kind.id}`,
+                  { 'archive-graph-node-active': activeArchiveGraphNodeId === node.id },
+                ]"
+                type="button"
+                data-testid="story-overview-archive-graph-node"
+                @click="activeArchiveGraphNodePath = node.id"
+              >
+                <span>{{ node.kind.label }}</span>
+                <strong>{{ node.note.title }}</strong>
+                <small v-if="node.pending">{{ pendingArchiveNodeStatus(node) }}</small>
+                <small v-else-if="node.issueCount">{{ obsidianNoteIssueText(node.note) }}</small>
+              </button>
+            </div>
+
+            <aside class="archive-graph-detail">
+              <div v-if="activeArchiveGraphNode">
+                <div class="knowledge-result-head">
+                  <strong>{{ activeArchiveGraphNode.note.title }}</strong>
+                  <span>{{ activeArchiveGraphNode.pending ? '待审档案' : activeArchiveGraphNode.kind.label }}</span>
+                </div>
+                <p>{{ activeArchiveGraphNode.note.preview || activeArchiveGraphNode.note.summary || '暂无摘要。' }}</p>
+                <p class="entity-meta-line">
+                  {{ activeArchiveGraphNode.pending ? '建议笔记：' : '' }}{{ activeArchiveGraphNode.note.relative_path }}
+                </p>
+                <p
+                  v-if="activeArchiveGraphNode.pending && obsidianMaintenanceSourceChapterText(activeArchiveGraphNode.maintenance)"
+                  class="entity-meta-line"
+                >
+                  {{ obsidianMaintenanceSourceChapterText(activeArchiveGraphNode.maintenance) }}
+                </p>
+                <p
+                  v-if="obsidianChapterScope(activeArchiveGraphNode.note)"
+                  class="entity-meta-line"
+                >
+                  {{ obsidianChapterScope(activeArchiveGraphNode.note) }}
+                </p>
+                <p
+                  v-if="obsidianNoteIssueText(activeArchiveGraphNode.note)"
+                  class="entity-meta-line archive-graph-issue-line"
+                >
+                  {{ obsidianNoteIssueText(activeArchiveGraphNode.note) }}
+                </p>
+
+                <div
+                  v-if="activeArchiveGraphRelations.length"
+                  class="archive-graph-relations"
+                >
+                  <span>关联关系</span>
+                  <p
+                    v-for="edge in activeArchiveGraphRelations"
+                    :key="edge.id"
+                  >
+                    {{ edge.from.note.title }} <b>{{ edge.kind }}</b> {{ edge.to.note.title }}
+                  </p>
+                </div>
+                <div
+                  v-else
+                  class="archive-graph-relations archive-graph-relations-empty"
+                >
+                  这份笔记还没有和当前图谱里的其它节点形成明确关系。
+                </div>
+
+                <div
+                  v-if="archiveGraphMode === 'issues' && obsidian?.issues?.length"
+                  class="archive-graph-relations"
+                >
+                  <span>Vault 图谱提醒</span>
+                  <p
+                    v-for="issue in obsidian.issues.slice(0, 4)"
+                    :key="`${issue.kind}-${issue.title}`"
+                  >
+                    {{ issue.title || issue.kind }}：{{ issue.message || issue.notes?.join('、') }}
+                  </p>
+                </div>
+
+                <div class="archive-actions">
+                  <button
+                    v-if="activeArchiveGraphNode.pending && activeArchiveGraphNode.maintenance?.draft_markdown"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(activeArchiveGraphNode.maintenance, 'stage')"
+                  >
+                    {{ archiveActionId === `stage:${activeArchiveGraphNode.maintenance.id}` ? '保存中…' : '保存草稿' }}
+                  </button>
+                  <button
+                    v-if="activeArchiveGraphNode.pending && canPublishObsidianMaintenance(activeArchiveGraphNode.maintenance)"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(activeArchiveGraphNode.maintenance, 'publish')"
+                  >
+                    {{ archiveActionId === `publish:${activeArchiveGraphNode.maintenance.id}` ? '发布中…' : '发布到 Vault' }}
+                  </button>
+                  <button
+                    v-if="!activeArchiveGraphNode.pending"
+                    class="document-save archive-action-button"
+                    :disabled="archiveEditorLoading || !canEditObsidianNotes"
+                    type="button"
+                    @click="openObsidianNote(activeArchiveGraphNode.note)"
+                  >
+                    打开编辑
+                  </button>
+                </div>
+              </div>
+            </aside>
+          </div>
+
+          <div
+            v-else
+            class="empty-card"
+          >
+            当前视角下没有可展示的稳定档案节点。
+          </div>
+        </section>
+
+        <section
+          class="archive-layout"
+          data-testid="story-overview-obsidian-maintenance"
+        >
+          <article class="document-card archive-panel">
+            <div class="document-head">
+              <div>
+                <p class="overview-kicker">AI 自动维护</p>
+                <h4>待确认 {{ obsidianMaintenanceActionable.length }} 项</h4>
+              </div>
+              <span>{{ obsidianMaintenanceSummary.total || 0 }} 项总计</span>
+            </div>
+
+            <div
+              v-if="obsidianMaintenanceSuggestions.length"
+              class="archive-list"
+            >
+              <article
+                v-for="item in obsidianMaintenanceSuggestions.slice(0, 12)"
+                :key="item.id || item.title"
+                class="archive-item"
+              >
+                <div class="knowledge-result-head">
+                  <strong>{{ item.title || '未命名维护项' }}</strong>
+                  <span>{{ item.priority || 'medium' }} · {{ obsidianMaintenanceStatusLabel(item) }}</span>
+                </div>
+                <p>{{ item.reason || item.action || '等待确认。' }}</p>
+                <p
+                  v-if="item.suggested_path"
+                  class="entity-meta-line"
+                >
+                  建议笔记：{{ item.suggested_path }}
+                </p>
+                <p
+                  v-if="obsidianMaintenanceSourceChapterText(item)"
+                  class="entity-meta-line"
+                >
+                  {{ obsidianMaintenanceSourceChapterText(item) }}
+                </p>
+                <p
+                  v-if="item.draft_path"
+                  class="entity-meta-line"
+                >
+                  草稿文件：{{ item.draft_path }}
+                </p>
+                <p
+                  v-if="item.merge_draft_path"
+                  class="entity-meta-line"
+                >
+                  Vault 合并草稿：{{ item.merge_draft_path }}
+                </p>
+                <p
+                  v-if="item.vault_relative_path"
+                  class="entity-meta-line"
+                >
+                  Vault 笔记：{{ item.vault_relative_path }}
+                </p>
+                <div class="archive-actions">
+                  <button
+                    v-if="item.draft_markdown"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(item, 'stage')"
+                  >
+                    {{ archiveActionId === `stage:${item.id}` ? '保存中…' : '保存草稿' }}
+                  </button>
+                  <button
+                    v-if="canPublishObsidianMaintenance(item)"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(item, 'publish')"
+                  >
+                    {{ archiveActionId === `publish:${item.id}` ? '发布中…' : '发布到 Vault' }}
+                  </button>
+                  <button
+                    v-if="canConfirmObsidianMaintenanceMerge(item)"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(item, 'confirm')"
+                  >
+                    {{ archiveActionId === `confirm:${item.id}` ? '确认中…' : '确认已合并' }}
+                  </button>
+                  <button
+                    v-if="canIgnoreObsidianMaintenance(item)"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(item, 'ignore')"
+                  >
+                    {{ archiveActionId === `ignore:${item.id}` ? '忽略中…' : '忽略' }}
+                  </button>
+                  <button
+                    v-if="canReopenObsidianMaintenance(item)"
+                    class="document-save archive-action-button"
+                    :disabled="Boolean(archiveActionId)"
+                    type="button"
+                    @click="runObsidianMaintenanceAction(item, 'reopen')"
+                  >
+                    {{ archiveActionId === `reopen:${item.id}` ? '恢复中…' : '恢复处理' }}
+                  </button>
+                </div>
+              </article>
+            </div>
+
+            <div
+              v-else
+              class="empty-card"
+            >
+              还没有 AI 维护建议。章节保存、自动续写和核验后，系统会把人物状态、章节档案、剧情债务和文风规则整理到这里。
+            </div>
+          </article>
+
+          <article class="document-card archive-panel">
+            <div class="document-head">
+              <div>
+                <p class="overview-kicker">正式 Vault 笔记</p>
+                <h4>{{ obsidianNotes.length }} 份可用档案</h4>
+              </div>
+              <span>{{ canEditObsidianNotes ? '可在此编辑' : '外部 Vault 只读' }}</span>
+            </div>
+
+            <div
+              v-if="obsidianNotes.length"
+              class="archive-list"
+            >
+              <article
+                v-for="item in obsidianNotes.slice(0, 16)"
+                :key="item.relative_path"
+                class="archive-item"
+              >
+                <div class="knowledge-result-head">
+                  <strong>{{ item.title }}</strong>
+                  <span>{{ item.note_type || item.status || '笔记' }}</span>
+                </div>
+                <p>{{ item.preview || '暂无摘要。' }}</p>
+                <p class="entity-meta-line">{{ item.relative_path }}</p>
+                <p
+                  v-if="obsidianChapterScope(item)"
+                  class="entity-meta-line"
+                >
+                  {{ obsidianChapterScope(item) }}
+                </p>
+                <div class="archive-actions">
+                  <button
+                    class="document-save archive-action-button"
+                    :disabled="archiveEditorLoading || !canEditObsidianNotes"
+                    type="button"
+                    @click="openObsidianNote(item)"
+                  >
+                    {{ archiveEditorLoading && archiveEditorPath.endsWith(item.relative_path) ? '读取中…' : '打开编辑' }}
+                  </button>
+                </div>
+              </article>
+            </div>
+
+            <div
+              v-else
+              class="empty-card"
+            >
+              当前还没有正式档案。可以先让 AI 保存维护草稿，再发布到 Vault。
+            </div>
+          </article>
+
+          <article
+            class="document-card archive-editor-card"
+            data-testid="story-overview-archive-editor"
+          >
+            <div class="document-head">
+              <div>
+                <p class="overview-kicker">档案编辑</p>
+                <h4>{{ archiveEditorPath || '选择一份项目内 Vault 笔记' }}</h4>
+              </div>
+              <button
+                class="document-save"
+                :disabled="archiveEditorSaving || !archiveEditorPath"
+                type="button"
+                @click="saveArchiveNote"
+              >
+                {{ archiveEditorSaving ? '保存中…' : '保存并索引' }}
+              </button>
+            </div>
+            <textarea
+              v-model="archiveEditorContent"
+              class="document-editor archive-editor"
+              :disabled="!archiveEditorPath"
+              placeholder="在左侧选择一份 Vault Markdown 笔记后编辑。"
+            />
+          </article>
+        </section>
+      </section>
     </div>
 
     <div
@@ -1830,7 +3209,7 @@ async function importKnowledge() {
           data-testid="story-overview-obsidian"
         >
           <div class="knowledge-result-head knowledge-library-head">
-            <strong>Obsidian</strong>
+            <strong>长篇稳定档案</strong>
             <span>{{ obsidian.included_count ?? 0 }} 份 · 解析 {{ obsidian.resolved_link_count ?? 0 }} 条 · 歧义 {{ obsidian.ambiguous_link_count ?? 0 }} 条</span>
           </div>
 
@@ -2193,6 +3572,57 @@ async function importKnowledge() {
   white-space: nowrap;
 }
 
+.architecture-ledger {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.architecture-ledger-item {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+  min-height: 88px;
+  padding: 10px 12px;
+  border: 1px solid rgba(214, 221, 231, 0.96);
+  border-radius: 14px;
+  background: #ffffff;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.architecture-ledger-item:hover {
+  border-color: #cfe0fa;
+  background: #f8fbff;
+}
+
+.architecture-ledger-item:focus-visible {
+  outline: 2px solid #456ce9;
+  outline-offset: 2px;
+}
+
+.architecture-ledger-item span {
+  color: #6a7383;
+  font-size: 11px;
+}
+
+.architecture-ledger-item strong {
+  color: #18202d;
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.architecture-ledger-item em {
+  color: #5c6675;
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .summary-card p,
 .info-card p,
 .entity-card p,
@@ -2276,6 +3706,7 @@ async function importKnowledge() {
 .document-head,
 .character-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
@@ -2318,6 +3749,7 @@ async function importKnowledge() {
 .relationship-panel-head,
 .timeline-shell-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
@@ -2410,6 +3842,7 @@ async function importKnowledge() {
 
 .relationship-node-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
@@ -2521,6 +3954,11 @@ async function importKnowledge() {
 }
 
 .entity-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
   padding: 10px 12px;
   border: 1px solid transparent;
   border-radius: 14px;
@@ -2536,6 +3974,27 @@ async function importKnowledge() {
 .document-card,
 .empty-card {
   padding: 16px 18px;
+}
+
+.entity-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.overview-maintenance-button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.document-card-focused {
+  border-color: #bcd2f7;
+  background: #f8fbff;
 }
 
 .overview-body-documents {
@@ -2555,6 +4014,10 @@ async function importKnowledge() {
 }
 
 .overview-body-dream {
+  display: block;
+}
+
+.overview-body-archive {
   display: block;
 }
 
@@ -2666,6 +4129,253 @@ async function importKnowledge() {
   gap: 10px;
 }
 
+.archive-shell {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.archive-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.archive-metric-card {
+  padding: 14px 16px;
+}
+
+.archive-metric-card strong {
+  display: block;
+  margin-top: 8px;
+  color: #18202d;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.archive-graph {
+  display: grid;
+  gap: 14px;
+}
+
+.archive-graph-modes {
+  display: inline-flex;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid rgba(213, 220, 232, 0.9);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.archive-graph-mode {
+  border: none;
+  border-radius: 9px;
+  padding: 7px 10px;
+  background: transparent;
+  color: #5b6575;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.archive-graph-mode-active {
+  background: #1d4ed8;
+  color: #ffffff;
+}
+
+.archive-graph-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.archive-graph-stats span {
+  border: 1px solid rgba(213, 220, 232, 0.9);
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: #5b6575;
+  font-size: 12px;
+}
+
+.archive-graph-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(260px, 0.75fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.archive-graph-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 10px;
+  min-height: 188px;
+}
+
+.archive-graph-node {
+  display: grid;
+  gap: 5px;
+  min-height: 88px;
+  border: 1px solid rgba(213, 220, 232, 0.96);
+  border-left: 4px solid #64748b;
+  border-radius: 12px;
+  padding: 10px;
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  text-align: left;
+}
+
+.archive-graph-node strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.archive-graph-node span,
+.archive-graph-node small {
+  color: #667085;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.archive-graph-node-active {
+  border-color: rgba(29, 78, 216, 0.45);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+}
+
+.archive-graph-node-character {
+  border-left-color: #2563eb;
+}
+
+.archive-graph-node-location {
+  border-left-color: #059669;
+}
+
+.archive-graph-node-prop {
+  border-left-color: #0f766e;
+}
+
+.archive-graph-node-organization {
+  border-left-color: #4338ca;
+}
+
+.archive-graph-node-event {
+  border-left-color: #be123c;
+}
+
+.archive-graph-node-skill {
+  border-left-color: #0284c7;
+}
+
+.archive-graph-node-chapter {
+  border-left-color: #7c3aed;
+}
+
+.archive-graph-node-plan {
+  border-left-color: #d97706;
+}
+
+.archive-graph-node-debt {
+  border-left-color: #dc2626;
+}
+
+.archive-graph-node-rule {
+  border-left-color: #0891b2;
+}
+
+.archive-graph-detail {
+  display: grid;
+  gap: 10px;
+  min-height: 188px;
+  border: 1px solid rgba(213, 220, 232, 0.96);
+  border-radius: 12px;
+  padding: 12px;
+  background: #f8fafc;
+}
+
+.archive-graph-detail p {
+  margin: 0;
+}
+
+.archive-graph-issue-line {
+  color: #b45309;
+}
+
+.archive-graph-relations {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.archive-graph-relations span {
+  color: #4b5563;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.archive-graph-relations p {
+  color: #4b5563;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.archive-graph-relations b {
+  color: #1d4ed8;
+}
+
+.archive-graph-relations-empty {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.archive-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.archive-panel {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+}
+
+.archive-list {
+  display: grid;
+  gap: 10px;
+}
+
+.archive-item {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid rgba(222, 227, 236, 0.98);
+  border-radius: 14px;
+  background: #f9fbfd;
+}
+
+.archive-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.archive-action-button {
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.archive-editor-card {
+  grid-column: 1 / -1;
+}
+
+.archive-editor {
+  min-height: 260px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
 .dream-summary,
 .dream-rationale {
   margin: 0;
@@ -2701,6 +4411,12 @@ async function importKnowledge() {
 
 .memory-actions {
   justify-content: flex-end;
+}
+
+.archive-auto-sync {
+  color: #4b5563;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .memory-meta {
@@ -2887,6 +4603,10 @@ async function importKnowledge() {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
+  .architecture-ledger {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .overview-support-strip,
   .relationship-metrics {
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2900,11 +4620,14 @@ async function importKnowledge() {
   }
 
   .overview-body-characters,
+  .archive-layout,
+  .archive-metric-grid,
   .dream-grid,
   .overview-body-documents,
   .review-dimension-grid,
   .knowledge-grid,
   .entity-grid,
+  .architecture-ledger,
   .overview-summary,
   .overview-summary-core,
   .overview-support-strip,

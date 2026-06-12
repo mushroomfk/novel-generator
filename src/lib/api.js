@@ -631,6 +631,13 @@ export async function streamChapterWorkflow(payload, onEvent) {
   return streamRequest('/api/generate/chapter-workflow/stream', payload, onEvent);
 }
 
+export async function previewChapterWorkflowPrompt(payload) {
+  return request('/api/generate/chapter-workflow/prompt-preview', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function streamBrainstorm(payload, onEvent) {
   return streamRequest('/api/studio/brainstorm/stream', payload, onEvent);
 }
@@ -684,6 +691,13 @@ export async function streamBlueprint(payload, onEvent) {
 
 export async function streamChapterGenerate(payload, onEvent) {
   return streamRequest('/api/studio/chapter-generate/stream', payload, onEvent);
+}
+
+export async function previewChapterGeneratePrompt(payload) {
+  return request('/api/studio/chapter-generate/prompt-preview', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function streamChapterFinalize(payload, onEvent) {

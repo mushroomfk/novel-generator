@@ -29,24 +29,26 @@ Windows Desktop Release
 
 ## 测试包整理
 
-从 GitHub Actions 下载的 Windows 测试产物整理到：
+`0.1.4` Windows 测试产物生成后，整理到：
 
 ```text
-release/test-release/windows/稿匣_0.1.3_测试包/
+release/test-release/windows/稿匣_0.1.4_测试包/
 ```
 
-目录包含：
+目录应包含：
 
-- `稿匣_0.1.3_x64-setup.exe`
+- `稿匣_0.1.4_x64-setup.exe`
 - `novel-backend-x86_64-pc-windows-msvc.exe`
 - `SHA256SUMS.txt`
 - `安装说明-先看这个.md`
 - `测试反馈清单.md`
 - `包信息.txt`
 
-共享给测试用户时优先提供 `稿匣_0.1.3_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
+生成并校验后，共享给测试用户时优先提供 `稿匣_0.1.4_x64-setup.exe` 和安装说明；sidecar 文件保留给排查打包问题，不需要普通用户手动运行。
 
 截至 2026-06-10，`0.1.3` Windows 测试包已由 GitHub Actions `Windows Desktop Release` run `27259635805` 在分支 `codex/full-verification-windows-20260609` 的提交 `943cd574b2ffa7fc9f8e486377f31b6d400c5d14` 构建完成；本地已整理到 `release/test-release/windows/稿匣_0.1.3_测试包/` 并通过 SHA256 校验。Windows 实机安装、卸载和首次启动仍需人工验收。
+
+截至 2026-06-12，`0.1.4` Windows 测试包尚未在本机生成；需要在包含 0.1.4 版本号的提交上触发 `Windows Desktop Release`，或在 Windows 环境执行 `npm run verify:desktop:windows` 后再更新测试包目录和校验信息。
 
 ## 本地 Windows 打包
 

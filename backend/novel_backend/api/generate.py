@@ -5,7 +5,12 @@ from fastapi.responses import StreamingResponse
 
 from novel_backend.api.license_guard import require_valid_license
 from novel_backend.models import ArchitectureRequest, ArchitectureStepRequest, ChapterWorkflowRequest
-from novel_backend.services.generation_service import architecture_step_stream, architecture_stream, chapter_workflow_stream
+from novel_backend.services.generation_service import (
+  architecture_step_stream,
+  architecture_stream,
+  chapter_workflow_prompt_preview,
+  chapter_workflow_stream,
+)
 
 router = APIRouter(prefix="/api/generate", tags=["generate"])
 
@@ -53,3 +58,10 @@ async def stream_chapter_workflow(request: Request, payload: ChapterWorkflowRequ
       "X-Accel-Buffering": "no",
     },
   )
+
+
+@router.post("/chapter-workflow/prompt-preview")
+async def preview_chapter_workflow_prompt(request: Request, payload: ChapterWorkflowRequest):
+  require_valid_license(request)
+  settings = request.app.state.settings
+  return {"ok": True, "data": chapter_workflow_prompt_preview(settings, payload).model_dump(mode="json")}

@@ -211,6 +211,9 @@ export interface StoryOverview {
   documents: StoryDocument[];
   knowledge_hits: KnowledgeSearchResult[];
   materials: KnowledgeMaterial[];
+  obsidian?: Record<string, unknown> | null;
+  obsidian_maintenance_summary: Record<string, unknown>;
+  obsidian_maintenance_suggestions: Record<string, unknown>[];
   memory_entries: ProjectMemoryEntry[];
   dream_report?: ProjectDreamReport | null;
   model_overview: StoryOverviewModelStatus;

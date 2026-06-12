@@ -1206,7 +1206,7 @@ def _obsidian_chapter_handoff_issues(project_detail, chapter, chapter_text: str)
 def _obsidian_dimension(project_detail, chapter, guard_context=None) -> ChapterReviewDimension:
   obsidian = getattr(getattr(project_detail, "story_overview", None), "obsidian", None)
   if obsidian is None or not bool(getattr(obsidian, "enabled", False)):
-    return _dimension("obsidian", "Obsidian 设定", 0, "当前未启用 Obsidian，暂不做设定反查。", status="na")
+    return _dimension("obsidian", "Obsidian 设定", 0, "当前没有可用于核验的长篇稳定档案，暂不做设定反查。", status="na")
   all_notes = list(getattr(obsidian, "notes", []) or [])
   if not all_notes:
     return _dimension("obsidian", "Obsidian 设定", 0, "Obsidian 当前没有可用于核验的正式笔记。", status="na")

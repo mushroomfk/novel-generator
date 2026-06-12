@@ -5,10 +5,12 @@ import json
 import os
 import re
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.exceptions import RequestValidationError
 
+from novel_backend.api import generate, studio
 from novel_backend.app import LOCAL_ORIGIN_PATTERN, create_app
 from novel_backend.config import Settings, reset_settings_cache
 from novel_backend.models import AGENT_MESSAGE_CONTENT_MAX_LENGTH
@@ -76,6 +78,27 @@ class AppValidationErrorTestCase(unittest.TestCase):
     self.assertFalse(payload["ok"])
     self.assertEqual(payload["error"]["code"], "validation_error")
     self.assertIn("messages.0.content", payload["error"]["message"])
+
+
+class AppEnvelopeTestCase(unittest.TestCase):
+  def test_chapter_prompt_preview_routes_use_success_envelope(self) -> None:
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=Settings())))
+    preview = SimpleNamespace(model_dump=lambda mode="json": {"editable_prompt": "提示词"})
+
+    with patch("novel_backend.api.generate.require_valid_license"), patch(
+      "novel_backend.api.generate.chapter_workflow_prompt_preview",
+      return_value=preview,
+    ):
+      workflow_payload = asyncio.run(generate.preview_chapter_workflow_prompt(request, object()))
+
+    with patch("novel_backend.api.studio.require_valid_license"), patch(
+      "novel_backend.api.studio.chapter_generate_prompt_preview",
+      return_value=preview,
+    ):
+      generate_payload = asyncio.run(studio.preview_chapter_generate_prompt(request, object()))
+
+    self.assertEqual(workflow_payload, {"ok": True, "data": {"editable_prompt": "提示词"}})
+    self.assertEqual(generate_payload, {"ok": True, "data": {"editable_prompt": "提示词"}})
 
 
 if __name__ == "__main__":

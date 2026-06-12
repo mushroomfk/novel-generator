@@ -283,6 +283,18 @@ def run_smoke() -> dict[str, object]:
         )["data"]
         require(any(item.get("source") == "章节正文" for item in chapter_hits), "章节保存后知识索引没有刷新")
 
+        api_json(
+          client.put(
+            f"/api/projects/{project_id}/documents",
+            json={
+              "documents": [
+                {"key": "global_summary", "content": "API 冒烟快照前版本标记：盐仓密押违规已完成核验。"},
+              ]
+            },
+          ),
+          "写入快照前版本标记",
+        )
+
         snapshot_detail = api_json(
           client.post(f"/api/projects/{project_id}/snapshots", json={"message": "API 冒烟快照"}),
           "创建快照",

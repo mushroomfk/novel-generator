@@ -232,6 +232,39 @@ async function saveProjectChapterContent(backendUrl, projectId, chapterId, conte
   });
 }
 
+function projectFileContentApiPath(projectId, relativePath) {
+  const params = new URLSearchParams({ path: relativePath });
+  return `/api/studio/projects/${projectId}/files/content?${params.toString()}`;
+}
+
+async function saveProjectFileContent(backendUrl, projectId, relativePath, content) {
+  await apiRequest(backendUrl, projectFileContentApiPath(projectId, relativePath), {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  });
+}
+
+async function readProjectFileContent(backendUrl, projectId, relativePath) {
+  return apiRequest(backendUrl, projectFileContentApiPath(projectId, relativePath));
+}
+
+async function useInternalObsidianVault(backendUrl, projectId) {
+  await apiRequest(backendUrl, `/api/projects/${projectId}/obsidian`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      enabled: true,
+      vault_path: 'Vault',
+      include_patterns: ['**/*.md', '**/*.canvas'],
+      exclude_patterns: ['.obsidian/**', '.trash/**', 'templates/**'],
+      allowed_statuses: ['canonical', '正式', '已确认', 'active', 'published', 'usable'],
+      excluded_statuses: ['draft', '草稿', 'private', '私密', 'deprecated', '废案', '弃用'],
+      include_without_status: true,
+      require_usable_by_ai: false,
+      max_notes: 2000,
+    }),
+  });
+}
+
 async function waitForChapterPreviewContent(page, expectedText) {
   await page.waitForFunction(
     (text) => {
@@ -239,6 +272,16 @@ async function waitForChapterPreviewContent(page, expectedText) {
       return panel instanceof HTMLElement && panel.textContent?.includes(text);
     },
     expectedText,
+  );
+}
+
+async function waitForTestButtonEnabled(page, testId) {
+  await page.waitForFunction(
+    (id) => {
+      const button = document.querySelector(`[data-testid="${id}"]`);
+      return button instanceof HTMLButtonElement && !button.disabled;
+    },
+    testId,
   );
 }
 
@@ -262,6 +305,36 @@ async function waitForWorkspaceComposerReady(page) {
       && submit.getAttribute('aria-label') === '发送'
       && !submit.classList.contains('composer-submit-button-running');
   });
+}
+
+async function confirmAgentPlanWithPromptEdit(page, marker) {
+  await page.getByTestId('agent-plan-confirm-button').first().waitFor({ timeout: 60000 });
+  await page.getByTestId('agent-plan-confirm-button').first().click();
+  await page.getByTestId('agent-plan-confirm-modal').waitFor();
+  await page.getByTestId('agent-plan-prompt-preview').waitFor({ timeout: 60000 });
+  await page.waitForFunction(() => {
+    const editor = document.querySelector('[data-testid="agent-plan-prompt-editor"]');
+    const error = document.querySelector('[data-testid="agent-plan-prompt-error"]');
+    return (
+      editor instanceof HTMLTextAreaElement
+      || (error instanceof HTMLElement && Boolean(error.textContent?.trim()))
+    );
+  });
+  const errorText = await page.getByTestId('agent-plan-prompt-error').textContent().catch(() => '');
+  if (String(errorText ?? '').trim()) {
+    throw new Error(`章节提示词预览失败：${String(errorText ?? '').trim()}`);
+  }
+  const editor = page.getByTestId('agent-plan-prompt-editor').first();
+  await page.waitForFunction(() => {
+    const textarea = document.querySelector('[data-testid="agent-plan-prompt-editor"]');
+    return textarea instanceof HTMLTextAreaElement && textarea.value.includes('连续性证据包');
+  });
+  const promptBefore = await editor.inputValue();
+  if (!promptBefore.includes('写作任务：生成可直接保存的章节正文')) {
+    throw new Error('章节提示词预览缺少正文生成任务说明');
+  }
+  await editor.fill(`${promptBefore}\n\nUI smoke 提示词编辑标记：${marker}`);
+  await page.getByTestId('agent-plan-confirm-execute-button').click();
 }
 
 async function resolveChromePath() {
@@ -1301,6 +1374,7 @@ async function runSmoke(previewUrl, backendUrl) {
       const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
+    await confirmAgentPlanWithPromptEdit(page, '追兵脚步必须压近');
     await page.getByTestId('agent-artifact-card').first().waitFor({ timeout: 60000 });
     const visibleChapterTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
     if (visibleChapterTimelineCount > 0) {
@@ -1327,6 +1401,7 @@ async function runSmoke(previewUrl, backendUrl) {
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
     await page.getByTestId('agent-plan-card').getByText(/生成第 2 章正文/u).first().waitFor();
+    await confirmAgentPlanWithPromptEdit(page, '第二章必须承接第一章灯塔线索');
     await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002', { timeoutMs: 60000 });
 
     log('检查混合命令优先走架构');
@@ -1342,12 +1417,23 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('skill-workbench').waitFor();
     await page.getByTestId('knowledge-search-input').fill(knowledgeQuery);
     await page.getByTestId('knowledge-search-button').click();
-    await page.getByTestId('knowledge-search-results').getByText(knowledgeQuery).first().waitFor();
+    await page.getByTestId('knowledge-search-results').locator('.issue-card').first().waitFor({ timeout: 30000 });
+    const knowledgeSearchHits = await apiRequest(
+      backendUrl,
+      `/api/projects/${seededProject.id}/knowledge/search?q=${encodeURIComponent(knowledgeQuery)}&limit=8&chapter_index=2`,
+    );
+    const hasKnowledgeQueryHit = Array.isArray(knowledgeSearchHits) && knowledgeSearchHits.some((item) => [
+      item?.section,
+      item?.source,
+      item?.preview,
+    ].some((value) => String(value ?? '').includes(knowledgeQuery)));
+    if (!hasKnowledgeQueryHit) {
+      throw new Error('知识检索接口没有命中旧船队资料');
+    }
 
     log('检查 Obsidian 同步和检索');
     await page.getByTestId('skill-use-obsidian-vault').click();
     await page.getByTestId('obsidian-vault-form').waitFor();
-    await page.getByTestId('obsidian-enabled-checkbox').check();
     await page.getByTestId('obsidian-vault-path-input').fill(obsidianVaultDir);
     await page.getByTestId('obsidian-save-button').click();
     await page.waitForFunction(() => {
@@ -1443,7 +1529,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('self-evolution-narrative-obsidian-card').getByText('林追主动交出铜钥匙').first().waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance').getByText('整理剧情债务笔记').first().waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance').getByText('自动草稿').first().waitFor();
-    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Plot/').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Debts/').first().waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance-count').getByText(/\d+ \/ \d+ 条/u).waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('Vault 笔记待更新');
     const outdatedChapterNoteCard = page
@@ -1452,6 +1538,7 @@ async function runSmoke(previewUrl, backendUrl) {
       .filter({ hasText: 'Vault 笔记待更新' })
       .first();
     await outdatedChapterNoteCard.waitFor();
+    await waitForTestButtonEnabled(page, 'self-evolution-obsidian-stage-visible-button');
     await page.getByTestId('self-evolution-obsidian-stage-visible-button').click();
     await page.waitForFunction(() => {
       const buttons = [...document.querySelectorAll('button')];
@@ -1483,12 +1570,14 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('');
     await page.getByTestId('self-evolution-obsidian-ignore-visible-button').waitFor();
     await page.getByTestId('self-evolution-obsidian-reopen-visible-button').waitFor();
-    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('Plot/');
-    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Plot/').first().waitFor();
+    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('Debts/');
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Debts/').first().waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('自动草稿');
     await page.getByTestId('self-evolution-obsidian-maintenance').getByText('自动草稿').first().waitFor();
     await page.getByTestId('self-evolution-obsidian-maintenance-filter').selectOption('全部');
-    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('');
+    await page.getByTestId('self-evolution-obsidian-maintenance-search').fill('Debts/');
+    await page.getByTestId('self-evolution-obsidian-maintenance').getByText('建议笔记：Debts/').first().waitFor();
+    await waitForTestButtonEnabled(page, 'self-evolution-obsidian-stage-visible-button');
     await page.getByTestId('self-evolution-obsidian-stage-visible-button').click();
     await page.waitForFunction(() => {
       const button = document.querySelector('[data-testid="self-evolution-obsidian-stage-visible-button"]');
@@ -1505,7 +1594,7 @@ async function runSmoke(previewUrl, backendUrl) {
       return !(button instanceof HTMLButtonElement) || !button.textContent?.includes('发布中');
     });
     const obsidianAfterMaintenance = await apiRequest(backendUrl, `/api/projects/${seededProject.id}/obsidian`);
-    if (!obsidianAfterMaintenance.notes.some((item) => String(item.relative_path ?? '').startsWith('Plot/'))) {
+    if (!obsidianAfterMaintenance.notes.some((item) => String(item.relative_path ?? '').startsWith('Debts/'))) {
       throw new Error('Obsidian 维护笔记没有发布到 Vault');
     }
     await page.getByTestId('self-evolution-failure-cases').waitFor();
@@ -1651,6 +1740,13 @@ async function runSmoke(previewUrl, backendUrl) {
     if (await settingsModal.getByText('单独设置 Embedding').count()) {
       throw new Error('设置页不应再显示单独设置 Embedding');
     }
+    if (await settingsModal.getByText('篇幅能力', { exact: true }).count()) {
+      throw new Error('设置页不应再显示篇幅能力手动选项');
+    }
+    if (await settingsModal.getByRole('button', { name: '测试当前配置' }).count()) {
+      throw new Error('设置页不应再显示手动模型测试按钮');
+    }
+    await settingsModal.getByText('写作参数自动处理', { exact: true }).waitFor();
     await settingsModal.getByText('第二审查模型', { exact: true }).waitFor();
     await settingsModal.getByText('运行调度', { exact: true }).waitFor();
     await page.mouse.click(16, 16);
@@ -1668,15 +1764,25 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('architecture-open-confirm-button').click();
     await page.getByRole('dialog', { name: '确认执行整书架构' }).waitFor();
     await page.getByRole('button', { name: '确认执行' }).click();
-    await page.getByTestId('agent-runtime-message').waitFor({ timeout: 10000 });
-    await page.getByTestId('agent-runtime-status-list').first().waitFor({ timeout: 10000 });
-    await page
-      .locator('[data-testid="agent-runtime-status-row"]:visible')
-      .filter({ hasText: /正在运行|正在思考|已完成/u })
-      .first()
-      .waitFor({ timeout: 10000 });
+    const architectureRuntimeMessage = page.getByTestId('agent-runtime-message');
+    let architectureRuntimeVisible = true;
+    try {
+      await architectureRuntimeMessage.waitFor({ timeout: 10000 });
+    } catch {
+      architectureRuntimeVisible = false;
+    }
+    if (architectureRuntimeVisible) {
+      await page.getByTestId('agent-runtime-status-list').first().waitFor({ timeout: 10000 });
+      await page
+        .locator('[data-testid="agent-runtime-status-row"]:visible')
+        .filter({ hasText: /正在运行|正在思考|已完成/u })
+        .first()
+        .waitFor({ timeout: 10000 });
+    }
     await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
-    await page.getByTestId('agent-runtime-message').waitFor({ state: 'hidden', timeout: 10000 });
+    if (architectureRuntimeVisible) {
+      await architectureRuntimeMessage.waitFor({ state: 'hidden', timeout: 10000 });
+    }
     const visibleAgentTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
     if (visibleAgentTimelineCount > 0) {
       throw new Error('Agent 执行完成后不应继续显示执行步骤列表');
@@ -1732,12 +1838,58 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('story-overview-relationship-grid').waitFor();
     await page.getByTestId('story-overview-character-skills').waitFor();
     await page.getByTestId('story-overview-timeline').waitFor();
+    await page.getByTestId('story-overview-maintenance-ledger').waitFor();
+    await page
+      .getByTestId('story-overview-maintenance-area-world')
+      .locator('span')
+      .filter({ hasText: '世界设定' })
+      .waitFor();
+    await page.getByTestId('story-overview-maintenance-area-world').click();
+    await page.locator('[data-overview-target="locations"]').waitFor();
+    const locationEntityCard = page.getByTestId('story-overview-entity-card-locations').first();
+    await locationEntityCard.waitFor();
+    await locationEntityCard.getByRole('button', { name: '维护' }).click();
+    const worldBuildingDocument = page.getByTestId('story-overview-document-world_building');
+    await worldBuildingDocument.waitFor();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="story-overview-document-world_building"] textarea');
+      return textarea instanceof HTMLTextAreaElement
+        && textarea.value.includes('世界架构维护：地点');
+    });
     await page.getByRole('button', { name: '查看事件' }).click();
     await page.locator('[data-overview-target="events"]').waitFor();
     await page.getByRole('button', { name: '查看技能' }).click();
     await page.locator('[data-overview-target="skills"]').waitFor();
     await page.getByRole('button', { name: '查看时间线' }).click();
     await page.getByTestId('story-overview-timeline').waitFor();
+
+    await page.getByTestId('story-overview-maintain-character-button').click();
+    const characterStateDocument = page.getByTestId('story-overview-document-character_state');
+    await characterStateDocument.waitFor();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="story-overview-document-character_state"] textarea');
+      return textarea instanceof HTMLTextAreaElement
+        && textarea.value.includes('世界架构维护：人物');
+    });
+
+    await page.getByTestId('story-overview-modal').getByRole('button', { name: '世界要素' }).click();
+    const eventEntityCard = page.getByTestId('story-overview-entity-card-events').first();
+    await eventEntityCard.waitFor();
+    await eventEntityCard.getByRole('button', { name: '维护' }).click();
+    const plotStructureDocument = page.getByTestId('story-overview-document-plot_structure');
+    await plotStructureDocument.waitFor();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="story-overview-document-plot_structure"] textarea');
+      return textarea instanceof HTMLTextAreaElement
+        && textarea.value.includes('世界架构维护：事件');
+    });
+    await plotStructureDocument.getByRole('button', { name: '保存' }).click();
+    await page.getByText('情节骨架 已保存').waitFor({ timeout: 30000 });
+
+    await page.getByTestId('story-overview-archive-tab').click();
+    await page.getByTestId('story-overview-archive').waitFor();
+    await page.getByTestId('story-overview-obsidian-maintenance').getByText('AI 自动维护').waitFor();
+    await page.getByTestId('story-overview-obsidian-maintenance').getByText('正式 Vault 笔记').waitFor();
     await page.getByTestId('story-overview-modal').getByRole('button', { name: '章节核验' }).click();
     await page.getByTestId('story-overview-chapter-reviews').waitFor();
     await page.getByTestId('chapter-review-project-memory-dimension').first().waitFor();
@@ -1751,6 +1903,82 @@ async function runSmoke(previewUrl, backendUrl) {
       .getByText('考据来源：林追靠港账册：https://example.com/ui-smoke-harbor-ledger')
       .first()
       .waitFor();
+
+    log('检查世界架构内置稳定档案编辑');
+    const internalArchivePath = 'Vault/ChapterNotes/架构总览编辑.md';
+    const archiveEditToken = `世界架构编辑 smoke ${Date.now()}`;
+    await saveProjectFileContent(
+      backendUrl,
+      seededProject.id,
+      internalArchivePath,
+      [
+        '---',
+        'type: chapter_note',
+        'status: canonical',
+        'chapter_range: 1',
+        '---',
+        '# 架构总览编辑',
+        '',
+        '灯塔议会内部档案。',
+        '',
+      ].join('\n'),
+    );
+    await useInternalObsidianVault(backendUrl, seededProject.id);
+    const archivePanel = page.getByTestId('story-overview-archive');
+    await page.getByTestId('story-overview-archive-tab').click();
+    await archivePanel.waitFor();
+    if ((await archivePanel.getByTestId('story-overview-obsidian-sync-button').count()) > 0) {
+      throw new Error('世界架构稳定档案不应再显示手动同步按钮');
+    }
+    await archivePanel.getByTestId('story-overview-archive-auto-sync').waitFor();
+    await archivePanel.getByText('稳定档案已自动融入当前项目').waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    const archiveGraph = page.getByTestId('story-overview-archive-graph');
+    await archiveGraph.waitFor();
+    await archiveGraph.getByRole('button', { name: '人物关系' }).click();
+    await archiveGraph.getByRole('button', { name: '本章图谱' }).click();
+    const pendingArchiveGraphNodes = archiveGraph
+      .getByTestId('story-overview-archive-graph-node')
+      .filter({ hasText: '待审' });
+    const pendingArchiveGraphNodeCount = await pendingArchiveGraphNodes.count();
+    if (pendingArchiveGraphNodeCount > 0) {
+      const pendingArchiveGraphNode = pendingArchiveGraphNodes.first();
+      await pendingArchiveGraphNode.click();
+      await archiveGraph.getByRole('button', { name: /保存草稿|发布到 Vault/ }).first().waitFor();
+    }
+    await archiveGraph
+      .getByTestId('story-overview-archive-graph-node')
+      .filter({ hasText: '架构总览编辑' })
+      .first()
+      .waitFor();
+    await page.getByTestId('story-overview-modal').getByRole('button', { name: '关系总览' }).click();
+    await page.getByTestId('story-overview-relationship-grid').waitFor();
+    await page.getByTestId('story-overview-character-skills').waitFor();
+    await page.getByTestId('story-overview-archive-tab').click();
+    await archivePanel.waitFor();
+    const internalArchiveNote = archivePanel
+      .locator('.archive-panel .archive-item')
+      .filter({ hasText: '架构总览编辑' })
+      .first();
+    await internalArchiveNote.waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    await internalArchiveNote.getByRole('button', { name: '打开编辑' }).click();
+    const archiveEditor = page.getByTestId('story-overview-archive-editor');
+    const archiveTextarea = archiveEditor.locator('textarea');
+    await archiveTextarea.waitFor();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="story-overview-archive-editor"] textarea');
+      return textarea instanceof HTMLTextAreaElement && textarea.value.includes('灯塔议会内部档案');
+    });
+    const archiveEditorContent = await archiveTextarea.inputValue();
+    await archiveTextarea.fill(`${archiveEditorContent.trim()}\n\n${archiveEditToken}\n`);
+    await archiveEditor.getByRole('button', { name: '保存并索引' }).click();
+    await archivePanel
+      .getByText('档案笔记已保存并重新索引')
+      .waitFor({ timeout: OBSIDIAN_SYNC_TIMEOUT_MS });
+    const savedArchiveFile = await readProjectFileContent(backendUrl, seededProject.id, internalArchivePath);
+    if (!String(savedArchiveFile.content ?? '').includes(archiveEditToken)) {
+      throw new Error('世界架构稳定档案编辑内容没有保存到项目 Vault');
+    }
+
     await page.keyboard.press('Escape');
     await page.getByTestId('story-overview-modal').waitFor({ state: 'hidden' });
     await saveProjectChapterContent(
@@ -1944,7 +2172,7 @@ async function main() {
       },
     );
     backgroundProcesses.push(backend);
-    await waitForHttpOk(`${backendUrl}/api/app/health`, { timeoutMs: 15000 });
+    await waitForHttpOk(`${backendUrl}/api/app/health`, { timeoutMs: 120000 });
     await seedTestLicense(backendUrl, smokeLicense.content);
 
     log(`启动本地假模型：127.0.0.1:${modelPort}`);

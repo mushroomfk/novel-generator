@@ -4,6 +4,76 @@
 
 历史上已经做完、但没有单独留日期的内容，不补编日期，先按“基线能力”归档；后续新改动按日期继续追加。
 
+## 2026-06-12
+
+### 0.1.4 测试包准备与稳定档案同步修正
+
+- 修改摘要：版本号提升到 `0.1.4`，同步 `package.json`、`package-lock.json`、Tauri 配置、Cargo 配置、README 状态说明、Windows 打包说明和 macOS 测试版安装说明；修正架构总览“稳定档案”页签的自动刷新行为，进入页签时改为调用 Obsidian 同步接口并用返回的项目详情刷新界面，避免项目内 `Vault/` Markdown 直接改动后只显示旧索引；基于当前工作区生成 macOS arm64 测试包。
+- 影响范围：桌面测试包版本、macOS 测试说明、Windows 打包说明、架构总览稳定档案页签、项目内 Vault 自动同步和当前分支打包流程；不改变模型配置结构、项目数据格式、许可证格式、外部 Vault 保护策略或运行时 API。
+- 验证结果：`git diff --check` 通过；`.venv/bin/python -m py_compile` 相关后端文件和验证脚本通过；`node --check scripts/verify-ui-smoke.mjs` 通过；后端重点单测通过，包含 `backend.tests.test_generation_service`、`backend.tests.test_studio_service`、`backend.tests.test_project_service`、`backend.tests.test_project_narrative_state_service`、`backend.tests.test_context_builder` 和 `backend.tests.test_app`；`npm run verify` 通过，包含打包静态检查、前端静态回归、API 冒烟、445 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖 Agent 章节提示词预览与编辑、章节生成写回、Obsidian 同步、自学习面板、架构总览稳定档案页签、项目内 Vault Markdown 编辑、人物复刻和项目迁移包；`npm run verify:local-smoke` 通过，本地 Embedding、旧稿接管、接续上下文、知识检索、章节写入后索引和本地章节核验均完成；`npm run verify:model-preflight` 通过，当前写作模型和第二审查模型的模型名、接口域名、API Key 存在性和 DNS 解析检查通过；`npm run release:test:macos` 通过，包含桌面发布静态检查、445 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、本地 Embedding 检查、Tauri release `.app` / `.dmg` 构建、签名修复、开发机路径扫描、应用内 sidecar 健康检查和 `.app` 启动检查；已整理 `release/test-release/macos/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.4_aarch64.dmg: OK`，`hdiutil verify` 通过，DMG SHA256 为 `b7566992d47d77b696dbfd6c8e0ace689405e0d6db98e942c7f62cbb2fcfa966`。未执行真实模型长篇生成验证；`0.1.4` Windows x64 测试包尚未生成或实机验收。
+
+### 章节提示词确认与编辑
+
+- 修改摘要：章节生成前新增可编辑提示词确认，覆盖 Agent 章节计划、技能库单章生成、`chapter_workflow/draft` 和小批量生成；新增章节提示词预览接口；确认后的文本通过 `prompt_override` / `prompt_overrides` 进入正文生成；Agent 章节生成不再自动执行，必须先确认提示词；编辑提示词生成后仍会执行连续性证据、承接冲突检查、三类审校和必要修订；UI smoke 的后端健康等待时间调整为 120 秒，适配本机后端冷启动较慢的情况。
+- 影响范围：`ChapterGenerateRequest`、`ChapterWorkflowRequest`、`AgentPlanAction`、`BatchGenerateRequest`、章节提示词预览 API、generation / studio / agent services、Agent 计划确认弹窗、技能库生成弹窗、前端 API、UI smoke、相关后端测试、README、Agent 指令和 docs；不改变作品目录结构、章节保存路径、知识库表结构或真实模型配置。
+- 验证结果：`python3 -m py_compile` 相关后端文件通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`.venv/bin/python -m unittest backend.tests.test_studio_service backend.tests.test_generation_service -v` 通过，41 个用例通过；`.venv/bin/python -m unittest backend.tests.test_app.AppEnvelopeTestCase.test_chapter_prompt_preview_routes_use_success_envelope -v` 通过；`npm run verify:ui` 通过，覆盖 Agent 章节生成前提示词预览、编辑和确认执行；`npm run verify` 通过，包含 API smoke、445 个后端 unittest 和前端生产构建。未执行真实模型长篇生成验证或桌面包验证。
+
+### 长篇稳定性风险修复
+
+- 修改摘要：修复章节保存后稳定档案维护日志里未定义章节变量的问题；普通项目详情读取不再触发叙事状态刷新和 Vault 写入，只有章节保存、Obsidian 同步、章节上下文生成、自学习或稳定档案维护刷新会执行写入类维护；章节上下文预算会随写作模型配置容量在保守上限内扩大，超预算时按信息块分配容量并优先保留项目记忆、章节合同、叙事状态、人物弧线、剧情债务和本章约束，避免整段处理导致关键信息丢失；知识检索结果按来源混合，避免自动生成的 Obsidian 笔记占满结果导致章节正文命中消失；自学习面板“保存当前结果草稿”只统计当前筛选结果里可保存的维护项，按钮会等待可操作后再执行 UI smoke。
+- 影响范围：项目详情 API、章节保存后的稳定档案维护、章节上下文构建、知识检索排序、自学习 Obsidian 维护批量操作、UI smoke、README、Agent 指令、核心引擎说明、Agent 执行架构说明和技能流程回归清单；不改变作品目录结构、`knowledge.db` 表结构、外部 Vault 保护策略或真实模型调用参数。
+- 验证结果：相关 backend 定向 unittest 通过；`npm run build` 通过；`npm run verify:ui` 通过；`npm run verify` 通过，包含 API 冒烟、441 个后端 unittest 和前端生产构建；`npm run verify:local-smoke` 通过，本地 Embedding、旧稿接管、接续章上下文、章节写入后知识索引和本地章节核验均完成；`npm run verify:model-preflight` 通过，当前保存的写作模型和第二审查模型配置、API Key 存在性和 DNS 解析检查通过；`npm run verify:desktop` 通过，生成并验证 `/Users/liuqingxing/Desktop/小说生成器/src-tauri/target/release/bundle/macos/稿匣.app`、`/Users/liuqingxing/Desktop/小说生成器/src-tauri/target/release/bundle/dmg/稿匣_0.1.3_aarch64.dmg` 和包内 sidecar。未执行真实模型长篇生成验证。
+
+## 2026-06-11
+
+### 模型篇幅和配置检测自动化
+
+- 修改摘要：模型设置页不再显示“篇幅能力”下拉和“测试当前配置”手动按钮；保存写作设置时系统使用推荐输出容量，并自动检测写作模型、内置知识检索模型和已启用的第二审查模型。检测失败会在设置页提示失败项，不再要求作者单独点测试。
+- 影响范围：模型设置页、配置保存载荷、模型配置检测交互、UI smoke、README、Agent 指令和 docs；后端仍保留 `max_tokens` 和 `POST /api/config/test` 兼容旧配置、脚本和直接 API 调用。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run verify:frontend-static` 通过；`npm run build` 通过，前端生产构建通过；内置浏览器打开 `http://localhost:1421/` 检查设置弹窗，确认不再显示“篇幅能力”“测试当前配置”“知识检索模型”或“单独设置 Embedding”，仍显示保存按钮、写作参数自动处理说明、第二审查模型和运行调度；`npm run verify:ui` 通过，覆盖设置页无手动篇幅选项、无手动测试按钮和回归脚本同步。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 章节完成后稳定档案自动发布
+
+- 修改摘要：章节正文保存完成后，项目内 `Vault/` 会自动发布系统生成、未被人工改动且无缺失 / 合并风险的中高优先级稳定档案，覆盖章节档案、剧情债务、人物状态、图谱整理和其它可安全写入的系统维护项；自动发布后的系统笔记如果后续正文或来源变化，且 Vault 内容仍保持系统生成版本，会自动更新到新版。项目目录外的独立 Obsidian Vault、人工改动草稿、合并项、缺失项和低优先级规则仍需要作者在架构总览“稳定档案”页签或自学习面板手动发布 / 确认，避免越过作品目录改外部库。
+- 影响范围：章节保存后的叙事状态维护、Obsidian 维护建议发布链路、项目内 `Vault/`、`.gaoxia/obsidian_drafts/`、架构总览稳定档案页签、自学习面板维护队列、Agent 资料分析计数、后端默认技能目录、章节核验提示文案、API 冒烟快照脚本、README、Agent 指令和 docs；不改变外部 Vault 保护策略，不覆盖作者手工改过的 Vault 正文。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/services/project_narrative_state_service.py backend/novel_backend/services/project_service.py backend/tests/test_project_narrative_state_service.py backend/tests/test_project_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_project_narrative_state_service -v` 通过，60 个用例通过；`.venv/bin/python -m unittest backend.tests.test_project_service -v` 通过，82 个用例通过；`npm run verify` 通过，包含打包静态检查、前端静态检查、API 冒烟、437 个后端 unittest 和前端生产构建；`git diff --check` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 稳定档案从架构总览自动发布
+
+- 修改摘要：新建作品的项目内 `Vault/` 目录扩展为 `Characters`、`Events`、`Locations`、`Props`、`Skills`、`Scenes`、`Organizations`、`Plans`、`ChapterNotes`、`Debts`、`CharacterArcs`、`Style`、`XP` 和 `Graph`；读取项目详情时，当前有效的模型版架构总览会把未入 Vault 的人物、事件、地点、道具、技能、场景和组织自动整理并发布为项目内 Vault 正式档案。发布后会刷新 Obsidian 摘要、知识索引和模型总览来源签名，避免系统派生档案让总览立刻变成过期；模型总览过期时只展示旧结构，不写入草稿或 Vault。已存在同名或带相同 `source_ids` 的 Vault 笔记时，不再重复生成建议。仍需人工确认的待审架构档案才进入“稳定档案”写作图谱，并在目标章节可见时作为低优先级提醒进入章节上下文。
+- 影响范围：新建项目默认 Vault 目录、项目详情读取、Obsidian 维护建议、`.gaoxia/learning/narrative_state.json`、`.gaoxia/obsidian_drafts/`、项目内 `Vault/`、架构总览写作图谱、章节上下文待审提醒、迁移包项目内 Vault 测试、README、Agent 指令和 docs；不把过期模型总览写入稳定档案，不把外部 Vault 当作自动写入目标。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/services/project_narrative_state_service.py backend/novel_backend/services/project_service.py backend/tests/test_project_narrative_state_service.py backend/tests/test_project_service.py` 通过；`.venv/bin/python -m unittest backend.tests.test_project_narrative_state_service -v` 通过，60 个用例通过；`.venv/bin/python -m unittest backend.tests.test_project_service -v` 通过，82 个用例通过；`npm run verify` 通过，包含打包静态检查、前端静态检查、API 冒烟、437 个后端 unittest 和前端生产构建；`git diff --check` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 稳定档案自动融入写作流程
+
+- 修改摘要：架构总览“稳定档案”页签移除“同步档案”按钮，改为进入页签时自动读取项目详情，由后端按 Vault 文件变化刷新档案摘要；项目内 `Vault/` Markdown 保存后仍会自动重新索引。页签只显示自动融入状态，并新增桌面写作图谱，支持本章图谱、人物关系和图谱问题视角，节点详情可查看关联、章节范围和问题。普通作者不需要判断什么时候同步。
+- 影响范围：架构总览稳定档案页签、桌面写作图谱、UI smoke、README、Agent 指令和 docs；不改变后端 Obsidian 解析规则、维护建议发布规则、章节生成上下文过滤规则或 `POST /api/projects/{project_id}/obsidian/sync` 兼容接口。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run build` 通过；`npm run verify:ui` 通过，覆盖架构总览“稳定档案”页签无手动同步按钮、自动刷新、写作图谱展示、本章图谱 / 人物关系切换、稳定档案节点展示、自动刷新后关系总览保持可见、项目内 Vault Markdown 编辑保存；`git diff --check` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 稳定档案同步不清空架构总览
+
+- 修改摘要：修复稳定档案刷新后，过期的模型版故事总览被普通项目详情当作空结果返回，导致关系总览、人物、事件和世界要素在界面上变空的问题。档案刷新现在只更新 Vault 摘要和知识索引；模型总览来源签名过期时，项目详情仍返回上次结构化总览用于展示，并在状态里标记过期或失败。前端收到同步后的空结构化结果时，也会保留当前可见的人物、事件、地点、道具、技能、场景和组织/势力。
+- 影响范围：架构总览、稳定档案同步、StoryOverview 模型缓存读取、UI smoke、README、Agent 指令和 docs；不改变章节生成、改稿、诊断上下文对模型总览缓存的禁用规则，不会把过期模型总览用于写作上下文。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_displays_stale_model_cache_without_model_request backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_without_model_cache_keeps_entities_empty backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_uses_validated_model_cache_for_all_sections -v` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run build` 通过；`npm run verify:ui` 通过，覆盖架构总览和稳定档案同步后关系总览仍可见；`git diff --check` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 世界架构结构化内容可维护
+
+- 修改摘要：架构总览的关系总览、时间线和世界要素新增维护入口，并增加长篇写作台账；人物、时间线、事件、地点、道具、技能、组织/势力可以整理成 Markdown 维护块，进入“架构原文”页签后由作者修改并保存。人物和技能写回 `character_state.txt`，时间线、事件和场景写回 `plot_structure.txt`，地点、道具和组织/势力写回 `world_building.txt`，不直接改 `.gaoxia/story_overview_model.json`。
+- 影响范围：架构总览交互、世界架构查看台账、故事文档草稿、UI smoke、README、Agent 指令和 docs；不改变 StoryOverview 缓存生成规则、后端文档保存接口或真实模型调用方式。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run build` 通过；`npm run verify:ui` 第一次失败，原因是 smoke 先保存人物状态后模型总览来源变更，事件卡片不再保证立即可见，调整顺序后通过；新增长篇写作台账和地点维护到世界设定草稿后，`npm run verify:ui` 又出现两次测试定位失败，原因分别是“世界设定”和“稳定档案”文字匹配到台账与页签两处，改成精确选择器后重跑通过；`git diff --check` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 架构总览集成长篇稳定档案
+
+- 修改摘要：`StoryOverview` 返回 Obsidian 维护摘要和建议；架构总览新增“稳定档案”页签，展示 Vault 状态、图谱解析、AI 维护建议和正式笔记，支持保存草稿、发布到 Vault、确认合并、忽略 / 恢复建议，并可直接编辑项目内 `Vault/` Markdown 后重新同步。
+- 影响范围：StoryOverview API、架构总览、长篇稳定档案维护流程、UI smoke、README、Agent 指令和 docs；不改变 Obsidian Markdown / Canvas 解析规则、章节生成提示规则、迁移包外部 Vault 保护或真实模型调用方式。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_story_overview_includes_obsidian_maintenance_state backend.tests.test_project_service.ProjectServiceTestCase.test_create_project_initializes_longform_archive backend.tests.test_project_service.ProjectServiceTestCase.test_obsidian_default_save_creates_vault_for_existing_project -v` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`git diff --check` 通过；`npm run build` 通过；`npm run verify:api-smoke` 通过；`npm run verify:local-smoke` 通过；`npm run verify:ui` 第一次失败，原因是新增的稳定档案编辑断言用标题文本匹配到了标题、正文预览和路径三处，触发 Playwright strict mode，改为等待具体正式笔记卡后重跑通过，第二次已覆盖项目内 `Vault/` Markdown 在架构总览“稳定档案”页签打开、保存、重新索引和接口回读。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
+### 长篇稳定档案默认初始化
+
+- 修改摘要：新建作品会自动创建项目内 `Vault/`，包含 `Characters`、`Locations`、`Plans`、`ChapterNotes`、`Debts`、`CharacterArcs`、`Style`、`XP` 和 `Graph` 等目录，并写入默认 Obsidian 同步配置；技能库入口从 `Obsidian 知识库` 调整为 `长篇稳定档案`，取消启用开关，普通作者只看到 `Vault 文件夹` 和索引状态，路径 / 状态 / AI 可见性过滤保留在高级同步规则里。
+- 影响范围：新作品初始化、旧稿接管创建项目后的默认档案、技能库 Obsidian 面板、UI smoke 操作脚本、README、核心引擎说明、Agent 执行架构说明、记忆系统说明、技能流程回归清单、界面回归说明、测试反馈清单和项目 Agent 指令；不改变 Obsidian Markdown / Canvas 解析规则、Vault 发布策略、外部 Vault 迁移保护或章节生成提示规则。
+- 验证结果：`.venv/bin/python -m unittest backend.tests.test_project_service.ProjectServiceTestCase.test_create_project_initializes_longform_archive backend.tests.test_project_service.ProjectServiceTestCase.test_obsidian_default_save_creates_vault_for_existing_project backend.tests.test_project_service.ProjectServiceTestCase.test_obsidian_config_response_includes_self_evolution_state backend.tests.test_project_service.ProjectServiceTestCase.test_obsidian_sync_response_includes_self_evolution_state -v` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`node --check src/lib/skillCatalog.js` 通过；`npm run verify:api-smoke` 通过；`npm run verify:local-smoke` 通过；`npm run build` 通过；`npm run verify:ui` 通过。未执行 `npm run verify:desktop` 或真实模型长篇验证。
+
 ## 基线能力（日期未补录）
 
 这部分能力在建立本记录前已经存在：
@@ -274,7 +344,7 @@
 - 影响范围：模型设置页、配置保存载荷、模型请求传输层、第二审查模型调用、侧栏作品入口按钮、README、项目 Agent 指令、界面回归说明、测试反馈清单和桌面版方案文档；不改变模型服务商、接口地址、API Key 环境变量、Embedding 配置字段、章节生成流程或作品数据格式。
 - 验证结果：`.venv/bin/python -m unittest backend.tests.test_model_transport_service backend.tests.test_config_service -v` 通过，15 个用例通过；`npm run verify` 通过，399 个后端 unittest 通过，前端生产构建通过；`npm run build` 通过；本地浏览器打开 `http://localhost:1421/` 检查模型设置弹窗，确认不再显示温度相关文字；本地浏览器检查作品列表入口按钮，确认三个按钮同为 92px 宽、32px 高，文字完整显示。
 
-### 最近改动审查修复
+### 代码改动审查修复
 
 - 修改摘要：审查本地分支提交 `0dfe133ea8b755346d222c8a69373ebdcd21ba15` 和全部未提交改动后，修正三处边界问题。旧稿导入弹窗允许 30 MiB 文件，后端 `content_base64` 校验上限现在按 30 MiB 转 base64 后的 41943040 字符计算，避免前端允许但接口拒绝；Agent workflow 子任务文件名除了替换 `:` 等非法字符，也会避开 `CON / PRN / AUX / NUL / COM1-9 / LPT1-9` 这类 Windows 保留名；macOS 测试包签名修复脚本会在 `.app` 签名后单独重签应用内 `novel-backend` sidecar，避免桌面发布回归在应用内 sidecar 健康检查阶段被系统直接终止。
 - 影响范围：`ExistingNovelImportRequest` 的旧稿文件 base64 长度校验、Agent workflow 子任务状态文件名、macOS 测试包签名修复脚本、对应 backend 和桌面发布回归；不改变旧稿正文拆章、项目章节写入、workflow 状态结构、前端文件大小限制、模型配置或 Tauri 打包参数。
@@ -578,9 +648,9 @@
 - 影响范围：自学习项目 API 响应、前端 API 解包、技能库 `Agent 自学习` 面板的候选 / 草案 / 回归 / 模型审查 / 排程动作状态同步、README、项目 Agent 指令、技能流程回归清单和界面回归说明；不改变 Vault 写入规则或 `knowledge.db` 表结构。
 - 验证结果：`python3 -m py_compile backend/novel_backend/api/projects.py backend/tests/test_self_evolution_service.py` 通过；`PYTHONPATH=backend pytest backend/tests/test_self_evolution_service.py -k "self_evolution_project_api_reads_updates_and_curates" -q` 通过，1 passed, 13 deselected；`node node_modules/vue-tsc/bin/vue-tsc.js --noEmit` 通过；`git diff --check` 通过；`npm run verify` 通过，354 个后端 unittest 通过，前端生产构建通过；`npm run verify:ui` 未能启动，当前沙箱拒绝监听 `127.0.0.1`，报错为 `listen EPERM: operation not permitted 127.0.0.1`。
 
-### Obsidian 配置、同步和维护动作同步作品详情
+### Obsidian 配置、同步接口和维护动作同步作品详情
 
-- 修改摘要：自学习面板保存 Obsidian 配置或手动同步 Vault 后，接口会随作品详情在 `meta.self_evolution` 返回最新自学习状态；新增 Vault 笔记触发的图谱风险、维护摘要和章节任务卡会立即更新。保存草稿、批量保存、发布到 Vault、批量发布、确认 Vault 合并、批量确认、忽略和恢复 Obsidian 维护建议后，维护接口也会返回最新自学习状态；前端优先用响应里的状态更新维护摘要和章节任务卡，并重新读取作品详情；发布和确认合并仍会刷新 Obsidian 同步状态。维护动作已成功但自学习状态或作品详情刷新失败时，界面会保留成功提示并附带失败原因。
+- 修改摘要：自学习面板保存 Obsidian 配置、调用 Obsidian 同步接口或触发自动刷新后，接口会随作品详情在 `meta.self_evolution` 返回最新自学习状态；新增 Vault 笔记触发的图谱风险、维护摘要和章节任务卡会立即更新。保存草稿、批量保存、发布到 Vault、批量发布、确认 Vault 合并、批量确认、忽略和恢复 Obsidian 维护建议后，维护接口也会返回最新自学习状态；前端优先用响应里的状态更新维护摘要和章节任务卡，并重新读取作品详情；发布和确认合并仍会刷新 Obsidian 同步状态。维护动作已成功但自学习状态或作品详情刷新失败时，界面会保留成功提示并附带失败原因。
 - 影响范围：Obsidian 配置保存接口响应、Obsidian 同步接口响应、Obsidian 维护接口响应、前端 API 解包、技能库 `Agent 自学习` 面板的 Obsidian 配置保存、同步和维护动作状态同步、父级作品详情刷新、README、项目 Agent 指令、技能流程回归清单和界面回归说明；不改变 Vault 写入规则或 `knowledge.db` 表结构。
 - 验证结果：`python3 -m py_compile backend/novel_backend/api/projects.py backend/tests/test_project_service.py` 通过；`PYTHONPATH=backend pytest backend/tests/test_project_service.py -k "obsidian_config_response_includes_self_evolution_state or obsidian_sync_response_includes_self_evolution_state or project_action_response_includes_self_evolution_state or chapter_mutation_response_includes_self_evolution_state" -q` 通过，4 passed, 51 deselected；`node node_modules/vue-tsc/bin/vue-tsc.js --noEmit` 通过；`git diff --check` 通过；`npm run verify` 通过，354 个后端 unittest 通过，前端生产构建通过；`npm run verify:ui` 未能启动，当前沙箱拒绝监听 `127.0.0.1`，报错为 `listen EPERM: operation not permitted 127.0.0.1`。
 

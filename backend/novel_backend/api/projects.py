@@ -206,7 +206,13 @@ def get_project(
   if review_characters:
     require_valid_license(request)
   settings = request.app.state.settings
-  payload = get_project_detail(settings, project_id, review_characters=review_characters).model_dump(mode="json")
+  payload = get_project_detail(
+    settings,
+    project_id,
+    review_characters=review_characters,
+    refresh_narrative_state=review_characters,
+    auto_publish_obsidian_maintenance=review_characters,
+  ).model_dump(mode="json")
   return {"ok": True, "data": payload}
 
 

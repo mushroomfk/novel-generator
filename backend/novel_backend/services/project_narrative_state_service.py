@@ -54,6 +54,15 @@ _MAX_OBSIDIAN_GRAPH_MAINTENANCE_SUGGESTIONS = 4
 _MAX_OBSIDIAN_CHAPTER_NOTE_SUGGESTIONS = 80
 _MAX_OBSIDIAN_AUTO_STAGED_DRAFTS = 12
 _OBSIDIAN_AUTO_STAGE_PRIORITIES = {"high", "medium"}
+_STORY_ARCHIVE_MAINTENANCE_LABELS = {
+  "create_story_character_note": "人物档案",
+  "create_story_event_note": "事件档案",
+  "create_story_location_note": "地点档案",
+  "create_story_prop_note": "道具档案",
+  "create_story_skill_note": "技能档案",
+  "create_story_scene_note": "场景档案",
+  "create_story_organization_note": "组织档案",
+}
 _DRAFT_TAG_LABELS = ("tags", "tag", "标签")
 _DRAFT_SOURCE_CHAPTER_LABELS = ("source_chapters", "source_chapter", "source chapters", "source chapter", "来源章节")
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？!?；;]\s*")
@@ -996,6 +1005,7 @@ def _attach_maintenance_action_status(
       suggestion["staged_at"] = str(action.get("created_at") or "")
       suggestion["published_at"] = str(action.get("published_at") or "")
       suggestion["auto_staged"] = bool(action.get("auto_staged"))
+      suggestion["auto_published"] = bool(action.get("auto_published"))
       suggestion["relative_path"] = str(action.get("relative_path") or "")
       suggestion["status_inherited_from_path"] = inherited_from_path
       suggestion["draft_missing"] = draft_missing
@@ -1009,25 +1019,26 @@ def _attach_maintenance_action_status(
         else bool(action.get("preserved_existing_draft")) or _action_draft_has_manual_edits(project_dir, action)
       )
     else:
-      suggestion["status"] = "open"
-      suggestion["draft_path"] = ""
-      suggestion["merge_draft_path"] = ""
-      suggestion["merge_draft_relative_path"] = ""
-      suggestion["vault_path"] = ""
-      suggestion["vault_relative_path"] = ""
-      suggestion["vault_moved"] = False
-      suggestion["moved_from_vault_relative_path"] = ""
-      suggestion["staged_at"] = ""
-      suggestion["published_at"] = ""
-      suggestion["auto_staged"] = False
-      suggestion["relative_path"] = ""
-      suggestion["status_inherited_from_path"] = False
-      suggestion["draft_missing"] = False
-      suggestion["published_missing"] = False
-      suggestion["published_outdated"] = False
-      suggestion["merge_draft_manual_edits"] = False
-      suggestion["preserved_existing_draft"] = False
-      suggestion["manual_draft_edits"] = False
+      suggestion["status"] = str(suggestion.get("status") or "open")
+      suggestion["draft_path"] = str(suggestion.get("draft_path") or "")
+      suggestion["merge_draft_path"] = str(suggestion.get("merge_draft_path") or "")
+      suggestion["merge_draft_relative_path"] = str(suggestion.get("merge_draft_relative_path") or "")
+      suggestion["vault_path"] = str(suggestion.get("vault_path") or "")
+      suggestion["vault_relative_path"] = str(suggestion.get("vault_relative_path") or "")
+      suggestion["vault_moved"] = bool(suggestion.get("vault_moved"))
+      suggestion["moved_from_vault_relative_path"] = str(suggestion.get("moved_from_vault_relative_path") or "")
+      suggestion["staged_at"] = str(suggestion.get("staged_at") or "")
+      suggestion["published_at"] = str(suggestion.get("published_at") or "")
+      suggestion["auto_staged"] = bool(suggestion.get("auto_staged"))
+      suggestion["auto_published"] = bool(suggestion.get("auto_published"))
+      suggestion["relative_path"] = str(suggestion.get("relative_path") or "")
+      suggestion["status_inherited_from_path"] = bool(suggestion.get("status_inherited_from_path"))
+      suggestion["draft_missing"] = bool(suggestion.get("draft_missing") or suggestion.get("status") == "draft_missing")
+      suggestion["published_missing"] = bool(suggestion.get("published_missing") or suggestion.get("status") == "published_missing")
+      suggestion["published_outdated"] = bool(suggestion.get("published_outdated") or suggestion.get("status") == "published_outdated")
+      suggestion["merge_draft_manual_edits"] = bool(suggestion.get("merge_draft_manual_edits"))
+      suggestion["preserved_existing_draft"] = bool(suggestion.get("preserved_existing_draft"))
+      suggestion["manual_draft_edits"] = bool(suggestion.get("manual_draft_edits"))
     hydrated.append(suggestion)
   return hydrated
 
@@ -2376,6 +2387,262 @@ def _chapter_contract_maintenance_suggestions(project_detail: object, state: dic
   return suggestions
 
 
+def _story_overview_entity_source_id(kind: str, name: str) -> str:
+  digest = hashlib.sha1(f"{kind}:{name}".encode("utf-8")).hexdigest()[:12]
+  return f"story-overview-{kind}-{digest}"
+
+
+def _story_overview_entity_specs() -> tuple[dict[str, str], ...]:
+  return (
+    {
+      "field": "characters",
+      "kind": "character",
+      "note_kind": "create_story_character_note",
+      "folder": "Characters",
+      "type": "character",
+      "label": "人物",
+      "priority": "medium",
+    },
+    {
+      "field": "events",
+      "kind": "event",
+      "note_kind": "create_story_event_note",
+      "folder": "Events",
+      "type": "event",
+      "label": "事件",
+      "priority": "medium",
+    },
+    {
+      "field": "locations",
+      "kind": "location",
+      "note_kind": "create_story_location_note",
+      "folder": "Locations",
+      "type": "location",
+      "label": "地点",
+      "priority": "medium",
+    },
+    {
+      "field": "props",
+      "kind": "prop",
+      "note_kind": "create_story_prop_note",
+      "folder": "Props",
+      "type": "prop",
+      "label": "道具",
+      "priority": "medium",
+    },
+    {
+      "field": "skills",
+      "kind": "skill",
+      "note_kind": "create_story_skill_note",
+      "folder": "Skills",
+      "type": "skill",
+      "label": "技能",
+      "priority": "medium",
+    },
+    {
+      "field": "scenes",
+      "kind": "scene",
+      "note_kind": "create_story_scene_note",
+      "folder": "Scenes",
+      "type": "scene",
+      "label": "场景",
+      "priority": "medium",
+    },
+    {
+      "field": "organizations",
+      "kind": "organization",
+      "note_kind": "create_story_organization_note",
+      "folder": "Organizations",
+      "type": "organization",
+      "label": "组织",
+      "priority": "medium",
+    },
+  )
+
+
+def _story_overview_entity_name(item: object) -> str:
+  return _compact_text(getattr(item, "name", ""), 80)
+
+
+def _story_overview_entity_summary(item: object) -> str:
+  for candidate in (
+    getattr(item, "summary", ""),
+    getattr(item, "profile", ""),
+    getattr(item, "current_state", ""),
+  ):
+    summary = _compact_text(candidate, 260)
+    if summary:
+      return summary
+  return ""
+
+
+def _story_overview_entity_chapters(item: object) -> list[int]:
+  chapters: list[int] = []
+  for raw in getattr(item, "chapter_indexes", []) or []:
+    try:
+      chapter_index = int(raw or 0)
+    except (TypeError, ValueError):
+      chapter_index = 0
+    if chapter_index > 0 and chapter_index not in chapters:
+      chapters.append(chapter_index)
+  for entry in getattr(item, "timeline", []) or []:
+    try:
+      chapter_index = int(getattr(entry, "chapter_index", 0) or 0)
+    except (TypeError, ValueError):
+      chapter_index = 0
+    if chapter_index > 0 and chapter_index not in chapters:
+      chapters.append(chapter_index)
+  return sorted(chapters)
+
+
+def _story_overview_entity_has_obsidian_note(
+  name: str,
+  notes: list[object],
+  *,
+  source_id: str,
+  vault_source_ids: set[str],
+) -> bool:
+  if source_id and source_id in vault_source_ids:
+    return True
+  normalized = str(name or "").strip()
+  if not normalized:
+    return False
+  for note in notes:
+    if normalized in _obsidian_note_title_labels(note):
+      return True
+  return False
+
+
+def _story_overview_character_timeline_lines(item: object) -> list[str]:
+  lines: list[str] = []
+  for entry in getattr(item, "timeline", []) or []:
+    summary = _compact_text(getattr(entry, "summary", ""), 160)
+    source = _compact_text(getattr(entry, "source_label", ""), 80)
+    try:
+      chapter_index = int(getattr(entry, "chapter_index", 0) or 0)
+    except (TypeError, ValueError):
+      chapter_index = 0
+    label = f"第 {chapter_index} 章" if chapter_index > 0 else source
+    detail = "：".join(part for part in [label, summary] if part)
+    if detail:
+      lines.append(f"- {detail}")
+    if len(lines) >= 8:
+      break
+  return lines
+
+
+def _story_overview_entity_markdown(spec: dict[str, str], item: object, source_id: str) -> str:
+  name = _story_overview_entity_name(item)
+  label = spec["label"]
+  summary = _story_overview_entity_summary(item)
+  source_chapters = _story_overview_entity_chapters(item)
+  related_characters = _string_list(getattr(item, "related_characters", []), limit=10)
+  frontmatter = [
+    "---",
+    f"type: {spec['type']}",
+    "status: canonical",
+    "usable_by_ai: true",
+    *_frontmatter_quoted_line("summary", summary or name, limit=240),
+    "tags:",
+    f"  - {label}",
+    "  - 架构总览",
+    "  - 自动维护",
+    *_frontmatter_list_lines("source_ids", [source_id], limit=1),
+    *_frontmatter_int_list_lines("source_chapters", source_chapters, limit=8),
+    *_source_chapter_reveal_line(source_chapters),
+  ]
+  if related_characters:
+    frontmatter.extend(_frontmatter_quoted_list_lines("related_characters", related_characters, limit=10, item_limit=80))
+  if spec["kind"] == "character":
+    frontmatter.extend(_frontmatter_quoted_line("character", name, limit=80))
+    frontmatter.extend(_frontmatter_quoted_line("current_state", getattr(item, "current_state", ""), limit=220))
+    frontmatter.extend(_frontmatter_quoted_list_lines("related_locations", getattr(item, "locations", []), limit=8, item_limit=80))
+    frontmatter.extend(_frontmatter_quoted_list_lines("related_props", getattr(item, "props", []), limit=8, item_limit=80))
+    frontmatter.extend(_frontmatter_quoted_list_lines("related_organizations", getattr(item, "organizations", []), limit=8, item_limit=80))
+  frontmatter.append("---")
+
+  lines = [
+    *frontmatter,
+    f"# {name}",
+    "",
+    f"来源：架构总览自动识别的{label}档案。",
+  ]
+  if source_chapters:
+    lines.append(f"关联章节：第 {'、'.join(str(item) for item in source_chapters[:8])} 章")
+  if summary:
+    lines.extend(["", "## 摘要", summary])
+
+  if spec["kind"] == "character":
+    sections = [
+      ("人物简介", [getattr(item, "profile", "")]),
+      ("当前状态", [getattr(item, "current_state", "")]),
+      ("人物关系", getattr(item, "relationships", [])),
+      ("关联事件", getattr(item, "events", [])),
+      ("关联地点", getattr(item, "locations", [])),
+      ("关联道具", getattr(item, "props", [])),
+      ("关联技能", getattr(item, "skills", [])),
+      ("关联场景", getattr(item, "scenes", [])),
+      ("关联组织", getattr(item, "organizations", [])),
+    ]
+    for title, values in sections:
+      items = _string_list(values, limit=10)
+      if not items:
+        continue
+      lines.extend(["", f"## {title}", *[f"- {value}" for value in items]])
+    timeline_lines = _story_overview_character_timeline_lines(item)
+    if timeline_lines:
+      lines.extend(["", "## 时间线", *timeline_lines])
+  elif related_characters:
+    character_links = _obsidian_link_list(related_characters, limit=10)
+    lines.extend(["", "## 相关人物", *[f"- {value}" for value in character_links]])
+
+  return "\n".join(lines).strip()
+
+
+def _story_overview_entity_maintenance_suggestions(
+  project_detail: object,
+  notes: list[object],
+  vault_source_ids: set[str],
+) -> list[dict[str, object]]:
+  overview = getattr(project_detail, "story_overview", None)
+  if overview is None:
+    return []
+  if str(getattr(getattr(overview, "model_overview", None), "status", "") or "") != "ready":
+    return []
+  suggestions: list[dict[str, object]] = []
+  for spec in _story_overview_entity_specs():
+    for item in getattr(overview, spec["field"], []) or []:
+      name = _story_overview_entity_name(item)
+      if not name:
+        continue
+      source_id = _story_overview_entity_source_id(spec["kind"], name)
+      if _story_overview_entity_has_obsidian_note(
+        name,
+        notes,
+        source_id=source_id,
+        vault_source_ids=vault_source_ids,
+      ):
+        continue
+      source_chapters = _story_overview_entity_chapters(item)
+      suggestions.append(
+        {
+          "id": f"obsidian-maintenance-{source_id}",
+          "kind": spec["note_kind"],
+          "priority": spec["priority"],
+          "title": f"整理{spec['label']}档案：{name}",
+          "reason": f"架构总览已经识别出这个{spec['label']}，但项目内 Vault 还没有匹配的稳定档案。",
+          "action": "建议整理成 Vault 待审档案，发布后给后续章节生成、改稿、核验和写作图谱使用。",
+          "source_ids": [source_id],
+          "source_chapters": source_chapters,
+          "suggested_path": f"{spec['folder']}/{_safe_obsidian_filename(name, spec['label'])}.md",
+          "draft_markdown": _story_overview_entity_markdown(spec, item, source_id),
+        }
+      )
+      if len(suggestions) >= 80:
+        return suggestions
+  return suggestions
+
+
 def _obsidian_maintenance_suggestions(
   project_detail: object,
   state: dict[str, object],
@@ -2399,6 +2666,9 @@ def _obsidian_maintenance_suggestions(
     suggestions.append(item)
 
   for suggestion in _graph_issue_maintenance_suggestions(project_detail):
+    add_suggestion(suggestion)
+
+  for suggestion in _story_overview_entity_maintenance_suggestions(project_detail, notes, vault_source_ids):
     add_suggestion(suggestion)
 
   for suggestion in _chapter_note_maintenance_suggestions(project_detail, notes, state, project_dir):
@@ -2455,7 +2725,7 @@ def _obsidian_maintenance_suggestions(
     if _debt_has_obsidian_note_match(debt, notes, vault_source_ids=vault_source_ids):
       continue
     filename = _safe_obsidian_filename(title, "剧情债务")
-    suggested_path = f"Plot/{filename}.md"
+    suggested_path = f"Debts/{filename}.md"
     add_suggestion(
       {
         "id": f"obsidian-maintenance-debt-{debt_id}",
@@ -2514,6 +2784,14 @@ def _obsidian_maintenance_suggestions(
         "draft_markdown": _character_maintenance_draft(arc),
       }
     )
+
+  for existing in state.get("obsidian_maintenance_suggestions", []) if isinstance(state.get("obsidian_maintenance_suggestions"), list) else []:
+    if not isinstance(existing, dict):
+      continue
+    kind = str(existing.get("kind") or "")
+    if kind not in {"repair_graph_link", "create_graph_note"}:
+      continue
+    add_suggestion(existing)
 
   suggestions.sort(
     key=lambda item: (
@@ -3268,6 +3546,58 @@ def _remove_generated_obsidian_draft(
   return True
 
 
+def _auto_update_published_obsidian_maintenance_note_action(
+  project_dir: Path,
+  state: dict[str, object],
+  suggestion: dict[str, object],
+  suggestion_id: str,
+  now: str,
+) -> dict[str, object] | None:
+  latest_action = _latest_obsidian_maintenance_action_for_suggestion(state, suggestion)
+  if not latest_action or str(latest_action.get("status") or "") != "published":
+    return None
+  if not bool(latest_action.get("auto_published")):
+    return None
+  draft_markdown = str(suggestion.get("draft_markdown") or "").strip()
+  if not draft_markdown:
+    return None
+  if not _published_obsidian_note_outdated(project_dir, latest_action, draft_markdown):
+    return None
+  note_path = _published_obsidian_note_path(project_dir, latest_action)
+  relative_path = _published_obsidian_note_relative_path(latest_action)
+  if note_path is None or relative_path is None:
+    return None
+  published_text = _ensure_obsidian_maintenance_identity_markdown(
+    draft_markdown,
+    str(suggestion.get("id") or suggestion_id),
+    str(suggestion.get("kind") or ""),
+  ).rstrip() + "\n"
+  atomic_write_text(note_path, published_text)
+  published_hash = _text_content_hash(published_text)
+  return {
+    "id": f"obsidian-maintenance-action-{hashlib.sha1(f'{suggestion_id}:auto-updated:{now}'.encode('utf-8')).hexdigest()[:12]}",
+    "suggestion_id": str(suggestion.get("id") or suggestion_id),
+    "gaoxia_maintenance_id": _obsidian_maintenance_identity_from_markdown(published_text) or str(suggestion.get("id") or suggestion_id),
+    "gaoxia_maintenance_kind": _obsidian_maintenance_kind_from_markdown(published_text) or str(suggestion.get("kind") or ""),
+    "status": "published",
+    "created_at": now,
+    "published_at": now,
+    "title": str(suggestion.get("title") or ""),
+    "draft_path": str(latest_action.get("draft_path") or ""),
+    "relative_path": relative_path.as_posix(),
+    "vault_path": str(note_path),
+    "vault_relative_path": relative_path.as_posix(),
+    "draft_content_hash": published_hash,
+    "published_content_hash": published_hash,
+    "previous_published_content_hash": str(latest_action.get("published_content_hash") or latest_action.get("draft_content_hash") or ""),
+    "published_from_manual_edits": False,
+    "auto_published": True,
+    "auto_updated": True,
+    "source_ids": _string_list(suggestion.get("source_ids"), limit=12),
+    "source_chapters": _obsidian_maintenance_source_chapter_indexes(suggestion),
+  }
+
+
 def _auto_stage_obsidian_maintenance_drafts(
   project_dir: Path,
   project_detail: object,
@@ -3285,6 +3615,22 @@ def _auto_stage_obsidian_maintenance_drafts(
     if not suggestion_id:
       continue
     status = str(suggestion.get("status") or "open")
+    if (
+      status == "published_outdated"
+      and str(suggestion.get("priority") or "low") in _OBSIDIAN_AUTO_STAGE_PRIORITIES
+    ):
+      action = _auto_update_published_obsidian_maintenance_note_action(
+        project_dir,
+        state,
+        suggestion,
+        suggestion_id,
+        now,
+      )
+      if action is not None:
+        actions.append(action)
+        state["obsidian_maintenance_actions"] = actions[-_MAX_OBSIDIAN_MAINTENANCE_ACTIONS:]
+        staged_count += 1
+      continue
     inherited_staged_draft = status == "staged" and bool(suggestion.get("status_inherited_from_path"))
     refresh_auto_staged_draft = (
       status == "staged"
@@ -3945,24 +4291,48 @@ def reopen_project_obsidian_maintenance_suggestions(
   }
 
 
-def publish_project_obsidian_maintenance_suggestion(
-  project_dir: Path,
-  project_detail: object,
-  suggestion_id: str,
-) -> dict[str, object]:
-  state = refresh_project_narrative_state_chapter_cards(project_dir, project_detail, persist=True)
-  suggestion = _find_obsidian_maintenance_suggestion(project_detail, state, suggestion_id, project_dir)
-  if suggestion is None:
-    raise FileNotFoundError("Obsidian 维护建议不存在")
+def _project_obsidian_publish_vault_dir(project_dir: Path) -> Path:
+  config = load_obsidian_config(project_dir)
+  if not config.enabled:
+    raise ValueError("Obsidian 未启用，不能发布维护笔记")
+  vault_dir = resolve_obsidian_vault_dir(project_dir, config)
+  if vault_dir is None:
+    raise ValueError("Obsidian Vault 路径为空")
+  if not vault_dir.exists() or not vault_dir.is_dir():
+    raise ValueError(f"Obsidian Vault 不存在：{vault_dir}")
+  return vault_dir
 
+
+def _publish_obsidian_maintenance_draft_action(
+  project_dir: Path,
+  vault_dir: Path,
+  state: dict[str, object],
+  suggestion: dict[str, object],
+  suggestion_id: str,
+  now: str,
+  *,
+  auto_published: bool = False,
+) -> tuple[dict[str, object], dict[str, object]]:
   latest_action = _latest_obsidian_maintenance_action_for_suggestion(state, suggestion)
+  latest_status = str((latest_action or {}).get("status") or "")
   staged_path = _safe_staged_obsidian_draft_path(project_dir, latest_action)
-  if staged_path is not None:
+  draft_from_suggestion = str(suggestion.get("draft_markdown") or "").strip()
+  use_staged_path = (
+    latest_status != "published"
+    and staged_path is not None
+    and (
+      not draft_from_suggestion
+      or bool((latest_action or {}).get("preserved_existing_draft"))
+      or _action_draft_has_manual_edits(project_dir, latest_action)
+    )
+  )
+  if use_staged_path and staged_path is not None:
     draft_markdown = staged_path.read_text(encoding="utf-8").strip()
   else:
-    draft_markdown = str(suggestion.get("draft_markdown") or "").strip()
+    draft_markdown = draft_from_suggestion
   if not draft_markdown:
     raise ValueError("这条 Obsidian 维护建议没有可发布的笔记草稿")
+  resolved_vault_dir = vault_dir.resolve()
   published_text = _ensure_obsidian_maintenance_identity_markdown(
     draft_markdown,
     str(suggestion.get("id") or suggestion_id),
@@ -3974,22 +4344,13 @@ def publish_project_obsidian_maintenance_suggestion(
     latest_action,
   )
 
-  config = load_obsidian_config(project_dir)
-  if not config.enabled:
-    raise ValueError("Obsidian 未启用，不能发布维护笔记")
-  vault_dir = resolve_obsidian_vault_dir(project_dir, config)
-  if vault_dir is None:
-    raise ValueError("Obsidian Vault 路径为空")
-  if not vault_dir.exists() or not vault_dir.is_dir():
-    raise ValueError(f"Obsidian Vault 不存在：{vault_dir}")
-
   relative_path = _safe_obsidian_draft_relative_path(
     suggestion.get("suggested_path") or (latest_action or {}).get("relative_path"),
     _safe_obsidian_filename(suggestion.get("title"), "obsidian-note"),
   )
   target_path = vault_dir / relative_path
   try:
-    target_path.resolve().relative_to(vault_dir.resolve())
+    target_path.resolve().relative_to(resolved_vault_dir)
   except ValueError:
     raise ValueError("Obsidian 维护笔记目标路径不在 Vault 内") from None
   if target_path.exists():
@@ -3997,8 +4358,6 @@ def publish_project_obsidian_maintenance_suggestion(
 
   atomic_write_text(target_path, published_text)
 
-  now = _now_iso()
-  state = load_project_narrative_state(project_dir)
   action = {
     "id": f"obsidian-maintenance-action-{hashlib.sha1(f'{suggestion_id}:published:{now}'.encode('utf-8')).hexdigest()[:12]}",
     "suggestion_id": str(suggestion.get("id") or suggestion_id),
@@ -4015,21 +4374,48 @@ def publish_project_obsidian_maintenance_suggestion(
     "draft_content_hash": published_content_hash,
     "published_content_hash": published_content_hash,
     "published_from_manual_edits": published_from_manual_edits,
+    "auto_published": auto_published,
     "source_ids": _string_list(suggestion.get("source_ids"), limit=12),
     "source_chapters": _obsidian_maintenance_source_chapter_indexes(suggestion),
   }
-  state = _append_obsidian_maintenance_action(project_dir, project_detail, state, action)
-
-  published_suggestion = _find_obsidian_maintenance_suggestion(project_detail, state, suggestion_id, project_dir) or suggestion
-  return {
+  result = {
     "suggestion_id": str(suggestion.get("id") or suggestion_id),
     "status": "published",
     "draft_path": str(staged_path or ""),
     "vault_path": str(target_path),
     "vault_relative_path": relative_path.as_posix(),
     "relative_path": relative_path.as_posix(),
-    "suggestion": published_suggestion,
+    "auto_published": auto_published,
   }
+  return action, result
+
+
+def publish_project_obsidian_maintenance_suggestion(
+  project_dir: Path,
+  project_detail: object,
+  suggestion_id: str,
+) -> dict[str, object]:
+  state = refresh_project_narrative_state_chapter_cards(project_dir, project_detail, persist=True)
+  suggestion = _find_obsidian_maintenance_suggestion(project_detail, state, suggestion_id, project_dir)
+  if suggestion is None:
+    raise FileNotFoundError("Obsidian 维护建议不存在")
+
+  vault_dir = _project_obsidian_publish_vault_dir(project_dir)
+  now = _now_iso()
+  action, result = _publish_obsidian_maintenance_draft_action(
+    project_dir,
+    vault_dir,
+    state,
+    suggestion,
+    suggestion_id,
+    now,
+  )
+  state = load_project_narrative_state(project_dir)
+  state = _append_obsidian_maintenance_action(project_dir, project_detail, state, action)
+
+  published_suggestion = _find_obsidian_maintenance_suggestion(project_detail, state, suggestion_id, project_dir) or suggestion
+  result["suggestion"] = published_suggestion
+  return result
 
 
 def publish_project_obsidian_maintenance_suggestions(
@@ -4038,13 +4424,18 @@ def publish_project_obsidian_maintenance_suggestions(
   suggestion_ids: list[str] | None = None,
   *,
   limit: int = 80,
+  auto_published: bool = False,
 ) -> dict[str, object]:
   state = refresh_project_narrative_state_chapter_cards(project_dir, project_detail, persist=True)
   suggestions = _obsidian_maintenance_suggestions(project_detail, state, project_dir)
   wanted_ids = {str(item or "").strip() for item in (suggestion_ids or []) if str(item or "").strip()}
   matched_ids: set[str] = set()
+  actions = [item for item in state.get("obsidian_maintenance_actions", []) if isinstance(item, dict)]
   published: list[dict[str, object]] = []
   skipped: list[dict[str, object]] = []
+  now = _now_iso()
+  vault_dir: Path | None = None
+  vault_error = ""
   max_items = max(1, min(int(limit or 80), _MAX_OBSIDIAN_MAINTENANCE_SUGGESTIONS))
 
   for suggestion in suggestions:
@@ -4071,19 +4462,61 @@ def publish_project_obsidian_maintenance_suggestions(
     if _safe_staged_obsidian_draft_path(project_dir, latest_action) is None:
       skipped.append({"suggestion_id": suggestion_id, "reason": "项目草稿文件不存在"})
       continue
+    if vault_dir is None and not vault_error:
+      try:
+        vault_dir = _project_obsidian_publish_vault_dir(project_dir)
+      except ValueError as error:
+        vault_error = str(error)
+    if vault_error:
+      skipped.append({"suggestion_id": suggestion_id, "reason": vault_error})
+      continue
+    if vault_dir is None:
+      skipped.append({"suggestion_id": suggestion_id, "reason": "Obsidian Vault 路径为空"})
+      continue
     try:
-      result = publish_project_obsidian_maintenance_suggestion(project_dir, project_detail, suggestion_id)
+      action, result = _publish_obsidian_maintenance_draft_action(
+        project_dir,
+        vault_dir,
+        state,
+        suggestion,
+        suggestion_id,
+        now,
+        auto_published=auto_published,
+      )
     except (FileNotFoundError, ValueError) as error:
       skipped.append({"suggestion_id": suggestion_id, "reason": str(error)})
-      state = load_project_narrative_state(project_dir)
       continue
+    actions.append(action)
+    state["obsidian_maintenance_actions"] = actions[-_MAX_OBSIDIAN_MAINTENANCE_ACTIONS:]
     published.append(result)
-    state = load_project_narrative_state(project_dir)
 
   for suggestion_id in sorted(wanted_ids - matched_ids):
     skipped.append({"suggestion_id": suggestion_id, "reason": "维护建议不存在"})
 
-  state = load_project_narrative_state(project_dir)
+  if published:
+    state["obsidian_maintenance_actions"] = actions[-_MAX_OBSIDIAN_MAINTENANCE_ACTIONS:]
+    refreshed_suggestions = _obsidian_maintenance_suggestions(project_detail, state, project_dir)
+    _set_obsidian_maintenance_suggestions(
+      state,
+      refreshed_suggestions,
+    )
+    suggestions_by_id = {
+      str(item.get("id") or ""): item
+      for item in refreshed_suggestions
+      if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    for result in published:
+      suggestion_id = str(result.get("suggestion_id") or "")
+      if suggestion_id in suggestions_by_id:
+        result["suggestion"] = suggestions_by_id[suggestion_id]
+    state["updated_at"] = now
+    state["revision"] = int(state.get("revision") or 0) + 1
+    atomic_write_json(narrative_state_path(project_dir), state)
+  else:
+    _set_obsidian_maintenance_suggestions(
+      state,
+      _obsidian_maintenance_suggestions(project_detail, state, project_dir),
+    )
   return {
     "status": "published",
     "published_count": len(published),
@@ -6334,6 +6767,36 @@ def _pending_style_xp_draft_preview(item: dict[str, object], markdown: str) -> s
   return f"；{label}：{'；'.join(detail_parts)}"
 
 
+def _pending_story_archive_draft_preview(item: dict[str, object], markdown: str) -> str:
+  kind = str(item.get("kind") or "")
+  label = _STORY_ARCHIVE_MAINTENANCE_LABELS.get(kind, "")
+  if not label:
+    return ""
+  markdowns = _pending_draft_preview_markdowns(item, markdown)
+  detail_parts: list[str] = []
+  summary = _pending_draft_preview_value(markdowns, ("summary", "description", "abstract", "摘要"))
+  current_state = _pending_draft_preview_value(markdowns, ("current_state", "当前状态"))
+  related_characters = _pending_draft_preview_values(markdowns, ("related_characters", "相关人物"), limit=2)
+  related_locations = _pending_draft_preview_values(markdowns, ("related_locations", "相关地点"), limit=2)
+  related_props = _pending_draft_preview_values(markdowns, ("related_props", "相关道具"), limit=2)
+  related_organizations = _pending_draft_preview_values(markdowns, ("related_organizations", "相关组织"), limit=2)
+  if summary:
+    detail_parts.append(f"摘要：{_compact_text(summary, 90)}")
+  if current_state and current_state != summary:
+    detail_parts.append(f"状态：{_compact_text(current_state, 70)}")
+  for title, values in (
+    ("人物", related_characters),
+    ("地点", related_locations),
+    ("道具", related_props),
+    ("组织", related_organizations),
+  ):
+    if values:
+      detail_parts.append(f"{title}：{' / '.join(_compact_text(value, 36) for value in values[:2])}")
+  if not detail_parts:
+    return ""
+  return f"；{label}：{'；'.join(detail_parts)}"
+
+
 def _pending_draft_preview(item: dict[str, object], markdown: str) -> str:
   chapter_note_preview = _pending_chapter_note_draft_preview(item, markdown)
   if chapter_note_preview:
@@ -6341,7 +6804,10 @@ def _pending_draft_preview(item: dict[str, object], markdown: str) -> str:
   chapter_contract_preview = _pending_chapter_contract_draft_preview(item, markdown)
   if chapter_contract_preview:
     return chapter_contract_preview
-  return _pending_style_xp_draft_preview(item, markdown)
+  style_xp_preview = _pending_style_xp_draft_preview(item, markdown)
+  if style_xp_preview:
+    return style_xp_preview
+  return _pending_story_archive_draft_preview(item, markdown)
 
 
 def obsidian_maintenance_suggestion_preview(
@@ -6384,6 +6850,8 @@ def _pending_draft_soft_constraint_label(kind: str) -> str:
     return "文风"
   if kind == "create_xp_rule_note":
     return "XP"
+  if kind in _STORY_ARCHIVE_MAINTENANCE_LABELS:
+    return _STORY_ARCHIVE_MAINTENANCE_LABELS[kind]
   return "待审规则"
 
 
@@ -6408,7 +6876,13 @@ def obsidian_pending_soft_constraint_lines(
   candidates: list[tuple[dict[str, object], str, tuple[int, int, int, str]]] = []
   for item in suggestions:
     kind = str(item.get("kind") or "")
-    if kind not in {"create_chapter_note", "create_chapter_contract_note", "create_style_rule_note", "create_xp_rule_note"}:
+    if kind not in {
+      "create_chapter_note",
+      "create_chapter_contract_note",
+      "create_style_rule_note",
+      "create_xp_rule_note",
+      *_STORY_ARCHIVE_MAINTENANCE_LABELS.keys(),
+    }:
       continue
     status = str(item.get("status") or "open")
     if status in {"published", "ignored"}:
@@ -6432,6 +6906,13 @@ def obsidian_pending_soft_constraint_lines(
     "create_chapter_contract_note",
     "create_style_rule_note",
     "create_xp_rule_note",
+    "create_story_character_note",
+    "create_story_location_note",
+    "create_story_prop_note",
+    "create_story_organization_note",
+    "create_story_event_note",
+    "create_story_skill_note",
+    "create_story_scene_note",
   )
   for kind in preferred_kinds:
     candidate = next((entry for entry in ranked if str(entry[0].get("kind") or "") == kind), None)

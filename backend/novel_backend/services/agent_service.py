@@ -3643,6 +3643,7 @@ def _execute_chapter_workflow(
         skill_prompt=skill_prompt,
       ),
       target_words=action.target_words or (1800 if action.mode == "draft" else 1200),
+      prompt_override=action.prompt_override,
     ),
     task_id,
   )
@@ -3662,7 +3663,7 @@ def _execute_chapter_workflow(
       review_error=review_error,
       style_name=action.style_name,
       xp_preset=action.xp_preset,
-      instruction=_compose_execution_instruction(
+      instruction=action.prompt_override or _compose_execution_instruction(
         action.instruction,
         knowledge_summary=knowledge_summary,
         skill_prompt=skill_prompt,
@@ -3706,6 +3707,7 @@ def _execute_chapter_generate(
       key_items=action.key_items,
       scene_location=action.scene_location,
       time_constraint=action.time_constraint,
+      prompt_override=action.prompt_override,
     ),
     task_id,
   )
@@ -3725,7 +3727,7 @@ def _execute_chapter_generate(
     review_error=review_error,
     style_name=action.style_name,
     xp_preset=action.xp_preset,
-    instruction=_chapter_generate_instruction(action, knowledge_summary, skill_prompt),
+    instruction=action.prompt_override or _chapter_generate_instruction(action, knowledge_summary, skill_prompt),
   )
   return result, detail, review_error, repair_result
 

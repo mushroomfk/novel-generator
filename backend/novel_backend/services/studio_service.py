@@ -22,6 +22,7 @@ from novel_backend.models import (
   CharacterReplicaResult,
   ChapterGenerateRequest,
   ChapterGenerateResult,
+  ChapterPromptPreviewResponse,
   ChapterRewriteRequest,
   ChapterRewriteResult,
   ChapterUpdateRequest,
@@ -48,6 +49,7 @@ from novel_backend.services.chapter_auto_repair_service import auto_repair_chapt
 from novel_backend.services.config_service import load_config
 from novel_backend.services.project_dream_service import build_project_dream_prompt_block
 from novel_backend.services.generation_service import (
+  build_continuation_prompt_preview,
   _compact_text,
   _extract_json_object,
   _invoke_model,
@@ -1146,6 +1148,7 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     candidate_count=3 if candidate_mode == "deep" else 1,
     prefer_project_budget=payload.target_words <= 0,
     complete_chapter=payload.target_words <= 0,
+    prompt_override=payload.prompt_override,
   )
   return ChapterGenerateResult(
     task_id=task_id,
@@ -1153,6 +1156,33 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     summary=str(pipeline["summary"]),
     content=str(pipeline["content"]),
     next_action=str(pipeline["next_action"]),
+  )
+
+
+def chapter_generate_prompt_preview(settings: Settings, payload: ChapterGenerateRequest) -> ChapterPromptPreviewResponse:
+  support = _apply_preset_and_style(
+    settings,
+    task_key="chapter",
+    style_name=payload.style_name,
+    style_task_type="chapter",
+    style_query=payload.instruction,
+    xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
+  )
+  return build_continuation_prompt_preview(
+    settings,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
+    instruction=payload.instruction,
+    target_words=payload.target_words or 1800,
+    support_text=support,
+    characters_involved=payload.characters_involved,
+    key_items=payload.key_items,
+    scene_location=payload.scene_location,
+    time_constraint=payload.time_constraint,
+    prefer_project_budget=payload.target_words <= 0,
+    complete_chapter=payload.target_words <= 0,
   )
 
 
@@ -1480,6 +1510,7 @@ def _batch_task_request_payload(payload: BatchGenerateRequest) -> dict[str, obje
     "instruction": payload.instruction,
     "style_name": payload.style_name,
     "xp_preset": payload.xp_preset,
+    "prompt_overrides": dict(sorted(payload.prompt_overrides.items())),
   }
 
 
@@ -1574,6 +1605,7 @@ async def batch_generate_stream(settings: Settings, payload: BatchGenerateReques
       instruction=payload.instruction,
       style_name=payload.style_name,
       xp_preset=payload.xp_preset,
+      prompt_override=payload.prompt_overrides.get(chapter_id, "") or payload.prompt_overrides.get(str(chapter_index), ""),
     )
     try:
       result = await asyncio.to_thread(_generate_chapter, settings, request_payload, f"{task_id}-{chapter_index}")
@@ -1593,7 +1625,7 @@ async def batch_generate_stream(settings: Settings, payload: BatchGenerateReques
         review_error=review_error,
         style_name=payload.style_name,
         xp_preset=payload.xp_preset,
-        instruction=payload.instruction,
+        instruction=request_payload.prompt_override or payload.instruction,
       )
       review_status = summarize_chapter_review_status(detail, chapter_id, review_error)
       review_score = review_status.get("score")

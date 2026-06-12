@@ -78,9 +78,11 @@ from novel_backend.services.model_runtime_service import mark_model_runtime_cool
 from novel_backend.services.model_http_service import request_json_with_retries
 from novel_backend.services.obsidian_service import (
   collect_obsidian_note_records,
+  load_obsidian_config,
   load_obsidian_state,
   obsidian_note_record_for_source_key,
   obsidian_source_signature_entries,
+  resolve_obsidian_vault_dir,
   select_obsidian_notes_for_query,
   save_obsidian_config,
   scoped_obsidian_note_records_for_chapter,
@@ -105,6 +107,7 @@ from novel_backend.services.project_narrative_state_service import (
   confirm_project_obsidian_maintenance_merge_suggestions,
   ignore_project_obsidian_maintenance_suggestion,
   ignore_project_obsidian_maintenance_suggestions,
+  load_project_narrative_state,
   publish_project_obsidian_maintenance_suggestion,
   publish_project_obsidian_maintenance_suggestions,
   record_project_narrative_state_observation,
@@ -142,6 +145,42 @@ _MIGRATION_PACKAGE_SUFFIX = ".gaoxia-project.zip"
 _MIGRATION_SCHEMA_VERSION = "1"
 _MIGRATION_MAX_FILE_COUNT = 20_000
 _MIGRATION_MAX_UNCOMPRESSED_BYTES = 2_000_000_000
+_DEFAULT_OBSIDIAN_VAULT_DIRNAME = "Vault"
+_DEFAULT_OBSIDIAN_VAULT_DIRS = (
+  "Characters",
+  "Events",
+  "Locations",
+  "Props",
+  "Skills",
+  "Scenes",
+  "Organizations",
+  "Plans",
+  "ChapterNotes",
+  "Debts",
+  "CharacterArcs",
+  "Style",
+  "XP",
+  "Graph",
+)
+_STORY_OVERVIEW_OBSIDIAN_MAINTENANCE_KINDS = {
+  "create_story_character_note",
+  "create_story_event_note",
+  "create_story_location_note",
+  "create_story_prop_note",
+  "create_story_skill_note",
+  "create_story_scene_note",
+  "create_story_organization_note",
+}
+_DEFAULT_OBSIDIAN_README = """---
+status: draft
+no_ai: true
+---
+# 长篇稳定档案
+
+这个目录由稿匣自动创建，用来保存人物、事件、地点、道具、技能、场景、组织、章节档案、剧情债务、章节计划、文风规则和 XP 规则。
+
+你可以直接用稿匣写作；系统会把可确认的长篇资料整理到这里。安装 Obsidian 后，也可以把这个文件夹作为 Vault 打开。
+"""
 _MODEL_STORY_OVERVIEW_FILENAME = "story_overview_model.json"
 _MODEL_STORY_OVERVIEW_FAILURE_FILENAME = "story_overview_model_failure.json"
 _MODEL_STORY_OVERVIEW_SCHEMA_VERSION = "1"
@@ -976,6 +1015,38 @@ def _migration_output_dir(project_dir: Path) -> Path:
   output_dir = project_dir / "exports"
   output_dir.mkdir(parents=True, exist_ok=True)
   return output_dir
+
+
+def _ensure_default_obsidian_vault_files(project_dir: Path) -> None:
+  vault_dir = project_dir / _DEFAULT_OBSIDIAN_VAULT_DIRNAME
+  vault_dir.mkdir(parents=True, exist_ok=True)
+  for dirname in _DEFAULT_OBSIDIAN_VAULT_DIRS:
+    (vault_dir / dirname).mkdir(parents=True, exist_ok=True)
+
+  readme_path = vault_dir / "README.md"
+  if not readme_path.exists():
+    atomic_write_text(readme_path, _DEFAULT_OBSIDIAN_README)
+
+
+def _ensure_default_obsidian_vault(project_dir: Path) -> None:
+  _ensure_default_obsidian_vault_files(project_dir)
+  save_obsidian_config(
+    project_dir,
+    ObsidianVaultConfig(
+      enabled=True,
+      vault_path=_DEFAULT_OBSIDIAN_VAULT_DIRNAME,
+    ),
+  )
+  sync_obsidian_state(project_dir)
+
+
+def _ensure_default_obsidian_vault_if_missing(project_dir: Path) -> None:
+  config = load_obsidian_config(project_dir)
+  if config.enabled and config.vault_path.strip():
+    if config.vault_path.strip() == _DEFAULT_OBSIDIAN_VAULT_DIRNAME:
+      _ensure_default_obsidian_vault_files(project_dir)
+    return
+  _ensure_default_obsidian_vault(project_dir)
 
 
 def _should_skip_migration_file(relative_path: str) -> bool:
@@ -3931,6 +4002,42 @@ def _semantic_search_project_knowledge(
   return scored[: max(1, min(limit, 20))]
 
 
+def _diversify_knowledge_hits_by_source(
+  ranked: list[dict[str, object]],
+  limit: int,
+) -> list[dict[str, object]]:
+  result_limit = max(1, limit)
+  if len(ranked) <= result_limit:
+    return ranked[:result_limit]
+
+  per_source_limit = max(2, result_limit // 2)
+  selected: list[dict[str, object]] = []
+  skipped: list[dict[str, object]] = []
+  source_counts: dict[str, int] = {}
+  selected_ids: set[str] = set()
+
+  for item in ranked:
+    chunk_id = str(item.get("chunk_id") or "")
+    source = str(item.get("source") or "")
+    if source_counts.get(source, 0) < per_source_limit:
+      selected.append(item)
+      selected_ids.add(chunk_id)
+      source_counts[source] = source_counts.get(source, 0) + 1
+      if len(selected) >= result_limit:
+        return selected[:result_limit]
+    else:
+      skipped.append(item)
+
+  for item in skipped:
+    chunk_id = str(item.get("chunk_id") or "")
+    if chunk_id and chunk_id in selected_ids:
+      continue
+    selected.append(item)
+    if len(selected) >= result_limit:
+      break
+  return selected[:result_limit]
+
+
 def _search_project_knowledge(
   settings: Settings,
   project_dir: Path,
@@ -3985,6 +4092,7 @@ def _search_project_knowledge(
     ),
     reverse=True,
   )
+  ranked = _diversify_knowledge_hits_by_source(ranked, search_limit)
   return [
     KnowledgeSearchResult(
       source=str(item["source"]),
@@ -3994,7 +4102,7 @@ def _search_project_knowledge(
       score=float(item["score"]),
       match_type=str(item["match_type"]),
     )
-    for item in ranked[:search_limit]
+    for item in ranked
   ]
 
 
@@ -5899,13 +6007,15 @@ def _model_cache_to_overview(
   project_dir: Path,
   documents: list[StoryDocument],
   source_signature: str,
+  *,
+  allow_stale: bool = False,
 ) -> StoryOverview | None:
   payload = read_json(_model_story_overview_path(project_dir), None)
   if not isinstance(payload, dict):
     return None
   if payload.get("schema_version") != _MODEL_STORY_OVERVIEW_SCHEMA_VERSION:
     return None
-  if payload.get("source_signature") != source_signature:
+  if not allow_stale and payload.get("source_signature") != source_signature:
     return None
   overview_payload = payload.get("overview")
   if not isinstance(overview_payload, dict):
@@ -6250,13 +6360,45 @@ def _model_story_overview_status(
 
 
 def _base_story_overview(project_dir: Path, documents: list[StoryDocument], status: StoryOverviewModelStatus) -> StoryOverview:
+  obsidian_maintenance_summary, obsidian_maintenance_suggestions = _story_overview_obsidian_maintenance(project_dir)
   return StoryOverview(
     documents=documents,
     materials=_build_knowledge_materials(project_dir),
     obsidian=load_obsidian_state(project_dir),
+    obsidian_maintenance_summary=obsidian_maintenance_summary,
+    obsidian_maintenance_suggestions=obsidian_maintenance_suggestions,
     memory_entries=load_project_memory(project_dir),
     model_overview=status,
   )
+
+
+def _story_overview_obsidian_maintenance(project_dir: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+  state = load_project_narrative_state(project_dir)
+  summary = state.get("obsidian_maintenance_summary")
+  suggestions = state.get("obsidian_maintenance_suggestions")
+  return (
+    dict(summary) if isinstance(summary, dict) else {},
+    [dict(item) for item in suggestions if isinstance(item, dict)] if isinstance(suggestions, list) else [],
+  )
+
+
+def _refresh_model_story_overview_source_signature(project_dir: Path, detail: ProjectDetail) -> bool:
+  if str(getattr(detail.story_overview.model_overview, "status", "") or "") != "ready":
+    return False
+  payload = read_json(_model_story_overview_path(project_dir), None)
+  if not isinstance(payload, dict) or payload.get("schema_version") != _MODEL_STORY_OVERVIEW_SCHEMA_VERSION:
+    return False
+  source_signature = _overview_source_signature(
+    list(detail.story_overview.documents),
+    _load_knowledge_material_payloads(project_dir),
+    list(detail.chapters),
+    obsidian_source_signature_entries(project_dir),
+  )
+  if payload.get("source_signature") == source_signature:
+    return False
+  payload["source_signature"] = source_signature
+  atomic_write_json(_model_story_overview_path(project_dir), payload)
+  return True
 
 
 def _model_story_overview_or_none(
@@ -6280,7 +6422,12 @@ def _model_story_overview_or_none(
   if cached is not None and not force:
     return cached
   if not allow_request:
-    return None
+    stale_cached = (
+      _model_cache_to_overview(project_dir, documents, source_signature, allow_stale=True)
+      if use_cache and not force
+      else None
+    )
+    return stale_cached
   if _story_overview_model_enabled(settings)[0] is None:
     append_app_log(settings, "story_overview_model skipped: 写作模型和第二审查模型均未配置", level="INFO")
     raise RuntimeError("模型总览生成失败：写作模型和第二审查模型均未配置。")
@@ -6456,9 +6603,12 @@ def _build_story_overview(
   )
   if model_overview is not None:
     model_status = _model_story_overview_status(settings, project_dir, documents, material_payloads, chapters)
+    obsidian_maintenance_summary, obsidian_maintenance_suggestions = _story_overview_obsidian_maintenance(project_dir)
     return model_overview.model_copy(
       update={
         "obsidian": load_obsidian_state(project_dir),
+        "obsidian_maintenance_summary": obsidian_maintenance_summary,
+        "obsidian_maintenance_suggestions": obsidian_maintenance_suggestions,
         "model_overview": model_status,
       }
     )
@@ -6486,6 +6636,8 @@ def get_project_detail(
   review_characters: bool = False,
   allow_model_overview: bool = False,
   use_model_overview_cache: bool = True,
+  refresh_narrative_state: bool = True,
+  auto_publish_obsidian_maintenance: bool = True,
 ) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
@@ -6564,6 +6716,37 @@ def get_project_detail(
     update={
       "chapter_reviews": load_chapter_reviews(project_dir, detail),
       "distillation_report": distillation_report,
+    }
+  )
+  refreshed_detail = ProjectDetail(
+    **summary.model_dump(),
+    chapters=chapters,
+    local_history=local_history,
+    story_overview=overview,
+  )
+  if not refresh_narrative_state:
+    return refreshed_detail
+  narrative_state = refresh_project_narrative_state_chapter_cards(
+    project_dir,
+    refreshed_detail,
+    persist=True,
+    auto_stage_drafts=True,
+  )
+  if auto_publish_obsidian_maintenance:
+    refreshed_detail, narrative_state = _auto_publish_generated_obsidian_maintenance(
+      settings,
+      project_id,
+      project_dir,
+      refreshed_detail,
+      narrative_state,
+      focus="长篇稳定档案已自动维护",
+    )
+  obsidian_maintenance_summary, obsidian_maintenance_suggestions = _story_overview_obsidian_maintenance(project_dir)
+  overview = refreshed_detail.story_overview
+  overview = overview.model_copy(
+    update={
+      "obsidian_maintenance_summary": obsidian_maintenance_summary,
+      "obsidian_maintenance_suggestions": obsidian_maintenance_suggestions,
     }
   )
 
@@ -6679,6 +6862,7 @@ def create_project(settings: Settings, request: CreateProjectRequest) -> Project
       atomic_write_text(file_path, payload)
 
   ensure_project_memory_file(project_dir)
+  _ensure_default_obsidian_vault(project_dir)
   _initialize_knowledge_db(project_dir / "knowledge.db")
   _rebuild_project_knowledge(project_dir, request.target_chapters, settings)
   _write_snapshot(
@@ -7248,7 +7432,9 @@ def import_project_knowledge(
 
 def get_project_obsidian_state(settings: Settings, project_id: str):
   summary = _project_summary_or_404(settings, project_id)
-  return load_obsidian_state(_project_dir(summary))
+  project_dir = _project_dir(summary)
+  _ensure_default_obsidian_vault_if_missing(project_dir)
+  return load_obsidian_state(project_dir)
 
 
 def _refresh_narrative_state_after_obsidian_sync(
@@ -7269,6 +7455,15 @@ def _refresh_narrative_state_after_obsidian_sync(
   return detail
 
 
+def _detail_with_refreshed_obsidian_state(project_dir: Path, detail: ProjectDetail) -> ProjectDetail:
+  overview = detail.story_overview.model_copy(
+    update={
+      "obsidian": load_obsidian_state(project_dir),
+    }
+  )
+  return detail.model_copy(update={"story_overview": overview})
+
+
 def update_project_obsidian_config(
   settings: Settings,
   project_id: str,
@@ -7276,6 +7471,10 @@ def update_project_obsidian_config(
 ) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
+  requested_vault_path = request.vault_path.strip()
+  if request.enabled and requested_vault_path in {"", _DEFAULT_OBSIDIAN_VAULT_DIRNAME}:
+    _ensure_default_obsidian_vault_files(project_dir)
+    request = request.model_copy(update={"enabled": True, "vault_path": _DEFAULT_OBSIDIAN_VAULT_DIRNAME})
   save_obsidian_config(project_dir, request)
   sync_obsidian_state(project_dir)
   updated_at = _now_iso()
@@ -7288,11 +7487,12 @@ def update_project_obsidian_config(
 def sync_project_obsidian(settings: Settings, project_id: str) -> ProjectDetail:
   summary = _project_summary_or_404(settings, project_id)
   project_dir = _project_dir(summary)
+  _ensure_default_obsidian_vault_if_missing(project_dir)
   sync_obsidian_state(project_dir)
   updated_at = _now_iso()
   _touch_project_timestamp(settings, project_id, updated_at)
   _rebuild_project_knowledge(project_dir, summary.target_chapters, settings)
-  detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 知识库已同步")
+  detail = _auto_refresh_system_memory(settings, project_id, focus="长篇稳定档案已同步")
   return _refresh_narrative_state_after_obsidian_sync(settings, project_id, project_dir, detail)
 
 
@@ -7457,6 +7657,89 @@ def publish_project_obsidian_maintenance_notes(
     refreshed_detail = _auto_refresh_system_memory(settings, project_id, focus="Obsidian 维护笔记已批量发布")
     refresh_project_narrative_state_chapter_cards(project_dir, refreshed_detail, persist=True)
   return result
+
+
+def _auto_publish_generated_obsidian_maintenance(
+  settings: Settings,
+  project_id: str,
+  project_dir: Path,
+  detail: ProjectDetail,
+  state: dict[str, object],
+  *,
+  focus: str,
+) -> tuple[ProjectDetail, dict[str, object]]:
+  config = load_obsidian_config(project_dir)
+  if not config.enabled:
+    return detail, state
+  vault_dir = resolve_obsidian_vault_dir(project_dir, config)
+  if vault_dir is None:
+    return detail, state
+  try:
+    vault_dir.resolve().relative_to(project_dir.resolve())
+  except ValueError:
+    return detail, state
+
+  model_overview_status = str(getattr(getattr(detail.story_overview, "model_overview", None), "status", "") or "")
+  suggestion_ids: list[str] = []
+  includes_story_overview_entities = False
+  for item in state.get("obsidian_maintenance_suggestions", []) if isinstance(state, dict) else []:
+    if not isinstance(item, dict):
+      continue
+    suggestion_id = str(item.get("id") or "").strip()
+    if not suggestion_id:
+      continue
+    if str(item.get("status") or "") != "staged":
+      continue
+    if not bool(item.get("auto_staged")):
+      continue
+    if bool(item.get("manual_draft_edits")) or bool(item.get("preserved_existing_draft")):
+      continue
+    if bool(item.get("draft_missing")) or bool(item.get("published_missing")) or bool(item.get("published_outdated")):
+      continue
+    if str(item.get("priority") or "low") not in {"high", "medium"}:
+      continue
+    kind = str(item.get("kind") or "")
+    if kind in {"merge_vault_note", "update_vault_note"}:
+      continue
+    if kind in _STORY_OVERVIEW_OBSIDIAN_MAINTENANCE_KINDS and model_overview_status != "ready":
+      continue
+    if kind in _STORY_OVERVIEW_OBSIDIAN_MAINTENANCE_KINDS:
+      includes_story_overview_entities = True
+    suggestion_ids.append(suggestion_id)
+
+  if not suggestion_ids:
+    return detail, state
+
+  result = publish_project_obsidian_maintenance_suggestions(
+    project_dir,
+    detail,
+    suggestion_ids=suggestion_ids,
+    limit=len(suggestion_ids),
+    auto_published=True,
+  )
+  if int(result.get("published_count") or 0) <= 0:
+    return detail, state
+
+  sync_obsidian_state(project_dir)
+  if includes_story_overview_entities:
+    _refresh_model_story_overview_source_signature(project_dir, detail)
+  try:
+    target_chapters = int(getattr(detail, "target_chapters", 0) or 0)
+  except (TypeError, ValueError):
+    target_chapters = 0
+  if target_chapters > 0:
+    _rebuild_project_knowledge(project_dir, target_chapters, settings)
+  _touch_project_timestamp(settings, project_id, _now_iso())
+  refreshed_detail = _detail_with_refreshed_obsidian_state(project_dir, detail)
+  refresh_project_narrative_state_chapter_cards(
+    project_dir,
+    refreshed_detail,
+    persist=True,
+    auto_stage_drafts=True,
+  )
+  refreshed_state = load_project_narrative_state(project_dir)
+  append_app_log(settings, f"{focus}: 自动发布 {int(result.get('published_count') or 0)} 条长篇稳定档案")
+  return refreshed_detail, refreshed_state
 
 
 def apply_architecture_workspace(
@@ -7937,12 +8220,20 @@ def update_chapter_content_with_review_status(
   except Exception as error:
     append_app_log(settings, f"style/xp evolution failed for {project_id}/{chapter_id}: {error}")
   try:
-    record_project_narrative_state_observation(
+    narrative_state = record_project_narrative_state_observation(
       project_dir,
       detail,
       chapter_id,
       settings=settings,
       review_error=review_error,
+    )
+    detail, narrative_state = _auto_publish_generated_obsidian_maintenance(
+      settings,
+      project_id,
+      project_dir,
+      detail,
+      narrative_state,
+      focus=f"第 {chapter_index} 章保存后稳定档案已自动维护",
     )
   except Exception as error:
     append_app_log(settings, f"narrative state update failed for {project_id}/{chapter_id}: {error}")

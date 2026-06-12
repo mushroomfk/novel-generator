@@ -4,6 +4,7 @@ import base64
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -59,6 +60,7 @@ from novel_backend.services.context_builder import build_project_context_bundle
 from novel_backend.api.projects import (
   _chapter_mutation_response,
   _project_action_response,
+  get_project,
   router as project_api_router,
   post_project_obsidian_sync,
   post_existing_novel_import,
@@ -76,6 +78,7 @@ from novel_backend.services.project_distillation_service import (
   build_task_distillation_prompt_block,
   resolve_task_pack_kind,
 )
+from novel_backend.services.project_narrative_state_service import build_project_narrative_state_prompt, load_project_narrative_state
 from novel_backend.services.project_service import (
   _initialize_knowledge_db,
   apply_architecture_workspace,
@@ -112,6 +115,7 @@ from novel_backend.services.project_takeover_service import (
   resume_existing_novel_takeover,
   split_existing_novel_chapters,
 )
+from novel_backend.services.obsidian_service import load_obsidian_config, load_obsidian_state
 from novel_backend.services.style_service import save_style
 
 
@@ -139,6 +143,117 @@ class ProjectServiceTestCase(unittest.TestCase):
     chapter_path = Path(project_path) / "chapters" / f"{index:03d}.md"
     chapter_path.parent.mkdir(parents=True, exist_ok=True)
     chapter_path.write_text(content, encoding="utf-8")
+
+  def test_project_detail_api_reads_without_maintenance_refresh_by_default(self) -> None:
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=self.settings)))
+    detail = SimpleNamespace(model_dump=lambda mode="json": {"id": "project-id"})
+
+    with patch("novel_backend.api.projects.get_project_detail", return_value=detail) as mocked_get_detail:
+      response = get_project(request, "project-id", review_characters=False)
+
+    self.assertTrue(response["ok"])
+    self.assertEqual(response["data"], {"id": "project-id"})
+    mocked_get_detail.assert_called_once()
+    self.assertFalse(mocked_get_detail.call_args.kwargs["refresh_narrative_state"])
+    self.assertFalse(mocked_get_detail.call_args.kwargs["auto_publish_obsidian_maintenance"])
+
+  def test_create_project_initializes_longform_archive(self) -> None:
+    summary = self.create_demo_project("自动长篇档案")
+    project_dir = Path(summary.path)
+    vault_dir = project_dir / "Vault"
+    config = load_obsidian_config(project_dir)
+    state = load_obsidian_state(project_dir)
+
+    self.assertTrue(config.enabled)
+    self.assertEqual(config.vault_path, "Vault")
+    self.assertTrue(vault_dir.is_dir())
+    for dirname in (
+      "Characters",
+      "Events",
+      "Locations",
+      "Props",
+      "Skills",
+      "Scenes",
+      "Organizations",
+      "Plans",
+      "ChapterNotes",
+      "Debts",
+      "CharacterArcs",
+      "Style",
+      "XP",
+      "Graph",
+    ):
+      self.assertTrue((vault_dir / dirname).is_dir(), dirname)
+    self.assertTrue((vault_dir / "README.md").is_file())
+    self.assertTrue(state.enabled)
+    self.assertEqual(state.vault_path, "Vault")
+    self.assertEqual(state.included_count, 0)
+
+  def test_obsidian_default_save_creates_vault_for_existing_project(self) -> None:
+    summary = self.create_demo_project("旧项目补档案")
+    project_dir = Path(summary.path)
+    shutil.rmtree(project_dir / "Vault")
+    (project_dir / ".gaoxia" / "obsidian.json").unlink()
+    (project_dir / ".gaoxia" / "obsidian_sync.json").unlink()
+
+    detail = update_project_obsidian_config(
+      self.settings,
+      summary.id,
+      ObsidianVaultConfig(enabled=True, vault_path=""),
+    )
+
+    self.assertTrue((project_dir / "Vault" / "ChapterNotes").is_dir())
+    self.assertEqual(detail.story_overview.obsidian.config.vault_path, "Vault")
+    self.assertTrue(detail.story_overview.obsidian.enabled)
+
+  def test_story_overview_includes_obsidian_maintenance_state(self) -> None:
+    summary = self.create_demo_project("架构总览维护")
+    project_dir = Path(summary.path)
+    learning_dir = project_dir / ".gaoxia" / "learning"
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    (learning_dir / "narrative_state.json").write_text(
+      json.dumps(
+        {
+          "schema_version": 1,
+          "debts": [
+            {
+              "id": "debt-first-chapter",
+              "title": "铜钥匙承诺",
+              "content": "第一章留下铜钥匙来源未解释。",
+              "status": "open",
+              "risk_level": "high",
+              "first_seen_chapter_index": 1,
+              "last_seen_chapter_index": 1,
+              "source_names": ["chapter"],
+            }
+          ],
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+
+    detail = get_project_detail(self.settings, summary.id)
+
+    self.assertEqual(detail.story_overview.obsidian_maintenance_summary["needs_action"], 1)
+    self.assertFalse(
+      any(
+        item.get("id") == "obsidian-maintenance-debt-debt-first-chapter"
+        for item in detail.story_overview.obsidian_maintenance_suggestions
+      )
+    )
+    state = load_project_narrative_state(project_dir)
+    published_action = next(
+      item
+      for item in state.get("obsidian_maintenance_actions", [])
+      if item.get("suggestion_id") == "obsidian-maintenance-debt-debt-first-chapter"
+      and item.get("status") == "published"
+    )
+    self.assertTrue(published_action["auto_published"])
+    self.assertEqual(published_action["source_chapters"], [1])
+    vault_path = project_dir / "Vault" / "Debts" / "铜钥匙承诺.md"
+    self.assertTrue(vault_path.is_file())
+    self.assertIn("type: plot_debt", vault_path.read_text(encoding="utf-8"))
 
   def test_story_overview_without_model_cache_keeps_entities_empty(self) -> None:
     summary = self.create_demo_project("本地总览")
@@ -181,6 +296,162 @@ class ProjectServiceTestCase(unittest.TestCase):
     self.assertEqual(detail.story_overview.skills, [])
     self.assertEqual(detail.story_overview.scenes, [])
     self.assertEqual(detail.story_overview.organizations, [])
+
+  def test_story_overview_displays_stale_model_cache_without_model_request(self) -> None:
+    summary = self.create_demo_project("同步后总览")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      "林晚已经改名为林澜，证据账本仍在她手里。",
+      encoding="utf-8",
+    )
+    gaoxia_dir = project_dir / ".gaoxia"
+    gaoxia_dir.mkdir(parents=True, exist_ok=True)
+    (gaoxia_dir / "story_overview_model.json").write_text(
+      json.dumps(
+        {
+          "schema_version": "1",
+          "source_signature": "old-source-signature",
+          "generated_at": "2026-06-10T12:00:00+08:00",
+          "overview": {
+            "characters": [
+              {
+                "name": "林晚",
+                "profile": "明成集团创意总监。",
+                "current_state": "掌握证据账本。",
+                "props": ["证据账本"],
+              }
+            ],
+            "events": [{"name": "公开羞辱", "related_characters": ["林晚"]}],
+            "locations": [{"name": "发布会现场", "related_characters": ["林晚"]}],
+            "props": [{"name": "证据账本", "related_characters": ["林晚"]}],
+            "skills": [{"name": "危机公关", "related_characters": ["林晚"]}],
+            "scenes": [{"name": "雨夜质询", "related_characters": ["林晚"]}],
+            "organizations": [{"name": "明成集团", "related_characters": ["林晚"]}],
+          },
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      side_effect=AssertionError("普通项目详情不应因为过期总览缓存发起模型请求"),
+    ):
+      detail = get_project_detail(self.settings, summary.id)
+
+    documents = {item.key: item.content for item in detail.story_overview.documents}
+    self.assertIn("林晚已经改名为林澜", documents["character_design"])
+    self.assertEqual(detail.story_overview.model_overview.status, "stale")
+    self.assertEqual(detail.story_overview.model_overview.generated_at, "2026-06-10T12:00:00+08:00")
+    self.assertIn("林晚", [item.name for item in detail.story_overview.characters])
+    self.assertIn("公开羞辱", [item.name for item in detail.story_overview.events])
+    self.assertIn("发布会现场", [item.name for item in detail.story_overview.locations])
+    self.assertIn("证据账本", [item.name for item in detail.story_overview.props])
+    self.assertIn("危机公关", [item.name for item in detail.story_overview.skills])
+    self.assertIn("雨夜质询", [item.name for item in detail.story_overview.scenes])
+    self.assertIn("明成集团", [item.name for item in detail.story_overview.organizations])
+    self.assertFalse((project_dir / "Vault" / "Characters" / "林晚.md").exists())
+    self.assertFalse((project_dir / ".gaoxia" / "obsidian_drafts" / "Characters" / "林晚.md").exists())
+
+  def test_story_overview_entities_auto_publish_archive_notes_to_project_vault(self) -> None:
+    save_config(
+      self.settings,
+      AppConfigUpdateRequest(
+        model=ModelConfig(
+          api_key="real-key",
+          base_url="https://primary.local/v1",
+          model_name="primary-overview-model",
+          max_tokens=4096,
+        ),
+        review_model=ReviewModelConfig(enabled=False),
+      ),
+    )
+    summary = self.create_demo_project("总览自动档案")
+    project_dir = Path(summary.path)
+    (project_dir / "character_design.txt").write_text(
+      (
+        "林晚是明成集团创意总监，掌握证据账本。"
+        "林晚在发布会现场被公开羞辱，公开羞辱让她决定追查关键转账。"
+        "发布会现场是舆论爆发的公开场所，证据账本记录关键转账。"
+        "林晚擅长危机公关，雨夜质询是雨夜中追问账本来源的场景。"
+      ),
+      encoding="utf-8",
+    )
+    model_content = json.dumps(
+      {
+        "characters": [
+          {
+            "name": "林晚",
+            "profile": "明成集团创意总监。",
+            "current_state": "掌握证据账本。",
+            "props": ["证据账本"],
+            "locations": ["发布会现场"],
+            "skills": ["危机公关"],
+            "scenes": ["雨夜质询"],
+            "organizations": ["明成集团"],
+            "evidence": ["林晚是明成集团创意总监"],
+          }
+        ],
+        "events": [
+          {"name": "公开羞辱", "summary": "发布会上被当众羞辱。", "related_characters": ["林晚"], "evidence": ["公开羞辱让她决定追查关键转账"]}
+        ],
+        "locations": [
+          {"name": "发布会现场", "summary": "舆论爆发的公开场所。", "related_characters": ["林晚"], "evidence": ["发布会现场是舆论爆发的公开场所"]}
+        ],
+        "props": [
+          {"name": "证据账本", "summary": "记录关键转账的账本。", "related_characters": ["林晚"], "evidence": ["证据账本记录关键转账"]}
+        ],
+        "skills": [{"name": "危机公关", "summary": "林晚擅长的公关能力。", "related_characters": ["林晚"], "evidence": ["林晚擅长危机公关"]}],
+        "scenes": [{"name": "雨夜质询", "summary": "雨夜中追问账本来源。", "related_characters": ["林晚"], "evidence": ["雨夜质询是雨夜中追问账本来源的场景"]}],
+        "organizations": [{"name": "明成集团", "summary": "林晚所在公司。", "related_characters": ["林晚"], "evidence": ["林晚是明成集团创意总监"]}],
+      },
+      ensure_ascii=False,
+    )
+
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      return_value={"choices": [{"message": {"content": model_content}}]},
+    ):
+      detail = get_project_detail(self.settings, summary.id, allow_model_overview=True)
+
+    self.assertEqual(detail.story_overview.model_overview.status, "ready")
+    vault_paths = {
+      "Characters/林晚.md": "type: character",
+      "Events/公开羞辱.md": "type: event",
+      "Locations/发布会现场.md": "type: location",
+      "Props/证据账本.md": "type: prop",
+      "Skills/危机公关.md": "type: skill",
+      "Scenes/雨夜质询.md": "type: scene",
+      "Organizations/明成集团.md": "type: organization",
+    }
+    for relative_path, expected_type in vault_paths.items():
+      vault_file = project_dir / "Vault" / relative_path
+      self.assertTrue(vault_file.is_file(), relative_path)
+      vault_text = vault_file.read_text(encoding="utf-8")
+      self.assertIn(expected_type, vault_text)
+      self.assertIn("gaoxia_maintenance_id:", vault_text)
+      self.assertIn("架构总览自动识别", vault_text)
+
+    state = load_project_narrative_state(project_dir)
+    published_actions = [
+      item
+      for item in state.get("obsidian_maintenance_actions", [])
+      if str(item.get("gaoxia_maintenance_kind") or "").startswith("create_story_")
+      and str(item.get("status") or "") == "published"
+    ]
+    self.assertGreaterEqual(len(published_actions), len(vault_paths))
+    self.assertTrue(all(item.get("auto_published") for item in published_actions))
+    self.assertFalse(any(str(item.get("kind") or "").startswith("create_story_") for item in detail.story_overview.obsidian_maintenance_suggestions))
+    note_paths = {item.relative_path for item in detail.story_overview.obsidian.notes}
+    self.assertTrue(set(vault_paths).issubset(note_paths))
+    with patch(
+      "novel_backend.services.project_service.request_json_with_retries",
+      side_effect=AssertionError("自动发布派生档案后，不应立刻让模型总览缓存过期并重新请求模型"),
+    ):
+      cached_detail = get_project_detail(self.settings, summary.id)
+    self.assertEqual(cached_detail.story_overview.model_overview.status, "ready")
+    self.assertTrue(set(vault_paths).issubset({item.relative_path for item in cached_detail.story_overview.obsidian.notes}))
 
   def test_story_overview_uses_validated_model_cache_for_all_sections(self) -> None:
     save_config(
@@ -875,6 +1146,33 @@ foreshadows:
 
     doc_hits = search_project_knowledge(self.settings, summary.id, "身世之谜")
     self.assertTrue(any(item.source == "架构文件" for item in doc_hits))
+
+  def test_search_project_knowledge_keeps_chapter_hit_with_many_obsidian_matches(self) -> None:
+    summary = self.create_demo_project("章节检索混排")
+
+    with patch(
+      "novel_backend.services.chapter_review_service._call_model_review",
+      side_effect=RuntimeError("skip remote chapter review"),
+    ), patch(
+      "novel_backend.services.project_narrative_state_service._invoke_narrative_editor_model",
+      side_effect=RuntimeError("skip narrative editor"),
+    ):
+      for index in range(1, 5):
+        update_chapter_content(
+          self.settings,
+          summary.id,
+          f"chapter-{index:03d}",
+          ChapterUpdateRequest(
+            content=(
+              f"# 第{index}章 盐仓密押\n"
+              f"林追在第 {index} 次记录里核对盐仓密押，顾临守住铜钥匙线索。\n"
+            ),
+          ),
+        )
+
+    hits = search_project_knowledge(self.settings, summary.id, "盐仓密押", limit=8)
+
+    self.assertTrue(any(item.source == "章节正文" for item in hits))
 
   def test_update_chapter_content_persists_and_can_be_cleared(self) -> None:
     summary = self.create_demo_project("章节编辑")
@@ -3106,8 +3404,8 @@ status: canonical
   def test_migration_package_keeps_project_internal_obsidian_vault_index(self) -> None:
     summary = self.create_demo_project("项目内 Obsidian 迁移")
     project_dir = Path(summary.path)
-    vault_dir = project_dir / "vault"
-    vault_dir.mkdir()
+    vault_dir = project_dir / "Vault"
+    vault_dir.mkdir(exist_ok=True)
     (vault_dir / "Clue.md").write_text(
       """---
 type: note
@@ -3122,7 +3420,7 @@ status: canonical
     update_project_obsidian_config(
       self.settings,
       summary.id,
-      ObsidianVaultConfig(enabled=True, vault_path="vault", allowed_statuses=["canonical"]),
+      ObsidianVaultConfig(enabled=True, vault_path="Vault", allowed_statuses=["canonical"]),
     )
 
     export_result = export_project_migration_package(self.settings, summary.id)
@@ -3133,7 +3431,7 @@ status: canonical
       db_bytes = archive.read("project/knowledge.db")
       sync_payload = json.loads(archive.read("project/.gaoxia/obsidian_sync.json").decode("utf-8"))
 
-    self.assertIn("project/vault/Clue.md", names)
+    self.assertIn("project/Vault/Clue.md", names)
     self.assertIn("project/.gaoxia/obsidian.json", names)
     self.assertTrue(any("项目内 Vault 线索" in item.get("title", "") for item in sync_payload.get("notes", [])))
     self.assertTrue(any("迁移包应该保留的项目内 Obsidian 正文" in item.get("preview", "") for item in sync_payload.get("notes", [])))
@@ -3166,7 +3464,7 @@ status: canonical
         ),
       )
       imported_project_dir = Path(import_result.path)
-      self.assertTrue((imported_project_dir / "vault" / "Clue.md").exists())
+      self.assertTrue((imported_project_dir / "Vault" / "Clue.md").exists())
       imported_detail = get_project_detail(target_settings, import_result.project.id)
       self.assertEqual(imported_detail.story_overview.obsidian.included_count, 1)
       self.assertFalse(imported_detail.story_overview.obsidian.warnings)

@@ -271,6 +271,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_active_style_xp_rules_generate_obsidian_maintenance_suggestions(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-style-xp-maintenance"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     first = (
       "# 第一章 雨夜\n"
       "雨停了。\n"
@@ -296,11 +301,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
       self.project.id,
       "chapter-002",
       ChapterUpdateRequest(content=second, xp_preset="悬疑推进"),
-    )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
     )
 
     state = load_project_narrative_state(Path(self.project.path))
@@ -501,6 +501,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_style_xp_maintenance_uses_latest_source_chapter_boundary(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-style-xp-late-source"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     update_chapter_content(
       self.settings,
       self.project.id,
@@ -530,11 +535,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
         ),
         xp_preset="悬疑推进",
       ),
-    )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
     )
 
     state = load_project_narrative_state(Path(self.project.path))
@@ -1599,7 +1599,7 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
     self.assertGreaterEqual(summary["auto_staged"], 1)
     self.assertTrue(summary["top_items"])
     plot_note = next(item for item in suggestions if item["kind"] == "create_plot_note")
-    self.assertIn("Plot/", plot_note["suggested_path"])
+    self.assertIn("Debts/", plot_note["suggested_path"])
     self.assertIn("type: plot_debt", plot_note["draft_markdown"])
     self.assertIn("source_ids:", plot_note["draft_markdown"])
     self.assertIn("debt_content:", plot_note["draft_markdown"])
@@ -1629,13 +1629,13 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
 
     capability_context = build_agent_capability_context(Path(self.project.path))
     self.assertIn("Obsidian 维护建议", capability_context)
-    self.assertIn("建议笔记 Plot/", capability_context)
+    self.assertIn("建议笔记 Debts/", capability_context)
 
     detail = get_project_detail(self.settings, self.project.id)
     next_prompt = build_project_narrative_state_prompt(Path(self.project.path), detail, "chapter-059")
     self.assertIn("Obsidian 待审草稿", next_prompt)
     self.assertIn("不能当作 Vault 正式设定引用", next_prompt)
-    self.assertIn("Plot/", next_prompt)
+    self.assertIn("Debts/", next_prompt)
 
     bundle = build_project_context_bundle(
       self.settings,
@@ -1708,7 +1708,7 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
         edited_lines.append("# 改写后的追踪项")
       else:
         edited_lines.append(line)
-    renamed_debt_path = vault_dir / "Plot" / "改写后的追踪项.md"
+    renamed_debt_path = vault_dir / "Debts" / "改写后的追踪项.md"
     vault_note_path.rename(renamed_debt_path)
     renamed_debt_path.write_text("\n".join(edited_lines) + "\n", encoding="utf-8")
     sync_project_obsidian(self.settings, self.project.id)
@@ -1951,6 +1951,24 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
       self.project.id,
       ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
     )
+    gaoxia_dir = Path(self.project.path) / ".gaoxia"
+    gaoxia_dir.mkdir(parents=True, exist_ok=True)
+    (gaoxia_dir / "story_overview_model.json").write_text(
+      json.dumps(
+        {
+          "schema_version": "1",
+          "source_signature": "test-source-signature",
+          "generated_at": "2026-06-11T10:00:00+08:00",
+          "overview": {
+            "locations": [{"name": "旧码头"}],
+            "props": [{"name": "银潮灯"}],
+            "organizations": [{"name": "旧船队"}],
+          },
+        },
+        ensure_ascii=False,
+      ),
+      encoding="utf-8",
+    )
     update_chapter_content(
       self.settings,
       self.project.id,
@@ -2122,9 +2140,57 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
     self.assertIn("正文摘录：", followup_bundle.context_text)
     self.assertIn("第 57 章后可用", followup_bundle.context_text)
 
+  def test_saved_chapter_auto_publishes_generated_archive_to_project_vault(self) -> None:
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path="Vault", allowed_statuses=["canonical"]),
+    )
+    with patch("novel_backend.services.project_service.append_app_log") as mocked_log:
+      update_chapter_content(
+        self.settings,
+        self.project.id,
+        "chapter-001",
+        ChapterUpdateRequest(
+          content=(
+            "# 第一章 旧码头\n"
+            "林追在旧码头发现银潮灯，宋闻提醒他旧船队记录不能外泄。\n"
+          ),
+        ),
+      )
+    log_messages = [
+      str(call.args[1])
+      for call in mocked_log.call_args_list
+      if len(call.args) >= 2
+    ]
+    self.assertFalse(any("narrative state update failed" in message for message in log_messages))
+    self.assertTrue(any("第 1 章保存后稳定档案已自动维护" in message for message in log_messages))
+
+    state = load_project_narrative_state(Path(self.project.path))
+    chapter_note_action = next(
+      item
+      for item in state["obsidian_maintenance_actions"]
+      if item["status"] == "published"
+      and item.get("auto_published")
+      and item.get("gaoxia_maintenance_kind") == "create_chapter_note"
+      and "第 1 章" in str(item.get("title") or "")
+    )
+    vault_path = Path(str(chapter_note_action["vault_path"]))
+    self.assertTrue(vault_path.exists())
+    self.assertTrue(vault_path.resolve().is_relative_to((Path(self.project.path) / "Vault").resolve()))
+    published_text = vault_path.read_text(encoding="utf-8")
+    self.assertIn("gaoxia_maintenance_id:", published_text)
+    self.assertIn("source_chapter_hash:", published_text)
+    self.assertIn("章节保存后自动生成", published_text)
+
   def test_obsidian_chapter_note_backlog_keeps_many_saved_chapters_visible(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-chapter-note-backlog"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     for index in range(1, 13):
       update_chapter_content(
         self.settings,
@@ -2138,11 +2204,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
 
     state = load_project_narrative_state(Path(self.project.path))
     chapter_notes = [
@@ -2163,6 +2224,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_pending_obsidian_drafts_prioritize_target_chapter(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-target-draft-priority"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     for index in range(1, 13):
       update_chapter_content(
         self.settings,
@@ -2176,11 +2242,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
 
     detail = get_project_detail(self.settings, self.project.id)
     prompt = build_project_narrative_state_prompt(Path(self.project.path), detail, "chapter-010")
@@ -2335,7 +2396,12 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_stage_obsidian_maintenance_drafts_saves_visible_backlog(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-maintenance-stage-batch"
     vault_dir.mkdir()
-    for index in range(1, 15):
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
+    for index in range(1, 5):
       update_chapter_content(
         self.settings,
         self.project.id,
@@ -2348,18 +2414,20 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
     initial_state = load_project_narrative_state(Path(self.project.path))
     chapter_note_ids = [
       item["id"]
       for item in initial_state["obsidian_maintenance_suggestions"]
       if item["kind"] == "create_chapter_note"
     ]
-    self.assertGreaterEqual(len(chapter_note_ids), 14)
+    self.assertEqual(len(chapter_note_ids), 4)
+    initial_notes = [
+      item
+      for item in initial_state["obsidian_maintenance_suggestions"]
+      if item["id"] in chapter_note_ids
+    ]
+    self.assertTrue(all(item["status"] == "staged" for item in initial_notes))
+    self.assertTrue(all(Path(str(item["draft_path"])).exists() for item in initial_notes))
 
     result = stage_project_obsidian_maintenance_drafts(
       self.settings,
@@ -2367,7 +2435,8 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
       suggestion_ids=chapter_note_ids,
       limit=80,
     )
-    self.assertGreaterEqual(result["staged_count"], 2)
+    self.assertEqual(result["staged_count"], 0)
+    self.assertEqual(result["skipped_count"], 4)
     refreshed_state = load_project_narrative_state(Path(self.project.path))
     refreshed_notes = [
       item
@@ -2381,6 +2450,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_ignore_obsidian_maintenance_notes_hides_visible_backlog(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-maintenance-ignore-batch"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     for index in range(1, 7):
       update_chapter_content(
         self.settings,
@@ -2394,11 +2468,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
     initial_state = load_project_narrative_state(Path(self.project.path))
     chapter_note_ids = [
       item["id"]
@@ -2429,6 +2498,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_reopen_obsidian_maintenance_notes_restores_visible_backlog(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-maintenance-reopen-batch"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     for index in range(1, 7):
       update_chapter_content(
         self.settings,
@@ -2442,11 +2516,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
     initial_state = load_project_narrative_state(Path(self.project.path))
     chapter_note_ids = [
       item["id"]
@@ -2486,6 +2555,11 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
   def test_publish_obsidian_maintenance_notes_publishes_staged_drafts_to_vault(self) -> None:
     vault_dir = Path(self._temp_dir.name) / "vault-maintenance-publish-batch"
     vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     for index in range(1, 5):
       update_chapter_content(
         self.settings,
@@ -2499,11 +2573,6 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
           ),
         ),
       )
-    update_project_obsidian_config(
-      self.settings,
-      self.project.id,
-      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
-    )
     initial_state = load_project_narrative_state(Path(self.project.path))
     chapter_note_ids = [
       item["id"]
@@ -2527,6 +2596,12 @@ class ProjectNarrativeStateServiceTestCase(unittest.TestCase):
 
     self.assertEqual(result["published_count"], 4)
     self.assertEqual(result["skipped_count"], 0)
+    published_by_id = {
+      str(item.get("suggestion_id")): item
+      for item in result["published"]
+    }
+    self.assertEqual(set(published_by_id), set(chapter_note_ids))
+    self.assertTrue(all(item.get("suggestion", {}).get("status") == "published" for item in result["published"]))
     for item in result["published"]:
       relative_path = str(item["vault_relative_path"])
       target_path = vault_dir / relative_path

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from novel_backend.config import Settings
+from novel_backend.services.config_service import load_config
 from novel_backend.services.log_service import append_app_log
 from novel_backend.services.obsidian_service import (
   obsidian_note_available_for_chapter,
@@ -432,10 +433,32 @@ def build_chapter_length_guidance(
   return "\n".join(lines)
 
 
-def _context_budget_limit(kind: str, rewrite_mode: str = "") -> int:
+def _context_budget_limit(kind: str, rewrite_mode: str = "", model_max_tokens: int | None = None) -> int:
   if rewrite_mode.strip():
-    return 22_000
-  return _CONTEXT_BUDGET_BY_TASK.get(kind.strip(), 18_000)
+    base_limit = 22_000
+    hard_limit = 48_000
+  else:
+    task_kind = kind.strip()
+    base_limit = _CONTEXT_BUDGET_BY_TASK.get(task_kind, 18_000)
+    hard_limit = 36_000 if task_kind == "architecture" else 42_000
+
+  try:
+    configured_output = int(model_max_tokens or 0)
+  except (TypeError, ValueError):
+    configured_output = 0
+  if configured_output <= 8_192:
+    return base_limit
+
+  bonus = min(22_000, max(0, configured_output - 8_192) // 2)
+  return min(hard_limit, base_limit + bonus)
+
+
+def _configured_model_capacity_signal(settings: Settings) -> int | None:
+  try:
+    return int(load_config(settings).model.max_tokens)
+  except Exception as exc:  # pragma: no cover - 容量信号失败不影响章节上下文构建
+    append_app_log(settings, "context budget model capacity signal unavailable", {"error": str(exc)})
+    return None
 
 
 def _chapter_content_limit(kind: str, rewrite_mode: str = "") -> int:
@@ -479,6 +502,43 @@ def _fit_text_to_budget(
   return shortened
 
 
+def _fit_text_to_exact_budget(
+  *,
+  label: str,
+  text: str,
+  limit: int,
+  trimmed_blocks: list[ContextBudgetTrim],
+) -> str:
+  content = str(text or "").strip()
+  if len(content) <= limit:
+    return content
+  if limit <= 1:
+    shortened = content[:limit]
+  else:
+    marker = f"\n\n[{label}已按上下文预算缩短，原长 {len(content)} 字。]\n\n"
+    if limit <= len(marker) + 24:
+      shortened = f"{content[:max(0, limit - 1)].rstrip()}…"
+    else:
+      available = limit - len(marker)
+      head_chars = max(12, int(available * 0.58))
+      tail_chars = max(12, available - head_chars)
+      shortened = (
+        f"{content[:head_chars].rstrip()}"
+        f"{marker}"
+        f"{content[-tail_chars:].lstrip()}"
+      ).strip()
+      if len(shortened) > limit:
+        shortened = f"{shortened[:max(0, limit - 1)].rstrip()}…"
+  trimmed_blocks.append(
+    ContextBudgetTrim(
+      block=label,
+      original_chars=len(content),
+      kept_chars=len(shortened),
+    )
+  )
+  return shortened
+
+
 def _build_budget_report(
   *,
   original_text: str,
@@ -492,6 +552,156 @@ def _build_budget_report(
     final_chars=len(final_text),
     trimmed_blocks=trimmed_blocks,
   )
+
+
+def _context_block_label(text: str) -> str:
+  first_line = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+  if "：" in first_line:
+    return first_line.split("：", 1)[0].strip() or "上下文块"
+  return compact_text(first_line, 32) or "上下文块"
+
+
+def _context_block_weight(label: str, text: str) -> int:
+  important_keywords = (
+    "章节合同",
+    "章节任务卡",
+    "叙事状态",
+    "剧情债务",
+    "人物弧线",
+  )
+  if label in {
+    "项目记忆",
+    "本章 Obsidian 写作约束",
+    "本章 Obsidian 设定检查清单",
+  }:
+    return 5
+  if any(keyword in text[:240] for keyword in important_keywords):
+    return 5
+  if label in {
+    "当前章节",
+    "当前章节状态",
+    "上一章末尾",
+    "核心种子",
+    "章节蓝图",
+    "人物状态",
+    "滚动摘要",
+  }:
+    return 4
+  if label in {
+    "当前章节正文",
+    "Obsidian 设定笔记",
+    "任务蒸馏",
+    "参考人物",
+    "参考事件",
+    "参考资料",
+  }:
+    return 3
+  if label == "检索线索":
+    return 2
+  return 1
+
+
+def _context_block_soft_limit(label: str, text: str, context_limit: int) -> int:
+  if label == "当前章节正文":
+    return max(1_600, context_limit // 3)
+  if label in {
+    "项目记忆",
+    "本章 Obsidian 写作约束",
+    "本章 Obsidian 设定检查清单",
+  }:
+    return max(1_200, context_limit // 5)
+  if any(keyword in text[:240] for keyword in ("章节合同", "章节任务卡", "叙事状态", "剧情债务", "人物弧线")):
+    return max(1_400, context_limit // 5)
+  if label in {"Obsidian 设定笔记", "任务蒸馏"}:
+    return max(900, context_limit // 7)
+  if label in {"参考人物", "参考事件", "参考资料", "检索线索"}:
+    return max(700, context_limit // 10)
+  return max(420, context_limit // 16)
+
+
+def _fit_context_lines_to_limit(
+  *,
+  context_lines: list[str],
+  context_limit: int,
+  trimmed_blocks: list[ContextBudgetTrim],
+) -> tuple[list[str], str]:
+  joined = "\n".join(context_lines).strip()
+  if len(joined) <= context_limit:
+    return context_lines, joined
+
+  compacted_lines: list[str] = []
+  for line in context_lines:
+    label = _context_block_label(line)
+    soft_limit = _context_block_soft_limit(label, line, context_limit)
+    compacted_lines.append(
+      _fit_text_to_budget(
+        label=label,
+        text=line,
+        limit=soft_limit,
+        trimmed_blocks=trimmed_blocks,
+      )
+      if len(line) > soft_limit
+      else line
+    )
+
+  joined = "\n".join(compacted_lines).strip()
+  if len(joined) <= context_limit:
+    return compacted_lines, joined
+
+  block_count = len(compacted_lines)
+  if block_count == 0:
+    return [], ""
+  separator_chars = max(0, block_count - 1)
+  available_chars = max(1, context_limit - separator_chars)
+  labels = [_context_block_label(line) for line in compacted_lines]
+  weights = [_context_block_weight(label, line) for label, line in zip(labels, compacted_lines, strict=False)]
+  total_weight = max(1, sum(weights))
+  floor = max(24, min(220, available_chars // block_count))
+
+  allocations: list[int] = []
+  remaining = available_chars
+  for index, (line, weight) in enumerate(zip(compacted_lines, weights, strict=False)):
+    if remaining <= 0:
+      allocations.append(0)
+      continue
+    remaining_items = block_count - index - 1
+    reserved_for_rest = min(remaining, floor * remaining_items)
+    max_for_current = max(0, remaining - reserved_for_rest)
+    ideal = max(floor, int(available_chars * weight / total_weight))
+    budget = min(len(line), remaining, max_for_current, ideal)
+    allocations.append(max(0, budget))
+    remaining -= allocations[-1]
+
+  if remaining > 0:
+    for index in sorted(range(block_count), key=lambda item: weights[item], reverse=True):
+      capacity = len(compacted_lines[index]) - allocations[index]
+      if capacity <= 0:
+        continue
+      extra = min(capacity, remaining)
+      allocations[index] += extra
+      remaining -= extra
+      if remaining <= 0:
+        break
+
+  final_lines = [
+    _fit_text_to_exact_budget(
+      label=label,
+      text=line,
+      limit=max(0, budget),
+      trimmed_blocks=trimmed_blocks,
+    )
+    for label, line, budget in zip(labels, compacted_lines, allocations, strict=False)
+  ]
+  final_text = "\n".join(final_lines).strip()
+  if len(final_text) > context_limit:
+    final_text = _fit_text_to_exact_budget(
+      label="完整上下文",
+      text=final_text,
+      limit=context_limit,
+      trimmed_blocks=trimmed_blocks,
+    )
+    final_lines = [final_text]
+  return final_lines, final_text
 
 
 def project_documents_map(project_detail, overrides: dict[str, str] | None = None) -> dict[str, str]:
@@ -1111,7 +1321,12 @@ def build_project_context_bundle(
     for item in knowledge_hits
   ) or "无"
   memory_text = "\n".join(_memory_lines(project_detail)) or "无"
-  context_limit = _context_budget_limit(resolved_task_pack_kind, rewrite_mode)
+  model_capacity_signal = _configured_model_capacity_signal(settings)
+  context_limit = _context_budget_limit(
+    resolved_task_pack_kind,
+    rewrite_mode,
+    model_max_tokens=model_capacity_signal,
+  )
   trimmed_blocks: list[ContextBudgetTrim] = []
 
   context_lines = [
@@ -1218,7 +1433,11 @@ def build_project_context_bundle(
     )
     context_lines[-1] = f"检索线索：\n{compacted_knowledge or '无'}"
 
-  final_context_text = "\n".join(context_lines).strip()
+  context_lines, final_context_text = _fit_context_lines_to_limit(
+    context_lines=context_lines,
+    context_limit=context_limit,
+    trimmed_blocks=trimmed_blocks,
+  )
   budget_report = _build_budget_report(
     original_text=original_context_text,
     final_text=final_context_text,

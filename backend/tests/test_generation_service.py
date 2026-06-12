@@ -48,6 +48,7 @@ from novel_backend.services.generation_service import (
   _run_continuation_pipeline,
   architecture_step_stream,
   architecture_stream,
+  chapter_workflow_prompt_preview,
   chapter_workflow_stream,
 )
 from novel_backend.services.project_service import (
@@ -300,6 +301,49 @@ class GenerationServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["headline"], "这一章最该先把冲突抬起来。")
     self.assertEqual(result_event[1]["scenes"][0]["title"], "雨夜取钥匙")
     self.assertEqual(events[-1][1]["status"], "completed")
+
+  def test_chapter_workflow_draft_prompt_preview_does_not_call_model(self) -> None:
+    save_config(
+      self.settings,
+      ModelConfig(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model_name="demo-model",
+      ),
+    )
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="续写预览",
+        genre="悬疑",
+        target_chapters=3,
+        target_words=60000,
+      ),
+    )
+    update_chapter_content(
+      self.settings,
+      project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追握住铜钥匙，门外有人停步。\n"),
+    )
+
+    with patch("novel_backend.services.generation_service._request_chat_completion") as request_mock:
+      preview = chapter_workflow_prompt_preview(
+        self.settings,
+        ChapterWorkflowRequest(
+          project_id=project.id,
+          chapter_id="chapter-001",
+          mode="draft",
+          instruction="继续写门外逼近的压力。",
+          target_words=900,
+        ),
+      )
+
+    request_mock.assert_not_called()
+    self.assertEqual(preview.chapter_id, "chapter-001")
+    self.assertIn("继续写门外逼近的压力", preview.editable_prompt)
+    self.assertIn("连续性证据包", preview.editable_prompt)
+    self.assertEqual(preview.messages[0].role, "system")
 
   def test_chapter_workflow_prompt_carries_reference_blocks_for_source_continuation(self) -> None:
     save_config(
@@ -919,6 +963,7 @@ status: canonical
     def fake_pipeline(_settings, **kwargs):
       self.assertEqual(kwargs["target_words"], 900)
       self.assertFalse(kwargs["prefer_project_budget"])
+      self.assertEqual(kwargs["prompt_override"], "用户改写后的续写提示词")
       return {
         "headline": "短正文",
         "summary": "按调用方目标生成。",
@@ -937,12 +982,109 @@ status: canonical
           mode="draft",
           instruction="生成短测试正文。",
           target_words=900,
+          prompt_override="用户改写后的续写提示词",
         ),
         "workflow-target-test",
       )
 
     self.assertEqual(result.headline, "短正文")
     self.assertEqual(result.draft, "# 第一章\n短正文继续推进。")
+
+  def test_prompt_override_continuation_still_runs_candidate_judge(self) -> None:
+    project = create_project(
+      self.settings,
+      CreateProjectRequest(
+        name="编辑提示词审校",
+        genre="悬疑",
+        target_chapters=3,
+        target_words=30000,
+      ),
+    )
+    update_chapter_content(
+      self.settings,
+      project.id,
+      "chapter-001",
+      ChapterUpdateRequest(content="# 第一章 雨夜靠港\n林追握住铜钥匙，门外有人停步。\n"),
+    )
+    detail = get_project_detail(self.settings, project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+    scene_result = ChapterWorkflowResult(
+      task_id="scene-plan",
+      mode="scenes",
+      headline="场景计划",
+      summary="继续推进追查。",
+      checklist=[],
+      scenes=[
+        ChapterWorkflowScene(
+          title="门外脚步",
+          goal="让追查者进入场",
+          conflict="林追不能暴露钥匙来源",
+          turn="脚步声停在门口",
+        )
+      ],
+      draft="",
+      next_action="继续写。",
+    )
+    fake_plan = {
+      "bundle": SimpleNamespace(context_text="项目上下文"),
+      "chapter": chapter,
+      "evidence_hits": [],
+      "evidence_text": "证据块",
+      "canon": {
+        "summary": "铜钥匙不能丢。",
+        "must_keep": ["林追持有铜钥匙"],
+        "current_state": ["门外有人"],
+        "voice_rules": ["克制"],
+        "blocked_changes": ["不能提前暴露身份"],
+        "next_action": "继续保持压力。",
+      },
+      "scene_result": scene_result,
+    }
+    partial_calls: list[list[dict[str, object]]] = []
+    judge_calls: list[str] = []
+
+    def fake_partial(_settings, messages, **_kwargs):
+      partial_calls.append(messages)
+      return "林追没有开门，只把铜钥匙藏进袖中。"
+
+    def fake_judge(_settings, **kwargs):
+      judge_calls.append(str(kwargs["content"]))
+      return {
+        "summary": "承接事实、人物口气和可读性都可用。",
+        "score": 91,
+        "passed": True,
+        "issues": [],
+        "rewrite_focus": [],
+        "next_action": "继续写下一章。",
+      }
+
+    with patch(
+      "novel_backend.services.generation_service._generate_continuation_plan",
+      return_value=fake_plan,
+    ), patch(
+      "novel_backend.services.generation_service._invoke_partial_model",
+      side_effect=fake_partial,
+    ), patch(
+      "novel_backend.services.generation_service._check_continuation_conflicts",
+      return_value={"summary": "没有硬冲突。", "next_action": "继续。"},
+    ), patch(
+      "novel_backend.services.generation_service._judge_continuation",
+      side_effect=fake_judge,
+    ):
+      result = _run_continuation_pipeline(
+        self.settings,
+        project_id=project.id,
+        chapter_id="chapter-001",
+        instruction="继续写当前章节。",
+        target_words=1200,
+        prompt_override="用户编辑后的完整章节提示词",
+      )
+
+    self.assertEqual(partial_calls[0][-1]["content"], "用户编辑后的完整章节提示词")
+    self.assertEqual(len(judge_calls), 1)
+    self.assertEqual(result["selected_candidate_id"], "edited-prompt")
+    self.assertEqual(result["candidate_judge"]["score"], 91)
+    self.assertIn("承接事实、人物口气和可读性都可用", result["summary"])
 
   def test_segmented_continuation_adds_sections_until_length_target(self) -> None:
     project = create_project(

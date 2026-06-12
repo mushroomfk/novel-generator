@@ -459,8 +459,8 @@ def initialize_app_storage(settings: Settings) -> None:
     {
       "id": "obsidian-vault",
       "badge": "Ob",
-      "name": "Obsidian 知识库",
-      "description": "把已有 Vault 作为可选设定来源，同步双链、标签和正式笔记。",
+      "name": "长篇稳定档案",
+      "description": "使用项目内 Vault 服务长篇写作，也可接入已有 Obsidian Vault。",
       "category": "工具",
       "scenes": ["资料", "知识图谱", "设定"],
       "accent": "olive",

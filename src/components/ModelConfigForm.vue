@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref, watch } from 'vue';
+import { reactive, ref, watch } from 'vue';
 import { testModelConfig, updateModelConfig } from '../lib/api.js';
 
 const MODEL_PRESETS = [
@@ -23,13 +23,6 @@ const MODEL_PRESETS = [
   },
 ];
 
-const TOKEN_BUDGET_PRESETS = [
-  { value: 4096, label: '普通章节', helper: '适合短任务、资料整理和普通章节续写。' },
-  { value: 8192, label: '长章节', helper: '适合多数长篇章节生成。' },
-  { value: 16000, label: '超长章节', helper: '适合长上下文、批量续写和复杂修订。' },
-  { value: 24000, label: '大纲到正文', helper: '适合一次携带大量设定和章节证据。' },
-];
-
 const LOCAL_EMBEDDING_CONFIG = {
   provider: 'local-fastembed',
   base_url: 'builtin://bge-small-zh-v1.5',
@@ -39,6 +32,8 @@ const LOCAL_EMBEDDING_CONFIG = {
   retrieval_k: 6,
   batch_size: 8,
 };
+
+const AUTOMATIC_WRITING_MAX_TOKENS = 8192;
 
 const props = defineProps({
   config: {
@@ -86,11 +81,6 @@ const isSaving = ref(false);
 const isTesting = ref(false);
 const message = ref('');
 const messageTone = ref('');
-
-const selectedTokenPreset = computed(() => (
-  TOKEN_BUDGET_PRESETS.find((item) => item.value === Number(form.model.max_tokens))
-  ?? TOKEN_BUDGET_PRESETS[1]
-));
 
 function normalizeDimensions(value) {
   if (value === '' || value === null || value === undefined) {
@@ -147,7 +137,7 @@ function modelPayloadFromForm() {
     base_url: form.model.base_url,
     api_key: form.model.api_key,
     model_name: form.model.model_name,
-    max_tokens: Number(form.model.max_tokens) || 8192,
+    max_tokens: AUTOMATIC_WRITING_MAX_TOKENS,
   };
 }
 
@@ -181,21 +171,36 @@ function testItemText(item) {
   return `${item.label} ${statusText}${item.message ? `：${item.message}` : ''}`;
 }
 
-async function testCurrentConfig() {
+function testResultText(result) {
+  return (result.items ?? []).map(testItemText).join('；') || '没有可检测的模型配置';
+}
+
+async function runAutomaticConfigTest(payload) {
   isTesting.value = true;
-  message.value = '';
+  message.value = '写作设置已保存，正在自动检测模型。';
   messageTone.value = '';
 
   try {
     const result = await testModelConfig({
-      ...settingsPayloadFromForm(),
+      ...payload,
       target: 'all',
     });
-    messageTone.value = result.status === 'passed' ? 'success' : result.status === 'skipped' ? '' : 'error';
-    message.value = (result.items ?? []).map(testItemText).join('；') || '没有可测试的模型配置';
+    const detail = testResultText(result);
+    if (result.status === 'passed') {
+      messageTone.value = 'success';
+      message.value = `写作设置已保存，模型自动检测通过：${detail}`;
+    } else if (result.status === 'skipped') {
+      messageTone.value = '';
+      message.value = `写作设置已保存，模型自动检测未执行：${detail}`;
+    } else {
+      messageTone.value = 'error';
+      message.value = `写作设置已保存，但模型自动检测失败：${detail}`;
+    }
   } catch (error) {
     messageTone.value = 'error';
-    message.value = error instanceof Error ? error.message : '模型配置测试失败';
+    message.value = error instanceof Error
+      ? `写作设置已保存，但模型自动检测失败：${error.message}`
+      : '写作设置已保存，但模型自动检测失败';
   } finally {
     isTesting.value = false;
   }
@@ -207,10 +212,10 @@ async function save() {
   messageTone.value = '';
 
   try {
-    await updateModelConfig(settingsPayloadFromForm());
-    message.value = '写作设置已保存';
-    messageTone.value = 'success';
+    const payload = settingsPayloadFromForm();
+    await updateModelConfig(payload);
     emit('updated');
+    await runAutomaticConfigTest(payload);
   } catch (error) {
     messageTone.value = 'error';
     message.value =
@@ -281,23 +286,10 @@ async function save() {
           <small class="field-helper">保存在本机配置里；留空时读取 `NOVEL_MODEL_API_KEY`、`DASHSCOPE_API_KEY`、`ARK_API_KEY` 等环境变量。</small>
         </label>
 
-        <label>
-          <span>篇幅能力</span>
-          <select v-model.number="form.model.max_tokens">
-            <option
-              v-for="preset in TOKEN_BUDGET_PRESETS"
-              :key="preset.value"
-              :value="preset.value"
-            >
-              {{ preset.label }}
-            </option>
-          </select>
-          <small class="field-helper">{{ selectedTokenPreset.helper }}</small>
-        </label>
-
         <div class="auto-panel smart-panel">
-          <p class="auto-title">智能参数</p>
-          <p class="auto-copy">写作风格参数由系统处理，避免部分模型因为不支持附加项而报错。</p>
+          <p class="auto-title">写作参数自动处理</p>
+          <p class="auto-copy">章节长度按作品目标、当前章节任务和你的明确要求处理；输出容量和写作风格参数由系统分配。</p>
+          <p class="auto-copy">保存后会自动检测写作模型、本地资料检索和已启用的第二审查模型。</p>
         </div>
 
         <details class="advanced-group">
@@ -479,19 +471,10 @@ async function save() {
 
         <div class="form-actions">
           <button
-            class="secondary-action"
-            :disabled="isSaving || isTesting"
-            type="button"
-            @click="testCurrentConfig"
-          >
-            {{ isTesting ? '测试中…' : '测试当前配置' }}
-          </button>
-
-          <button
             :disabled="isSaving || isTesting"
             type="submit"
           >
-            {{ isSaving ? '保存中…' : '保存写作设置' }}
+            {{ isTesting ? '检测中…' : isSaving ? '保存中…' : '保存写作设置' }}
           </button>
         </div>
       </form>

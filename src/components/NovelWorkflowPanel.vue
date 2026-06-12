@@ -12,6 +12,8 @@ import {
   importProjectKnowledgeFiles,
   listStyles,
   listXpPresets,
+  previewChapterGeneratePrompt,
+  previewChapterWorkflowPrompt,
   saveProjectAgentThreads,
   updateProjectMemory,
 } from '../lib/api.js';
@@ -99,6 +101,10 @@ const architectureForm = reactive({
 const architectureConfirmOpen = ref(false);
 const architectureSessionActive = ref(false);
 const planConfirmOpen = ref(false);
+const planPromptPreviews = ref([]);
+const planPromptPreviewLoading = ref(false);
+const planPromptPreviewError = ref('');
+const planPromptPreviewMessage = ref('');
 const forceDiscussionMode = ref(false);
 let discussionLoadSequence = 0;
 let remotePersistInFlight = false;
@@ -164,6 +170,25 @@ const previewMode = computed(() => {
   }
   return props.selectedChapter ? 'chapter' : 'project';
 });
+
+const planPromptActions = computed(() => {
+  const actions = Array.isArray(pendingPlan.value?.actions) ? pendingPlan.value.actions : [];
+  return actions
+    .map((action, index) => ({ action, index }))
+    .filter(({ action }) => (
+      action?.kind === 'chapter_generate'
+      || (action?.kind === 'chapter_workflow' && (action.mode || '') === 'draft')
+    ));
+});
+
+const planConfirmDisabled = computed(() => (
+  running.value
+  || planPromptPreviewLoading.value
+  || (
+    planPromptActions.value.length > 0
+    && (Boolean(planPromptPreviewError.value) || planPromptPreviews.value.length !== planPromptActions.value.length)
+  )
+));
 
 const hasPreviewChapter = computed(() => Boolean(props.selectedChapter));
 
@@ -665,6 +690,10 @@ watch(
   () => {
     architectureConfirmOpen.value = false;
     planConfirmOpen.value = false;
+    planPromptPreviews.value = [];
+    planPromptPreviewLoading.value = false;
+    planPromptPreviewError.value = '';
+    planPromptPreviewMessage.value = '';
     forceDiscussionMode.value = false;
     architectureSessionActive.value = false;
   },
@@ -775,6 +804,104 @@ function openPlanConfirmModal() {
   }
 
   planConfirmOpen.value = true;
+  void loadPlanPromptPreviews();
+}
+
+function chapterTitleFromAction(action) {
+  const chapter = (props.project?.chapters ?? []).find((item) => item.id === action?.chapter_id);
+  if (!chapter) {
+    return '章节提示词';
+  }
+  return `第 ${chapter.index} 章《${chapter.title}》`;
+}
+
+function chapterGeneratePreviewPayload(action) {
+  return {
+    project_id: props.project.id,
+    chapter_id: action.chapter_id || props.selectedChapterId,
+    instruction: String(action.instruction ?? '').trim(),
+    target_words: Number(action.target_words || 0),
+    style_name: String(action.style_name || executionOptions.styleName || '').trim(),
+    xp_preset: String(action.xp_preset || executionOptions.xpPreset || '').trim(),
+    characters_involved: String(action.characters_involved || executionOptions.charactersInvolved || '').trim(),
+    key_items: String(action.key_items || executionOptions.keyItems || '').trim(),
+    scene_location: String(action.scene_location || executionOptions.sceneLocation || '').trim(),
+    time_constraint: String(action.time_constraint || executionOptions.timeConstraint || '').trim(),
+  };
+}
+
+function chapterWorkflowPreviewPayload(action) {
+  return {
+    project_id: props.project.id,
+    chapter_id: action.chapter_id || props.selectedChapterId,
+    mode: action.mode || 'draft',
+    instruction: String(action.instruction ?? '').trim(),
+    target_words: Number(action.target_words || 1800),
+  };
+}
+
+async function loadPlanPromptPreviews() {
+  planPromptPreviewMessage.value = '';
+  planPromptPreviewError.value = '';
+  planPromptPreviews.value = [];
+  const promptActions = planPromptActions.value;
+  if (!props.project?.id || promptActions.length === 0) {
+    return;
+  }
+
+  planPromptPreviewLoading.value = true;
+  try {
+    const previews = await Promise.all(promptActions.map(async ({ action, index }) => {
+      const payload = action.kind === 'chapter_generate'
+        ? chapterGeneratePreviewPayload(action)
+        : chapterWorkflowPreviewPayload(action);
+      const preview = action.kind === 'chapter_generate'
+        ? await previewChapterGeneratePrompt(payload)
+        : await previewChapterWorkflowPrompt(payload);
+      return {
+        actionIndex: index,
+        actionKind: action.kind,
+        title: preview.title || chapterTitleFromAction(action),
+        editablePrompt: preview.editable_prompt || '',
+        promptText: preview.prompt_text || '',
+      };
+    }));
+    planPromptPreviews.value = previews;
+  } catch (error) {
+    planPromptPreviewError.value = error instanceof Error ? error.message : '章节提示词预览生成失败';
+  } finally {
+    planPromptPreviewLoading.value = false;
+  }
+}
+
+async function copyPlanPromptPreview(item) {
+  const text = String(item?.editablePrompt ?? '').trim();
+  if (!text) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    planPromptPreviewMessage.value = '提示词已复制';
+  } catch {
+    planPromptPreviewMessage.value = '复制失败，可以手动选择文本复制';
+  }
+}
+
+function planWithEditedPrompts(plan) {
+  const previewByIndex = new Map(planPromptPreviews.value.map((item) => [item.actionIndex, item]));
+  return {
+    ...plan,
+    actions: (plan.actions ?? []).map((action, index) => {
+      const preview = previewByIndex.get(index);
+      if (!preview) {
+        return action;
+      }
+      return {
+        ...action,
+        prompt_override: String(preview.editablePrompt ?? '').trim(),
+      };
+    }),
+  };
 }
 
 function buildDiscussionMessageId() {
@@ -1621,6 +1748,14 @@ function isExplicitExecutionRequest(value) {
 }
 
 function shouldAutoExecutePlan(userContent, plan) {
+  const actions = Array.isArray(plan?.actions) ? plan.actions : [];
+  const hasChapterPrompt = actions.some((action) => (
+    action?.kind === 'chapter_generate'
+    || (action?.kind === 'chapter_workflow' && (action.mode || '') === 'draft')
+  ));
+  if (hasChapterPrompt) {
+    return false;
+  }
   return Boolean(plan?.requires_confirmation) && isExplicitExecutionRequest(userContent);
 }
 
@@ -2037,10 +2172,13 @@ async function handleConfirmPlan() {
   if (!pendingPlan.value) {
     return;
   }
+  if (planConfirmDisabled.value) {
+    return;
+  }
 
   planConfirmOpen.value = false;
   await sendConversation({
-    approvedPlan: pendingPlan.value,
+    approvedPlan: planWithEditedPrompts(pendingPlan.value),
     userContent: '确认执行。',
   });
 }
@@ -2051,6 +2189,9 @@ function handleCancelPlan() {
   }
 
   planConfirmOpen.value = false;
+  planPromptPreviews.value = [];
+  planPromptPreviewError.value = '';
+  planPromptPreviewMessage.value = '';
   const systemMessage = createMessage({
     role: 'system',
     content: '当前计划已取消。你可以直接发新要求，我会按新的请求重新判断。',
@@ -2700,6 +2841,7 @@ onBeforeUnmount(() => {
       <div
         v-if="planConfirmOpen && pendingPlan"
         class="modal-overlay"
+        data-testid="agent-plan-confirm-modal"
         @click.self="planConfirmOpen = false"
       >
         <section
@@ -2740,6 +2882,56 @@ onBeforeUnmount(() => {
               </li>
             </ol>
 
+            <section
+              v-if="planPromptActions.length"
+              class="chapter-prompt-preview"
+              data-testid="agent-plan-prompt-preview"
+            >
+              <div class="chapter-prompt-preview-head">
+                <div>
+                  <strong>章节提示词</strong>
+                  <p>确认后将使用这里编辑后的内容生成正文。</p>
+                </div>
+                <span v-if="planPromptPreviewLoading">读取中…</span>
+              </div>
+              <p
+                v-if="planPromptPreviewError"
+                class="prompt-preview-error"
+                data-testid="agent-plan-prompt-error"
+              >
+                {{ planPromptPreviewError }}
+              </p>
+              <p
+                v-else-if="planPromptPreviewMessage"
+                class="prompt-preview-message"
+                data-testid="agent-plan-prompt-message"
+              >
+                {{ planPromptPreviewMessage }}
+              </p>
+              <article
+                v-for="item in planPromptPreviews"
+                :key="item.actionIndex"
+                class="chapter-prompt-preview-item"
+              >
+                <div class="chapter-prompt-preview-item-head">
+                  <strong>{{ item.title }}</strong>
+                  <button
+                    class="secondary-button small-button"
+                    type="button"
+                    @click="copyPlanPromptPreview(item)"
+                  >
+                    复制提示词
+                  </button>
+                </div>
+                <textarea
+                  v-model="item.editablePrompt"
+                  class="chapter-prompt-editor"
+                  data-testid="agent-plan-prompt-editor"
+                  rows="12"
+                />
+              </article>
+            </section>
+
             <div class="architecture-confirm-actions">
               <button
                 class="secondary-button"
@@ -2749,12 +2941,13 @@ onBeforeUnmount(() => {
                 取消
               </button>
               <button
-                :disabled="running"
+                :disabled="planConfirmDisabled"
                 class="primary-button"
+                data-testid="agent-plan-confirm-execute-button"
                 type="button"
                 @click="handleConfirmPlan"
               >
-                {{ running ? '执行中…' : '确认执行' }}
+                {{ running ? '执行中…' : planPromptPreviewLoading ? '读取提示词…' : '确认执行' }}
               </button>
             </div>
           </div>
@@ -3635,6 +3828,57 @@ onBeforeUnmount(() => {
 
 .plan-list-modal {
   padding-left: 20px;
+}
+
+.chapter-prompt-preview {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  padding: 12px;
+  background: #f6f8fa;
+}
+
+.chapter-prompt-preview-head,
+.chapter-prompt-preview-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chapter-prompt-preview-head p {
+  margin: 4px 0 0;
+  color: #57606a;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chapter-prompt-preview-head span,
+.prompt-preview-message {
+  color: #57606a;
+  font-size: 12px;
+}
+
+.prompt-preview-error {
+  margin: 0;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chapter-prompt-preview-item {
+  display: grid;
+  gap: 8px;
+}
+
+.chapter-prompt-editor {
+  min-height: 260px;
+  max-height: 460px;
+  resize: vertical;
+  font-family: 'SFMono-Regular', ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.7;
 }
 
 .primary-button,

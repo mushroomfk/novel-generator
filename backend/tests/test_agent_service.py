@@ -1694,6 +1694,13 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertTrue(Path(saved_path).exists())
 
   def test_knowledge_review_reuses_distillation_report_before_model_analysis(self) -> None:
+    vault_dir = Path(self._temp_dir.name) / "agent-distillation-empty-vault"
+    vault_dir.mkdir()
+    update_project_obsidian_config(
+      self.settings,
+      self.project.id,
+      ObsidianVaultConfig(enabled=True, vault_path=str(vault_dir), allowed_statuses=["canonical"]),
+    )
     import_project_knowledge(
       self.settings,
       self.project.id,

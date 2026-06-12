@@ -275,11 +275,11 @@ export const skillSections = [
       },
       {
         id: 'obsidian-vault',
-        badge: 'Ob',
-        name: 'Obsidian 知识库',
-        description: '把已有 Vault 作为可选设定来源，同步双链、标签和正式笔记。',
+        badge: '档',
+        name: '长篇稳定档案',
+        description: '同步 Obsidian Vault，用于章节档案、人物状态和写作约束。',
         category: '工具',
-        scenes: ['资料', '知识图谱', '设定'],
+        scenes: ['长篇', '档案', '设定'],
         accent: 'olive',
       },
       {

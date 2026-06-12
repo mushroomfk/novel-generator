@@ -480,6 +480,8 @@ class StoryOverview(BaseModel):
   knowledge_hits: list[KnowledgeSearchResult] = Field(default_factory=list)
   materials: list[KnowledgeMaterial] = Field(default_factory=list)
   obsidian: ObsidianVaultState = Field(default_factory=ObsidianVaultState)
+  obsidian_maintenance_summary: dict[str, object] = Field(default_factory=dict)
+  obsidian_maintenance_suggestions: list[dict[str, object]] = Field(default_factory=list)
   memory_entries: list[ProjectMemoryEntry] = Field(default_factory=list)
   dream_report: ProjectDreamReport | None = None
   distillation_report: ProjectDistillationReport | None = None
@@ -743,6 +745,7 @@ class ChapterWorkflowRequest(BaseModel):
   mode: str = Field(default="diagnose", min_length=1, max_length=32)
   instruction: str = Field(default="", max_length=2000)
   target_words: int = Field(default=1500, ge=300, le=30000)
+  prompt_override: str = Field(default="", max_length=600000)
 
 
 class ChapterWorkflowResult(BaseModel):
@@ -754,6 +757,20 @@ class ChapterWorkflowResult(BaseModel):
   scenes: list[ChapterWorkflowScene] = Field(default_factory=list)
   draft: str = ""
   next_action: str = ""
+
+
+class PromptPreviewMessage(BaseModel):
+  role: str = Field(pattern="^(user|assistant|system)$")
+  content: str
+
+
+class ChapterPromptPreviewResponse(BaseModel):
+  title: str
+  chapter_id: str
+  chapter_index: int
+  prompt_text: str
+  editable_prompt: str
+  messages: list[PromptPreviewMessage] = Field(default_factory=list)
 
 
 class BrainstormMessage(BaseModel):
@@ -873,6 +890,7 @@ class AgentPlanAction(BaseModel):
   key_items: str = Field(default="", max_length=500)
   scene_location: str = Field(default="", max_length=300)
   time_constraint: str = Field(default="", max_length=300)
+  prompt_override: str = Field(default="", max_length=600000)
   skill_ids: list[str] = Field(default_factory=list, max_length=5)
 
 
@@ -1034,6 +1052,7 @@ class ChapterGenerateRequest(BaseModel):
   key_items: str = Field(default="", max_length=500)
   scene_location: str = Field(default="", max_length=300)
   time_constraint: str = Field(default="", max_length=300)
+  prompt_override: str = Field(default="", max_length=600000)
 
 
 class ChapterGenerateResult(BaseModel):
@@ -1088,6 +1107,7 @@ class BatchGenerateRequest(BaseModel):
   instruction: str = Field(default="", max_length=2000)
   style_name: str = Field(default="", max_length=80)
   xp_preset: str = Field(default="", max_length=80)
+  prompt_overrides: dict[str, str] = Field(default_factory=dict)
   task_id: str = Field(default="", max_length=80)
   retry_failed: bool = False
   comment: str = Field(default="", max_length=1000)

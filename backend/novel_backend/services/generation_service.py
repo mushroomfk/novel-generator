@@ -15,10 +15,12 @@ from novel_backend.models import (
   ArchitectureStepRequest,
   ArchitectureStepResult,
   ArchitectureWorkspace,
+  ChapterPromptPreviewResponse,
   ChapterWorkflowRequest,
   ChapterWorkflowResult,
   ChapterWorkflowScene,
   ModelConfig,
+  PromptPreviewMessage,
 )
 from novel_backend.services.config_service import load_config
 from novel_backend.services.continuity_guard_service import ContinuityGuardContext, build_continuity_guard_context
@@ -630,6 +632,41 @@ def _invoke_partial_model(
     temperature=temperature,
     max_tokens=max_tokens,
     enable_thinking=enable_thinking,
+  )
+
+
+def _normalize_prompt_messages(messages: list[dict[str, object]]) -> list[PromptPreviewMessage]:
+  normalized: list[PromptPreviewMessage] = []
+  for item in messages:
+    role = str(item.get("role") or "user").strip()
+    if role not in {"system", "user", "assistant"}:
+      role = "user"
+    normalized.append(PromptPreviewMessage(role=role, content=str(item.get("content") or "")))
+  return normalized
+
+
+def _flatten_prompt_messages(messages: list[dict[str, object]]) -> str:
+  return "\n\n".join(
+    f"[{item.get('role', 'user')}]\n{item.get('content', '')}"
+    for item in messages
+  ).strip()
+
+
+def _chapter_prompt_preview_response(
+  *,
+  title: str,
+  chapter_id: str,
+  chapter_index: int,
+  messages: list[dict[str, object]],
+  editable_prompt: str,
+) -> ChapterPromptPreviewResponse:
+  return ChapterPromptPreviewResponse(
+    title=title,
+    chapter_id=chapter_id,
+    chapter_index=chapter_index,
+    prompt_text=_flatten_prompt_messages(messages),
+    editable_prompt=editable_prompt,
+    messages=_normalize_prompt_messages(messages),
   )
 
 
@@ -2219,25 +2256,15 @@ def _run_segmented_continuation_pipeline(
   }
 
 
-def _run_continuation_pipeline(
-  settings: Settings,
-  *,
-  project_id: str,
-  chapter_id: str,
+def _resolve_continuation_length_targets(
+  project_detail,
+  chapter_for_length,
   instruction: str,
   target_words: int,
-  support_text: str = "",
-  characters_involved: str = "",
-  key_items: str = "",
-  scene_location: str = "",
-  time_constraint: str = "",
-  task_name_prefix: str = "chapter_generate",
-  candidate_count: int = 1,
+  *,
   prefer_project_budget: bool = False,
   complete_chapter: bool = False,
 ) -> dict[str, object]:
-  project_detail = get_project_detail(settings, project_id)
-  chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
   explicit_target = explicit_length_target(instruction)
   explicit_length_requested = instruction_requests_explicit_length(instruction)
   full_chapter_requested = instruction_requests_full_chapter(instruction)
@@ -2271,6 +2298,295 @@ def _run_continuation_pipeline(
       completion_target_words = current_words + target_words
   elif len(segment_targets) > 1:
     completion_target_words = current_words + target_words
+  return {
+    "target_words": target_words,
+    "length_guidance": length_guidance,
+    "segment_targets": segment_targets,
+    "completion_target_words": completion_target_words,
+  }
+
+
+def _run_prompt_override_continuation_pipeline(
+  settings: Settings,
+  *,
+  project_id: str,
+  chapter_id: str,
+  instruction: str,
+  prompt_override: str,
+  target_words: int,
+  length_guidance: str,
+  support_text: str = "",
+  characters_involved: str = "",
+  key_items: str = "",
+  scene_location: str = "",
+  time_constraint: str = "",
+  task_name_prefix: str = "chapter_generate",
+) -> dict[str, object]:
+  plan = _generate_continuation_plan(
+    settings,
+    project_id=project_id,
+    chapter_id=chapter_id,
+    instruction=instruction,
+    target_words=target_words,
+    support_text=support_text,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
+  bundle = plan["bundle"]
+  evidence_text = str(plan["evidence_text"])
+  canon = dict(plan["canon"])
+  scene_result = plan["scene_result"]
+  prefix = _continuation_prefix(plan["chapter"])
+  suffix = _invoke_partial_model(
+    settings,
+    [
+      {"role": "system", "content": _CONTINUATION_WRITE_SYSTEM_PROMPT},
+      {"role": "user", "content": prompt_override.strip()},
+    ],
+    prefix=prefix,
+    task_name=f"{task_name_prefix}:prompt_override:partial",
+    temperature=0.82,
+    max_tokens=max(1200, target_words * 2),
+    enable_thinking=False,
+  )
+  suffix = _strip_repeated_partial_prefix(prefix, suffix)
+  content = f"{prefix}{suffix}".strip()
+  conflict_report = _check_continuation_conflicts(
+    settings,
+    context_text=bundle.context_text,
+    evidence_text=evidence_text,
+    brief=canon,
+    content=content,
+  )
+  repair_applied = False
+  repair_notes: list[str] = []
+  if _conflict_report_has_hard_conflict(conflict_report):
+    content = _repair_continuation_with_guard(
+      settings,
+      context_text=bundle.context_text,
+      evidence_text=evidence_text,
+      brief=canon,
+      conflict_report=conflict_report,
+      content=content,
+      support_text=support_text,
+    )
+    repair_applied = True
+    repair_notes.append("检测到硬冲突，已修订一次。")
+    conflict_report = _check_continuation_conflicts(
+      settings,
+      context_text=bundle.context_text,
+      evidence_text=evidence_text,
+      brief=canon,
+      content=content,
+    )
+  judge = _judge_continuation(
+    settings,
+    context_text=bundle.context_text,
+    evidence_text=evidence_text,
+    canon=canon,
+    scene_result=scene_result,
+    content=content,
+  )
+  if not bool(judge.get("passed")) and judge.get("rewrite_focus"):
+    content = _repair_continuation(
+      settings,
+      context_text=bundle.context_text,
+      evidence_text=evidence_text,
+      canon=canon,
+      scene_result=scene_result,
+      content=content,
+      rewrite_focus=[str(item) for item in judge.get("rewrite_focus") or []],
+      support_text=support_text,
+    )
+    repair_applied = True
+    repair_notes.append("候选审校后已修订一次。")
+    judge = _judge_continuation(
+      settings,
+      context_text=bundle.context_text,
+      evidence_text=evidence_text,
+      canon=canon,
+      scene_result=scene_result,
+      content=content,
+    )
+    conflict_report = _check_continuation_conflicts(
+      settings,
+      context_text=bundle.context_text,
+      evidence_text=evidence_text,
+      brief=canon,
+      content=content,
+    )
+  summary_parts = [
+    "已使用用户确认并编辑后的提示词生成正文。",
+    length_guidance,
+    str(judge.get("summary") or "").strip(),
+    str(conflict_report.get("summary") or "").strip(),
+    *repair_notes,
+  ]
+  checklist = [
+    *_object_text_list(canon.get("must_keep")),
+    *_object_text_list(canon.get("blocked_changes")),
+  ][:8]
+  return {
+    "content": content,
+    "summary": "\n".join(item for item in summary_parts if item),
+    "next_action": str(judge.get("next_action") or conflict_report.get("next_action") or canon.get("next_action") or "").strip(),
+    "headline": "章节初稿已修订" if repair_applied else "章节初稿已生成",
+    "scenes": list(getattr(scene_result, "scenes", []) or []),
+    "checklist": checklist,
+    "brief": canon,
+    "conflict_report": conflict_report,
+    "candidate_count": 1,
+    "selected_candidate_id": "edited-prompt",
+    "selected_candidate_label": "编辑提示词",
+    "candidate_judge": judge,
+    "repair_applied": repair_applied,
+    "evidence_hits": plan["evidence_hits"],
+    "prompt_override_used": True,
+  }
+
+
+def build_continuation_prompt_preview(
+  settings: Settings,
+  *,
+  project_id: str,
+  chapter_id: str,
+  instruction: str,
+  target_words: int,
+  support_text: str = "",
+  characters_involved: str = "",
+  key_items: str = "",
+  scene_location: str = "",
+  time_constraint: str = "",
+  prefer_project_budget: bool = False,
+  complete_chapter: bool = False,
+) -> ChapterPromptPreviewResponse:
+  project_detail = get_project_detail(settings, project_id)
+  chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
+  length_targets = _resolve_continuation_length_targets(
+    project_detail,
+    chapter_for_length,
+    instruction,
+    target_words,
+    prefer_project_budget=prefer_project_budget,
+    complete_chapter=complete_chapter,
+  )
+  resolved_target_words = int(length_targets["target_words"])
+  length_guidance = str(length_targets["length_guidance"])
+  context_query = _continuation_context_query(
+    settings,
+    project_id,
+    chapter_id,
+    instruction,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
+  bundle = build_project_context_bundle(
+    settings,
+    project_id,
+    include_blueprint=True,
+    include_character_state=True,
+    chapter_id=chapter_id,
+    knowledge_query=context_query,
+    task_pack_kind="continuation",
+    task_instruction=context_query,
+  )
+  chapter = bundle.chapter
+  if chapter is None:
+    raise RuntimeError("当前章节不存在")
+  guard_context = build_continuity_guard_context(
+    settings,
+    project_id=project_id,
+    project_detail=bundle.project_detail,
+    chapter=chapter,
+    instruction=instruction,
+    characters_involved=characters_involved,
+    key_items=key_items,
+    scene_location=scene_location,
+    time_constraint=time_constraint,
+  )
+  detail_lines = [
+    f"{bundle.context_text}",
+    f"连续性证据包：\n{guard_context.evidence_text}",
+    (
+      f"本次章节：第 {chapter.index} 章《{chapter.title}》\n"
+      "写作任务：生成可直接保存的章节正文。必须承接当前章节或上一章末尾，不能改动已成立的人名、关系、事件结果和时间顺序。\n"
+      f"用户补充：{instruction.strip() or '无'}\n"
+      f"涉及人物：{characters_involved.strip() or '无'}\n"
+      f"关键道具或线索：{key_items.strip() or '无'}\n"
+      f"场景地点：{scene_location.strip() or '无'}\n"
+      f"时间限制：{time_constraint.strip() or '无'}\n"
+      f"目标长度：约 {resolved_target_words} 字\n"
+      f"{length_guidance}"
+    ).strip(),
+    support_text.strip(),
+  ]
+  editable_prompt = "\n\n".join(item for item in detail_lines if item).strip()
+  messages: list[dict[str, object]] = [
+    {"role": "system", "content": _CONTINUATION_WRITE_SYSTEM_PROMPT},
+    {"role": "user", "content": editable_prompt},
+  ]
+  return _chapter_prompt_preview_response(
+    title=f"第 {chapter.index} 章《{chapter.title}》",
+    chapter_id=chapter.id,
+    chapter_index=int(chapter.index),
+    messages=messages,
+    editable_prompt=editable_prompt,
+  )
+
+
+def _run_continuation_pipeline(
+  settings: Settings,
+  *,
+  project_id: str,
+  chapter_id: str,
+  instruction: str,
+  target_words: int,
+  support_text: str = "",
+  characters_involved: str = "",
+  key_items: str = "",
+  scene_location: str = "",
+  time_constraint: str = "",
+  task_name_prefix: str = "chapter_generate",
+  candidate_count: int = 1,
+  prefer_project_budget: bool = False,
+  complete_chapter: bool = False,
+  prompt_override: str = "",
+) -> dict[str, object]:
+  project_detail = get_project_detail(settings, project_id)
+  chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
+  length_targets = _resolve_continuation_length_targets(
+    project_detail,
+    chapter_for_length,
+    instruction,
+    target_words,
+    prefer_project_budget=prefer_project_budget,
+    complete_chapter=complete_chapter,
+  )
+  target_words = int(length_targets["target_words"])
+  length_guidance = str(length_targets["length_guidance"])
+  segment_targets = list(length_targets["segment_targets"])
+  completion_target_words = int(length_targets["completion_target_words"])
+
+  if prompt_override.strip():
+    return _run_prompt_override_continuation_pipeline(
+      settings,
+      project_id=project_id,
+      chapter_id=chapter_id,
+      instruction=instruction,
+      prompt_override=prompt_override,
+      target_words=target_words,
+      length_guidance=length_guidance,
+      support_text=support_text,
+      characters_involved=characters_involved,
+      key_items=key_items,
+      scene_location=scene_location,
+      time_constraint=time_constraint,
+      task_name_prefix=task_name_prefix,
+    )
 
   if len(segment_targets) > 1:
     return _run_segmented_continuation_pipeline(
@@ -2531,6 +2847,45 @@ def _build_chapter_workflow_messages(settings: Settings, payload: ChapterWorkflo
   return messages
 
 
+def chapter_workflow_prompt_preview(settings: Settings, payload: ChapterWorkflowRequest) -> ChapterPromptPreviewResponse:
+  mode = _normalize_workflow_mode(payload.mode)
+  normalized_payload = payload.model_copy(update={"mode": mode})
+  if mode == "draft":
+    support = build_prompt_support(
+      settings,
+      task_key="chapter",
+      project_id=normalized_payload.project_id,
+      chapter_id=normalized_payload.chapter_id,
+    )
+    return build_continuation_prompt_preview(
+      settings,
+      project_id=normalized_payload.project_id,
+      chapter_id=normalized_payload.chapter_id,
+      instruction=normalized_payload.instruction,
+      target_words=normalized_payload.target_words,
+      support_text=support,
+      prefer_project_budget=normalized_payload.target_words <= 0,
+    )
+
+  messages = _build_chapter_workflow_messages(settings, normalized_payload)
+  project_detail = get_project_detail(settings, normalized_payload.project_id)
+  chapter = next((item for item in project_detail.chapters if item.id == normalized_payload.chapter_id), None)
+  if chapter is None:
+    raise RuntimeError("当前章节不存在")
+  editable_prompt = ""
+  for item in reversed(messages):
+    if item.get("role") == "user":
+      editable_prompt = str(item.get("content") or "")
+      break
+  return _chapter_prompt_preview_response(
+    title=f"第 {chapter.index} 章《{chapter.title}》",
+    chapter_id=chapter.id,
+    chapter_index=int(chapter.index),
+    messages=[dict(item) for item in messages],
+    editable_prompt=editable_prompt,
+  )
+
+
 def _scene_list_from_payload(payload: dict[str, object]) -> list[ChapterWorkflowScene]:
   raw_scenes = payload.get("scenes")
   if not isinstance(raw_scenes, list):
@@ -2631,6 +2986,7 @@ def _generate_chapter_workflow(
       support_text=support,
       task_name_prefix="chapter_workflow:draft",
       prefer_project_budget=normalized_payload.target_words <= 0,
+      prompt_override=normalized_payload.prompt_override,
     )
     return ChapterWorkflowResult(
       task_id=task_id,
@@ -2642,11 +2998,13 @@ def _generate_chapter_workflow(
       draft=str(pipeline["content"]),
       next_action=str(pipeline["next_action"]),
     )
-  content = _invoke_model(
-    settings,
-    _build_chapter_workflow_messages(settings, normalized_payload),
-    task_name=f"chapter_workflow:{mode}",
-  )
+  messages = _build_chapter_workflow_messages(settings, normalized_payload)
+  if normalized_payload.prompt_override.strip():
+    for index in range(len(messages) - 1, -1, -1):
+      if messages[index].get("role") == "user":
+        messages[index] = {"role": "user", "content": normalized_payload.prompt_override.strip()}
+        break
+  content = _invoke_model(settings, messages, task_name=f"chapter_workflow:{mode}")
   return _parse_chapter_workflow_payload(content, mode, task_id)
 
 

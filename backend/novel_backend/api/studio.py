@@ -89,6 +89,7 @@ from novel_backend.services.studio_service import (
   blueprint_stream,
   brainstorm_stream,
   character_replica_stream,
+  chapter_generate_prompt_preview,
   chapter_generate_stream,
   chapter_rewrite_stream,
   consistency_stream,
@@ -256,6 +257,12 @@ async def stream_blueprint(request: Request, payload: BlueprintGenerateRequest):
 async def stream_chapter_generate(request: Request, payload: ChapterGenerateRequest):
   require_valid_license(request)
   return _stream_response(chapter_generate_stream(request.app.state.settings, payload))
+
+
+@router.post("/chapter-generate/prompt-preview")
+async def preview_chapter_generate_prompt(request: Request, payload: ChapterGenerateRequest):
+  require_valid_license(request)
+  return {"ok": True, "data": chapter_generate_prompt_preview(request.app.state.settings, payload).model_dump(mode="json")}
 
 
 @router.post("/chapter-finalize/stream")
