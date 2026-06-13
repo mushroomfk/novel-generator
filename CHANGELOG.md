@@ -6,6 +6,12 @@
 
 ## 2026-06-13
 
+### 0.1.4 全量核验与桌面测试包重打包
+
+- 修改摘要：对当前未提交改动完成代码审查和全量验证，提交 `Verify agent UI and backend 0.1.4 fixes`；普通 Git HTTPS 远端命令超时未返回，改用 GitHub API 将远端分支 `codex/full-verification-windows-20260609` 更新到提交 `a2da44c5ce9906a518370ff1d7669693c2e99282`，该远端提交 tree 与本地提交 `2a297f2faead650530e0408aa0cac44bbf135805` 一致；基于该内容重新生成 macOS arm64 和 Windows x64 0.1.4 测试包。
+- 影响范围：Agent 对话滚动和运行态展示、backend 版本号、首页 backend 误报清理、macOS / Windows 0.1.4 测试包、README、Windows 打包说明和包内安装说明；不改变模型配置结构、作品数据格式、许可证格式或运行时 API。
+- 验证结果：`git diff --check` 通过；`npm run verify` 通过，包含打包静态检查、前端静态回归、API 冒烟、446 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖 Agent 计划执行、对话自动滚动、回到底部按钮、Obsidian 同步、自学习面板、架构总览、人物复刻和项目迁移包；`npm run verify:release-audit` 通过，包含完整本地回归、本地长篇链路 smoke、《围城》原文导入和第 10 章本地上下文、当前保存模型配置与 DNS 预检；`npm run release:test:macos` 通过，包含桌面发布检查、446 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri release `.app` / `.dmg` 构建、签名修复、开发机路径扫描、应用内 sidecar 健康检查和 `.app` 启动检查；macOS 测试包目录 `release/test-release/macos/稿匣_0.1.4_测试包` 的 `shasum -a 256 -c SHA256SUMS.txt` 通过，`hdiutil verify` 通过，DMG SHA256 为 `48e41988a89406360fefa3b271e0b517f61897f236074ca2385484be327ef050`；GitHub Actions `Windows Desktop Release` run `27459193672` 在提交 `a2da44c5ce9906a518370ff1d7669693c2e99282` 上通过，artifact `gaoxia-windows-a2da44c5ce9906a518370ff1d7669693c2e99282` 下载并整理到 `release/test-release/windows/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，Windows 安装程序 SHA256 为 `d2b60a93e654856071628dd54bbab97b40edb9ccbb25348f059adef22734f268`，Windows sidecar SHA256 为 `981527d124fe84b71c030324bb6d452da08ab6c0be791257545397b655fb43bf`。未执行真实模型长篇生成验证；Windows 实机安装、卸载、首次启动和安装后 GUI 操作仍待人工验收。
+
 ### Agent 对话回到底部按钮
 
 - 修改摘要：Agent 对话流在用户离开最新位置时显示底部居中的向下箭头按钮，点击后直接滑到最新消息；按钮会随滚动位置自动显示或隐藏，不在已经位于底部时打扰阅读。
