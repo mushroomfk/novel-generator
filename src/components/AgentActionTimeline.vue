@@ -253,23 +253,23 @@ function hasDetails(item) {
   padding: 2px 0 0;
   list-style: none;
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .timeline-item {
   position: relative;
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 10px;
   align-items: start;
 }
 
 .timeline-marker {
   position: relative;
   display: block;
-  width: 14px;
-  height: 14px;
-  margin-top: 10px;
+  width: 12px;
+  height: 12px;
+  margin-top: 9px;
   border-radius: 999px;
   background: #d0d7de;
   border: 3px solid #ffffff;
@@ -293,10 +293,10 @@ function hasDetails(item) {
 
 .timeline-card {
   display: grid;
-  gap: 8px;
+  gap: 7px;
   border: 1px solid #e7ebf0;
-  border-radius: 14px;
-  padding: 12px 14px;
+  border-radius: 10px;
+  padding: 9px 11px;
   background: #ffffff;
 }
 
@@ -322,20 +322,20 @@ function hasDetails(item) {
 
 .timeline-step {
   color: #1d4ed8;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .timeline-title-block strong {
   color: #1f2328;
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .timeline-status,
 .timeline-chip,
 .timeline-change-chip {
   border-radius: 999px;
-  padding: 4px 10px;
-  font-size: 12px;
+  padding: 3px 8px;
+  font-size: 11px;
   line-height: 1.3;
 }
 
@@ -377,7 +377,7 @@ function hasDetails(item) {
 .timeline-detail-copy {
   margin: 0;
   color: #586270;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.75;
 }
 
@@ -395,8 +395,8 @@ function hasDetails(item) {
   display: grid;
   gap: 6px;
   border: 1px solid #eef1f4;
-  border-radius: 10px;
-  padding: 8px;
+  border-radius: 8px;
+  padding: 7px;
   background: #fbfcfe;
 }
 
@@ -421,12 +421,12 @@ function hasDetails(item) {
 
 .timeline-subtask-copy strong {
   color: #24292f;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .timeline-subtask-copy span {
   color: #6b7280;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
@@ -447,7 +447,7 @@ function hasDetails(item) {
 .timeline-detail summary {
   cursor: pointer;
   color: #6b7280;
-  font-size: 12px;
+  font-size: 11px;
   list-style: none;
 }
 
@@ -459,7 +459,7 @@ function hasDetails(item) {
   margin: 0;
   padding-left: 18px;
   color: #586270;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.75;
 }
 </style>

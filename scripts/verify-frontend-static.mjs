@@ -59,14 +59,25 @@ excludesAll(existingNovelModal, 'src/components/ExistingNovelImportModal.vue', [
 const workflowPanel = read('src/components/NovelWorkflowPanel.vue');
 includesAll(workflowPanel, 'src/components/NovelWorkflowPanel.vue', [
   'data-testid="agent-runtime-message"',
+  'data-testid="agent-operation-stream"',
+  'data-testid="agent-scroll-to-latest-button"',
+  'data-testid="agent-runtime-thinking-process"',
+  'data-testid="agent-thinking-process"',
   'data-testid="agent-runtime-status-list"',
   'data-testid="agent-runtime-status-row"',
+  'ref="operationStreamRef"',
   "id: 'runtime-status-thinking'",
+  '思考过程',
+  'function scheduleOperationStreamScrollToLatest',
+  'function handleScrollToLatestClick',
+  'scheduleOperationStreamScrollToLatest({ smooth: true });',
+  'watch(\n  sessionTimeline,',
   "'正在思考'",
   "'正在运行'",
   "'已完成'",
-  'v-if="!isCompletedExecutionMessage(item) && messageTimelineItems(item).length"',
-  'v-if="!isCompletedExecutionMessage(item) && messageEventBlocks(item).length"',
+  'function hasMessageThinkingProcess(message)',
+  'v-if="hasMessageThinkingProcess(item)"',
+  'return [];\n  }\n\n  if (Array.isArray(message.executionTrace)',
   'return isCompletedExecutionMessage(message) ? [] : blocks;',
 ]);
 

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import AgentActionTimeline from './AgentActionTimeline.vue';
 import AgentArtifactSummary from './AgentArtifactSummary.vue';
 import AgentEventBlockSummary from './AgentEventBlockSummary.vue';
@@ -65,6 +65,8 @@ const composerText = ref('');
 const composerActiveSkillId = ref('');
 const composerActiveSkillPrompt = ref('');
 const composerFileInput = ref(null);
+const operationStreamRef = ref(null);
+const operationStreamNeedsLatestButton = ref(false);
 const composerReferences = ref([]);
 const composerReferenceSyncing = ref(false);
 const composerToolMessage = ref('');
@@ -109,6 +111,8 @@ const forceDiscussionMode = ref(false);
 let discussionLoadSequence = 0;
 let remotePersistInFlight = false;
 let queuedRemotePersist = null;
+let operationStreamScrollFrame = 0;
+let operationStreamStateFrame = 0;
 
 const {
   running,
@@ -708,6 +712,82 @@ watch(
     }
   },
 );
+
+function scrollOperationStreamToLatest({ smooth = true } = {}) {
+  const stream = operationStreamRef.value;
+  if (!stream) {
+    return;
+  }
+
+  const top = stream.scrollHeight;
+  operationStreamNeedsLatestButton.value = false;
+  if (typeof stream.scrollTo === 'function') {
+    stream.scrollTo({
+      top,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+    return;
+  }
+
+  stream.scrollTop = top;
+}
+
+function operationStreamIsAtLatest(stream = operationStreamRef.value) {
+  if (!stream) {
+    return true;
+  }
+
+  return stream.scrollHeight - stream.clientHeight - stream.scrollTop <= 12;
+}
+
+function updateOperationStreamLatestButton() {
+  const stream = operationStreamRef.value;
+  operationStreamNeedsLatestButton.value = stream
+    ? !operationStreamIsAtLatest(stream)
+    : false;
+}
+
+function scheduleOperationStreamLatestButtonUpdate() {
+  if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+    updateOperationStreamLatestButton();
+    return;
+  }
+
+  if (operationStreamStateFrame && typeof window.cancelAnimationFrame === 'function') {
+    window.cancelAnimationFrame(operationStreamStateFrame);
+  }
+  operationStreamStateFrame = window.requestAnimationFrame(() => {
+    operationStreamStateFrame = 0;
+    updateOperationStreamLatestButton();
+  });
+}
+
+function scheduleOperationStreamScrollToLatest(options = {}) {
+  void nextTick(() => {
+    const run = () => {
+      operationStreamScrollFrame = 0;
+      scrollOperationStreamToLatest(options);
+    };
+
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      run();
+      return;
+    }
+
+    if (operationStreamScrollFrame && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(operationStreamScrollFrame);
+    }
+    operationStreamScrollFrame = window.requestAnimationFrame(run);
+  });
+}
+
+function handleOperationStreamScroll() {
+  scheduleOperationStreamLatestButtonUpdate();
+}
+
+function handleScrollToLatestClick() {
+  scheduleOperationStreamScrollToLatest({ smooth: true });
+}
 
 function currentManualMemoryEntries() {
   return (props.project?.story_overview?.memory_entries ?? [])
@@ -1509,6 +1589,7 @@ function applyDiscussionThread(threadId) {
   }
   discussionSaveMessage.value = '';
   emitDiscussionThreadState();
+  scheduleOperationStreamScrollToLatest({ smooth: false });
 }
 
 function startDraftDiscussion() {
@@ -1807,6 +1888,10 @@ function messageEventBlocks(message) {
   return isCompletedExecutionMessage(message) ? [] : blocks;
 }
 
+function hasMessageThinkingProcess(message) {
+  return messageTimelineItems(message).length > 0 || messageEventBlocks(message).length > 0;
+}
+
 function isPendingPlanMessage(message) {
   return Boolean(
     message.plan
@@ -2019,6 +2104,7 @@ async function sendConversation(options = {}) {
     pendingPlan.value = null;
     threadSuggestions.value = [];
   }
+  scheduleOperationStreamScrollToLatest({ smooth: true });
   syncDiscussionThread(targetThreadId, {
     messages: nextMessages,
     suggestions: approvedPlan ? threadSuggestions.value : [],
@@ -2115,6 +2201,7 @@ async function sendConversation(options = {}) {
         discussionHistory.value = completedMessages;
         pendingPlan.value = assistantMessage.plan ?? null;
         threadSuggestions.value = assistantMessage.suggestions ?? [];
+        scheduleOperationStreamScrollToLatest({ smooth: true });
       }
       syncDiscussionThread(targetThreadId, {
         messages: completedMessages,
@@ -2200,6 +2287,7 @@ function handleCancelPlan() {
   discussionHistory.value = nextMessages;
   pendingPlan.value = null;
   threadSuggestions.value = [];
+  scheduleOperationStreamScrollToLatest({ smooth: true });
   syncActiveDiscussionThread({
     messages: nextMessages,
     suggestions: [],
@@ -2269,6 +2357,42 @@ watch(
 );
 
 watch(
+  () => activeDiscussionIsRunning.value,
+  (isActive) => {
+    if (isActive) {
+      scheduleOperationStreamScrollToLatest({ smooth: true });
+    } else {
+      scheduleOperationStreamLatestButtonUpdate();
+    }
+  },
+);
+
+watch(
+  sessionTimeline,
+  () => {
+    if (activeDiscussionIsRunning.value) {
+      scheduleOperationStreamScrollToLatest({ smooth: false });
+    }
+  },
+);
+
+watch(
+  () => discussionHistory.value.length,
+  () => {
+    scheduleOperationStreamLatestButtonUpdate();
+  },
+);
+
+watch(
+  runtimeError,
+  (message) => {
+    if (message) {
+      scheduleOperationStreamScrollToLatest({ smooth: true });
+    }
+  },
+);
+
+watch(
   () => props.conversationSessionKey,
   () => {
     composerText.value = '';
@@ -2299,6 +2423,22 @@ watch(
 
 onBeforeUnmount(() => {
   clearSessionElapsedTimer();
+  if (
+    operationStreamScrollFrame
+    && typeof window !== 'undefined'
+    && typeof window.cancelAnimationFrame === 'function'
+  ) {
+    window.cancelAnimationFrame(operationStreamScrollFrame);
+    operationStreamScrollFrame = 0;
+  }
+  if (
+    operationStreamStateFrame
+    && typeof window !== 'undefined'
+    && typeof window.cancelAnimationFrame === 'function'
+  ) {
+    window.cancelAnimationFrame(operationStreamStateFrame);
+    operationStreamStateFrame = 0;
+  }
 });
 </script>
 
@@ -2370,7 +2510,12 @@ onBeforeUnmount(() => {
           </div>
         </header>
 
-        <div class="operation-stream">
+        <div
+          ref="operationStreamRef"
+          class="operation-stream"
+          data-testid="agent-operation-stream"
+          @scroll="handleOperationStreamScroll"
+        >
           <article
             v-if="discussionHistory.length === 0"
             class="stream-card stream-card-assistant stream-card-empty"
@@ -2453,15 +2598,25 @@ onBeforeUnmount(() => {
                 </template>
               </AgentPlanCard>
 
-              <AgentActionTimeline
-                v-if="!isCompletedExecutionMessage(item) && messageTimelineItems(item).length"
-                :items="messageTimelineItems(item)"
-              />
+              <section
+                v-if="hasMessageThinkingProcess(item)"
+                class="thinking-process"
+                data-testid="agent-thinking-process"
+              >
+                <div class="thinking-process-head">
+                  <span>思考过程</span>
+                </div>
 
-              <AgentEventBlockSummary
-                v-if="!isCompletedExecutionMessage(item) && messageEventBlocks(item).length"
-                :blocks="messageEventBlocks(item)"
-              />
+                <AgentActionTimeline
+                  v-if="messageTimelineItems(item).length"
+                  :items="messageTimelineItems(item)"
+                />
+
+                <AgentEventBlockSummary
+                  v-if="messageEventBlocks(item).length"
+                  :blocks="messageEventBlocks(item)"
+                />
+              </section>
 
               <AgentArtifactSummary
                 v-if="item.artifacts?.length"
@@ -2520,29 +2675,38 @@ onBeforeUnmount(() => {
               <span>{{ runtimeStripContext }}</span>
             </p>
 
-            <div
-              class="runtime-status-list"
-              data-testid="agent-runtime-status-list"
+            <section
+              class="thinking-process thinking-process-runtime"
+              data-testid="agent-runtime-thinking-process"
             >
+              <div class="thinking-process-head">
+                <span>思考过程</span>
+              </div>
+
               <div
-                v-for="item in runtimeStatusItems"
-                :key="item.id"
-                :class="['runtime-status-row', `runtime-status-row-${item.status}`]"
-                data-testid="agent-runtime-status-row"
+                class="runtime-status-list"
+                data-testid="agent-runtime-status-list"
               >
-                <span
-                  class="runtime-status-icon"
-                  aria-hidden="true"
-                ></span>
-                <div class="runtime-status-copy">
-                  <div class="runtime-status-line">
-                    <strong>{{ item.label }}</strong>
-                    <span v-if="item.detail">{{ item.detail }}</span>
+                <div
+                  v-for="item in runtimeStatusItems"
+                  :key="item.id"
+                  :class="['runtime-status-row', `runtime-status-row-${item.status}`]"
+                  data-testid="agent-runtime-status-row"
+                >
+                  <span
+                    class="runtime-status-icon"
+                    aria-hidden="true"
+                  ></span>
+                  <div class="runtime-status-copy">
+                    <div class="runtime-status-line">
+                      <strong>{{ item.label }}</strong>
+                      <span v-if="item.detail">{{ item.detail }}</span>
+                    </div>
+                    <p v-if="item.summary">{{ item.summary }}</p>
                   </div>
-                  <p v-if="item.summary">{{ item.summary }}</p>
                 </div>
               </div>
-            </div>
+            </section>
           </article>
 
           <p
@@ -2560,6 +2724,17 @@ onBeforeUnmount(() => {
           </p>
 
         </div>
+
+        <button
+          v-if="operationStreamNeedsLatestButton"
+          aria-label="滑到最新消息"
+          class="latest-scroll-button"
+          data-testid="agent-scroll-to-latest-button"
+          type="button"
+          @click="handleScrollToLatestClick"
+        >
+          <span aria-hidden="true">↓</span>
+        </button>
 
       </section>
     </div>
@@ -2988,6 +3163,7 @@ onBeforeUnmount(() => {
 }
 
 .operation-panel {
+  position: relative;
   display: flex;
   flex-direction: column;
   border: 0;
@@ -3202,6 +3378,48 @@ onBeforeUnmount(() => {
   padding: 18px 0 16px;
 }
 
+.latest-scroll-button {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid #d6dbe3;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.14);
+  color: #1f2328;
+  cursor: pointer;
+  transform: translateX(-50%);
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
+}
+
+.latest-scroll-button:hover {
+  border-color: #b9c1ce;
+  background: #ffffff;
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.18);
+  transform: translateX(-50%) translateY(-1px);
+}
+
+.latest-scroll-button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 3px;
+}
+
+.latest-scroll-button span {
+  font-size: 25px;
+  font-weight: 400;
+  line-height: 1;
+}
+
 .stream-card {
   display: grid;
   gap: 8px;
@@ -3320,6 +3538,38 @@ onBeforeUnmount(() => {
   line-height: 1.7;
 }
 
+.thinking-process {
+  display: grid;
+  gap: 8px;
+  padding: 2px 0 0;
+  color: #667085;
+  font-size: 12px;
+}
+
+.thinking-process-runtime {
+  gap: 10px;
+  padding-top: 0;
+}
+
+.thinking-process-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: #8a94a3;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.thinking-process-head::after {
+  content: '';
+  flex: 1 1 auto;
+  min-width: 24px;
+  height: 1px;
+  background: #e8ecf1;
+}
+
 .state-pill-row,
 .suggestion-row,
 .reference-row,
@@ -3383,31 +3633,31 @@ onBeforeUnmount(() => {
 
 .runtime-status-list {
   display: grid;
-  gap: 18px;
-  padding: 4px 0 0;
+  gap: 12px;
+  padding: 0;
 }
 
 .runtime-status-row {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 9px;
   align-items: start;
   color: #8b949e;
 }
 
 .runtime-status-icon {
   position: relative;
-  width: 18px;
-  height: 18px;
-  margin-top: 2px;
+  width: 14px;
+  height: 14px;
+  margin-top: 4px;
   border: 2px solid currentColor;
-  border-radius: 5px;
+  border-radius: 4px;
 }
 
 .runtime-status-icon::before {
   content: '';
   position: absolute;
-  inset: 3px;
+  inset: 2px;
   border-radius: 2px;
   background: currentColor;
   opacity: 0.12;
@@ -3418,8 +3668,8 @@ onBeforeUnmount(() => {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 5px;
-  height: 5px;
+  width: 4px;
+  height: 4px;
   border-radius: 999px;
   background: currentColor;
   transform: translate(-50%, -50%);
@@ -3437,7 +3687,7 @@ onBeforeUnmount(() => {
 
 .runtime-status-copy {
   display: grid;
-  gap: 7px;
+  gap: 5px;
   min-width: 0;
 }
 
@@ -3451,7 +3701,7 @@ onBeforeUnmount(() => {
 .runtime-status-line strong {
   min-width: 0;
   color: #8b949e;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1.55;
 }
@@ -3467,16 +3717,16 @@ onBeforeUnmount(() => {
 
 .runtime-status-line span {
   color: #a0a7b0;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
 .runtime-status-copy p {
   margin: 0;
-  color: #24292f;
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 1.7;
+  color: #596474;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.65;
 }
 
 .runtime-status-row-failed .runtime-status-copy p,

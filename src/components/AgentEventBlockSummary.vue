@@ -120,20 +120,20 @@ const groupedStages = computed(() => {
 <style scoped>
 .event-summary {
   display: grid;
-  gap: 10px;
-  padding: 10px 0 2px;
+  gap: 8px;
+  padding: 8px 0 2px;
 }
 
 .event-stage {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 8px;
   align-items: start;
 }
 
 .event-stage-label {
   color: #42526b;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.6;
   padding-top: 2px;
 }
@@ -162,22 +162,22 @@ const groupedStages = computed(() => {
 .event-block-head strong {
   min-width: 0;
   color: #24292f;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
 .event-block p {
   margin: 0;
   color: #667085;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.65;
 }
 
 .event-status {
   flex: 0 0 auto;
   border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 2px 7px;
+  font-size: 10px;
   line-height: 1.4;
 }
 

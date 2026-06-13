@@ -4,13 +4,39 @@
 
 历史上已经做完、但没有单独留日期的内容，不补编日期，先按“基线能力”归档；后续新改动按日期继续追加。
 
+## 2026-06-13
+
+### Agent 对话回到底部按钮
+
+- 修改摘要：Agent 对话流在用户离开最新位置时显示底部居中的向下箭头按钮，点击后直接滑到最新消息；按钮会随滚动位置自动显示或隐藏，不在已经位于底部时打扰阅读。
+- 影响范围：Agent 对话面板、前端静态检查和浏览器 UI smoke；不改变后端接口、线程保存格式或模型调用方式。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run verify:frontend-static` 通过；`npm run build` 通过；`git diff --check` 通过；`npm run verify:ui` 完整通过，覆盖多轮 Agent 对话中手动滚离底部后按钮出现、点击按钮回到底部。
+
+### Agent 对话发送后自动滚动
+
+- 修改摘要：Agent 对话流新增底部定位逻辑，用户发送消息、运行中状态卡片出现、执行步骤更新、错误提示或最终结果写入后，会自动滚动到最新内容；切换已有对话线程时也会定位到最新消息。
+- 影响范围：Agent 对话面板、前端静态检查和浏览器 UI smoke；不改变后端接口、线程保存格式或模型调用方式。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`npm run verify:frontend-static` 通过；`npm run verify:packaging-static` 通过；`npm run build` 通过；`git diff --check` 通过；`npm run verify:ui` 第一次在 Chrome headless 启动阶段被系统 `SIGKILL`，未进入页面断言，第二次完整通过，并覆盖章节续写、第二章生成、混合架构请求和确认执行整书架构后的 Agent 对话流自动滚动断言。
+
+### 本地 backend 误报与版本号修正
+
+- 修改摘要：核查本机 0.1.4 桌面应用日志后，确认 `127.0.0.1:63019` backend 健康检查、作品列表、配置读取和模型运行态接口均可访问；界面红色“本地 backend 连接失败”属于早期请求失败后保留的顶层提示，不会随后续健康检查成功自动清除。本次改为首页刷新全部成功后清除这类已恢复的 backend 错误提示；同时把 backend 包版本、`novel_backend.__version__` 和健康检查使用的默认 `app_version` 同步到 `0.1.4`，避免 0.1.4 桌面包的 `/api/app/health` 仍显示 `backend_version=0.1.0`。
+- 影响范围：首页错误提示清理、backend 健康检查版本字段、backend 包元数据；不改变模型配置、作品数据、API 路径、sidecar 启动方式或模型网络重试策略。
+- 验证结果：`curl` 访问当前桌面 sidecar 的 `/api/app/health`、`/api/projects`、`/api/config` 和 `/api/studio/model-runtime` 均返回 200；`/api/studio/model-runtime` 显示 `chat` 通道处于 `模型网络连接中断` 暂停，来源是 `2026-06-13 12:49:55 +0800` 的 `story_overview_model` 远端连接关闭失败；`.venv/bin/python -m py_compile backend/novel_backend/config.py backend/novel_backend/__init__.py backend/tests/test_app.py` 通过；直接导入 `Settings` 验证 `app_version=0.1.4` 通过；`node --check scripts/verify-ui-smoke.mjs`、`node --check scripts/verify-frontend-static.mjs`、`npm run verify:frontend-static`、`npm run build` 和 `git diff --check` 通过。`backend.tests.test_app` 全文件单测执行超过 90 秒无输出，已手动结束，不能作为通过证据；未执行真实模型调用。
+
+### Agent 运行中思考过程展示
+
+- 修改摘要：Agent 对话运行中的执行卡片新增“思考过程”区域，展示当前步骤、状态、耗时和步骤摘要；已完成的执行消息继续隐藏过程信息，只保留结果正文、产物和建议。
+- 影响范围：Agent 对话运行态 UI、执行步骤摘要组件、事件阶段摘要组件和前端静态检查；不改变后端事件协议、线程保存格式或模型调用方式。
+- 验证结果：`npm run verify:frontend-static` 通过；`npm run verify:packaging-static` 通过；`npm run build` 通过；`git diff --check` 通过；本地前端服务打开 `http://localhost:1421/` 后，浏览器读取已加载样式确认正文 `14px`、思考过程 `12px`、状态细节 `11px`。未启动后端，未执行真实模型调用。
+
 ## 2026-06-12
 
 ### 0.1.4 测试包准备与稳定档案同步修正
 
 - 修改摘要：版本号提升到 `0.1.4`，同步 `package.json`、`package-lock.json`、Tauri 配置、Cargo 配置、README 状态说明、Windows 打包说明和 macOS 测试版安装说明；修正架构总览“稳定档案”页签的自动刷新行为，进入页签时改为调用 Obsidian 同步接口并用返回的项目详情刷新界面，避免项目内 `Vault/` Markdown 直接改动后只显示旧索引；基于当前工作区生成 macOS arm64 测试包。
 - 影响范围：桌面测试包版本、macOS 测试说明、Windows 打包说明、架构总览稳定档案页签、项目内 Vault 自动同步和当前分支打包流程；不改变模型配置结构、项目数据格式、许可证格式、外部 Vault 保护策略或运行时 API。
-- 验证结果：`git diff --check` 通过；`.venv/bin/python -m py_compile` 相关后端文件和验证脚本通过；`node --check scripts/verify-ui-smoke.mjs` 通过；后端重点单测通过，包含 `backend.tests.test_generation_service`、`backend.tests.test_studio_service`、`backend.tests.test_project_service`、`backend.tests.test_project_narrative_state_service`、`backend.tests.test_context_builder` 和 `backend.tests.test_app`；`npm run verify` 通过，包含打包静态检查、前端静态回归、API 冒烟、445 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖 Agent 章节提示词预览与编辑、章节生成写回、Obsidian 同步、自学习面板、架构总览稳定档案页签、项目内 Vault Markdown 编辑、人物复刻和项目迁移包；`npm run verify:local-smoke` 通过，本地 Embedding、旧稿接管、接续上下文、知识检索、章节写入后索引和本地章节核验均完成；`npm run verify:model-preflight` 通过，当前写作模型和第二审查模型的模型名、接口域名、API Key 存在性和 DNS 解析检查通过；`npm run release:test:macos` 通过，包含桌面发布静态检查、445 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、本地 Embedding 检查、Tauri release `.app` / `.dmg` 构建、签名修复、开发机路径扫描、应用内 sidecar 健康检查和 `.app` 启动检查；已整理 `release/test-release/macos/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.4_aarch64.dmg: OK`，`hdiutil verify` 通过，DMG SHA256 为 `b7566992d47d77b696dbfd6c8e0ace689405e0d6db98e942c7f62cbb2fcfa966`。未执行真实模型长篇生成验证；`0.1.4` Windows x64 测试包尚未生成或实机验收。
+- 验证结果：`git diff --check` 通过；`.venv/bin/python -m py_compile` 相关后端文件和验证脚本通过；`node --check scripts/verify-ui-smoke.mjs` 通过；后端重点单测通过，包含 `backend.tests.test_generation_service`、`backend.tests.test_studio_service`、`backend.tests.test_project_service`、`backend.tests.test_project_narrative_state_service`、`backend.tests.test_context_builder` 和 `backend.tests.test_app`；`npm run verify` 通过，包含打包静态检查、前端静态回归、API 冒烟、445 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过，覆盖 Agent 章节提示词预览与编辑、章节生成写回、Obsidian 同步、自学习面板、架构总览稳定档案页签、项目内 Vault Markdown 编辑、人物复刻和项目迁移包；`npm run verify:local-smoke` 通过，本地 Embedding、旧稿接管、接续上下文、知识检索、章节写入后索引和本地章节核验均完成；`npm run verify:model-preflight` 通过，当前写作模型和第二审查模型的模型名、接口域名、API Key 存在性和 DNS 解析检查通过；`npm run release:test:macos` 通过，包含桌面发布静态检查、445 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、本地 Embedding 检查、Tauri release `.app` / `.dmg` 构建、签名修复、开发机路径扫描、应用内 sidecar 健康检查和 `.app` 启动检查；已整理 `release/test-release/macos/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.4_aarch64.dmg: OK`，`hdiutil verify` 通过，DMG SHA256 为 `b7566992d47d77b696dbfd6c8e0ace689405e0d6db98e942c7f62cbb2fcfa966`；GitHub Actions `Windows Desktop Release` run `27428032565` 在提交 `6ae79e4443ec2c92a6f14bc1aacfbb43997fa8df` 上通过，已整理 `release/test-release/windows/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，返回 `稿匣_0.1.4_x64-setup.exe: OK` 和 `novel-backend-x86_64-pc-windows-msvc.exe: OK`，Windows 安装程序 SHA256 为 `90c0ee2dc5e4290d34ea2ad00be3805d85fe30a803ab7fe93d63b85794950239`，Windows sidecar SHA256 为 `c25ad3c95e79ac684beebc33d4c7c0dff91af974544581f1a523ba5330c66774`。未执行真实模型长篇生成验证；Windows 实机安装、卸载、首次启动和安装后 GUI 操作仍待人工验收。
 
 ### 章节提示词确认与编辑
 

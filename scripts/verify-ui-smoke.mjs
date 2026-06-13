@@ -307,6 +307,41 @@ async function waitForWorkspaceComposerReady(page) {
   });
 }
 
+async function waitForAgentOperationStreamAtBottom(page, label) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const stream = document.querySelector('[data-testid="agent-operation-stream"]');
+        if (!(stream instanceof HTMLElement)) {
+          return false;
+        }
+        return stream.scrollHeight - stream.clientHeight - stream.scrollTop <= 8;
+      },
+      null,
+      { timeout: 10000 },
+    );
+  } catch (error) {
+    throw new Error(`${label} 后 Agent 对话流没有自动滚动到底部`);
+  }
+}
+
+async function verifyAgentScrollToLatestButton(page, label) {
+  await page.waitForFunction(() => {
+    const stream = document.querySelector('[data-testid="agent-operation-stream"]');
+    return stream instanceof HTMLElement && stream.scrollHeight > stream.clientHeight + 80;
+  });
+  await page.evaluate(() => {
+    const stream = document.querySelector('[data-testid="agent-operation-stream"]');
+    if (stream instanceof HTMLElement) {
+      stream.scrollTop = 0;
+      stream.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+  });
+  await page.getByTestId('agent-scroll-to-latest-button').waitFor({ timeout: 10000 });
+  await page.getByTestId('agent-scroll-to-latest-button').click();
+  await waitForAgentOperationStreamAtBottom(page, `${label} 点击回到底部按钮`);
+}
+
 async function confirmAgentPlanWithPromptEdit(page, marker) {
   await page.getByTestId('agent-plan-confirm-button').first().waitFor({ timeout: 60000 });
   await page.getByTestId('agent-plan-confirm-button').first().click();
@@ -1374,6 +1409,7 @@ async function runSmoke(previewUrl, backendUrl) {
       const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
+    await waitForAgentOperationStreamAtBottom(page, '发送章节续写请求');
     await confirmAgentPlanWithPromptEdit(page, '追兵脚步必须压近');
     await page.getByTestId('agent-artifact-card').first().waitFor({ timeout: 60000 });
     const visibleChapterTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
@@ -1400,14 +1436,21 @@ async function runSmoke(previewUrl, backendUrl) {
       const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
+    await waitForAgentOperationStreamAtBottom(page, '发送第二章生成请求');
     await page.getByTestId('agent-plan-card').getByText(/生成第 2 章正文/u).first().waitFor();
     await confirmAgentPlanWithPromptEdit(page, '第二章必须承接第一章灯塔线索');
     await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002', { timeoutMs: 60000 });
+    await verifyAgentScrollToLatestButton(page, '多轮 Agent 对话');
 
     log('检查混合命令优先走架构');
     await waitForWorkspaceComposerReady(page);
     await page.getByTestId('workspace-composer-input').fill('把资料库的资料分析完，再重新弄续写架构');
     await page.locator('.composer-submit-button').click();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
+      return textarea instanceof HTMLTextAreaElement && textarea.value === '';
+    });
+    await waitForAgentOperationStreamAtBottom(page, '发送混合架构请求');
     await page.getByText('整书架构已经补齐并写回项目').first().waitFor({ timeout: 60000 });
     await waitForProjectDocumentContent(backendUrl, seededProject.id, 'blueprint', '第 3 章《夜潮账册》');
 
@@ -1764,6 +1807,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await page.getByTestId('architecture-open-confirm-button').click();
     await page.getByRole('dialog', { name: '确认执行整书架构' }).waitFor();
     await page.getByRole('button', { name: '确认执行' }).click();
+    await waitForAgentOperationStreamAtBottom(page, '确认执行整书架构');
     const architectureRuntimeMessage = page.getByTestId('agent-runtime-message');
     let architectureRuntimeVisible = true;
     try {

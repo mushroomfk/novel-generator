@@ -14,6 +14,7 @@ from novel_backend.api import generate, studio
 from novel_backend.app import LOCAL_ORIGIN_PATTERN, create_app
 from novel_backend.config import Settings, reset_settings_cache
 from novel_backend.models import AGENT_MESSAGE_CONTENT_MAX_LENGTH
+from novel_backend import __version__
 
 
 class AppCorsTestCase(unittest.TestCase):
@@ -48,6 +49,9 @@ class AppCorsTestCase(unittest.TestCase):
       settings = Settings()
 
     self.assertEqual(settings.cors_origins, ["http://localhost:1420", "http://127.0.0.1:1420"])
+
+  def test_default_app_version_uses_backend_package_version(self) -> None:
+    self.assertEqual(Settings().app_version, __version__)
 
 
 class AppValidationErrorTestCase(unittest.TestCase):

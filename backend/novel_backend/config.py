@@ -11,6 +11,8 @@ from typing import Annotated, Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 
+from novel_backend import __version__
+
 
 def default_data_dir() -> Path:
   env_data_dir = os.getenv("NOVEL_DATA_DIR")
@@ -33,7 +35,7 @@ class Settings(BaseSettings):
   port: int = 18181
   data_dir: Path = Field(default_factory=default_data_dir)
   app_name: str = "NovelGenerator"
-  app_version: str = "0.1.0"
+  app_version: str = __version__
   started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
   self_evolution_worker_enabled: bool = True
   self_evolution_worker_interval_seconds: int = Field(default=300, ge=30, le=86400)

@@ -268,6 +268,15 @@ function clearNotice() {
   noticeMessageTone.value = 'success';
 }
 
+function clearResolvedBackendNotice() {
+  if (
+    noticeMessageTone.value === 'error'
+    && /本地 backend (连接失败|未就绪)/.test(noticeMessage.value)
+  ) {
+    clearNotice();
+  }
+}
+
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000;
@@ -907,6 +916,7 @@ async function refreshDashboard() {
   bootErrors.value = nextBootErrors;
   if (nextBootErrors.length === 0) {
     dashboardRetryCount.value = 0;
+    clearResolvedBackendNotice();
   } else {
     scheduleDashboardRetry();
   }
