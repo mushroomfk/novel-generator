@@ -15,6 +15,8 @@ from novel_backend.models import (
   CharacterReplicaRequest,
   ChapterGenerateRequest,
   ChapterRewriteRequest,
+  ChapterSegmentAcceptRequest,
+  ChapterSegmentGenerateRequest,
   ConsistencyCheckRequest,
   ContinueProjectRequest,
   ImportedFileBatchRequest,
@@ -92,8 +94,11 @@ from novel_backend.services.studio_service import (
   chapter_generate_prompt_preview,
   chapter_generate_stream,
   chapter_rewrite_stream,
+  chapter_segment_generate_stream,
   consistency_stream,
   continue_project_stream,
+  accept_chapter_segment,
+  start_chapter_segment_session,
   style_analyze_dna_stream,
   style_analyze_stream,
   style_calibrate_narrative_stream,
@@ -263,6 +268,24 @@ async def stream_chapter_generate(request: Request, payload: ChapterGenerateRequ
 async def preview_chapter_generate_prompt(request: Request, payload: ChapterGenerateRequest):
   require_valid_license(request)
   return {"ok": True, "data": chapter_generate_prompt_preview(request.app.state.settings, payload).model_dump(mode="json")}
+
+
+@router.post("/chapter-segments/start")
+def post_chapter_segment_start(request: Request, payload: ChapterGenerateRequest):
+  require_valid_license(request)
+  return {"ok": True, "data": start_chapter_segment_session(request.app.state.settings, payload).model_dump(mode="json")}
+
+
+@router.post("/chapter-segments/generate/stream")
+async def stream_chapter_segment_generate(request: Request, payload: ChapterSegmentGenerateRequest):
+  require_valid_license(request)
+  return _stream_response(chapter_segment_generate_stream(request.app.state.settings, payload))
+
+
+@router.post("/chapter-segments/accept")
+def post_chapter_segment_accept(request: Request, payload: ChapterSegmentAcceptRequest):
+  require_valid_license(request)
+  return {"ok": True, "data": accept_chapter_segment(request.app.state.settings, payload).model_dump(mode="json")}
 
 
 @router.post("/chapter-finalize/stream")

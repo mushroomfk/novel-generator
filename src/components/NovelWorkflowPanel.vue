@@ -6,6 +6,7 @@ import AgentEventBlockSummary from './AgentEventBlockSummary.vue';
 import AgentPlanCard from './AgentPlanCard.vue';
 import ProjectWorkspaceSidebar from './ProjectWorkspaceSidebar.vue';
 import {
+  acceptChapterSegment,
   applyProjectArchitectureWorkspace,
   getProjectDetail,
   getProjectAgentThreads,
@@ -15,6 +16,8 @@ import {
   previewChapterGeneratePrompt,
   previewChapterWorkflowPrompt,
   saveProjectAgentThreads,
+  startChapterSegmentSession,
+  streamChapterSegmentGenerate,
   updateProjectMemory,
 } from '../lib/api.js';
 import { useAgentSession } from '../composables/useAgentSession.js';
@@ -74,6 +77,7 @@ const composerToolTone = ref('success');
 const discussionSaveMessage = ref('');
 const discussionSavePending = ref(false);
 const previewCollapsed = ref(true);
+const agentPanelHidden = ref(false);
 
 const discussionThreads = ref([]);
 const activeDiscussionThreadId = ref('');
@@ -107,6 +111,23 @@ const planPromptPreviews = ref([]);
 const planPromptPreviewLoading = ref(false);
 const planPromptPreviewError = ref('');
 const planPromptPreviewMessage = ref('');
+const agentSegmentState = reactive({
+  open: false,
+  starting: false,
+  running: false,
+  accepting: false,
+  planId: '',
+  promptActions: [],
+  actionCursor: 0,
+  session: null,
+  prompt: '',
+  draftText: '',
+  message: '',
+  error: '',
+  taskId: '',
+  focusChapterId: '',
+  streamResult: null,
+});
 const forceDiscussionMode = ref(false);
 let discussionLoadSequence = 0;
 let remotePersistInFlight = false;
@@ -185,6 +206,48 @@ const planPromptActions = computed(() => {
     ));
 });
 
+const pendingPlanHasWritingActions = computed(() => planPromptActions.value.length > 0);
+
+const activeAgentSegment = computed(() => {
+  const session = agentSegmentState.session;
+  if (!session?.segments?.length) {
+    return null;
+  }
+  return session.segments.find((item) => item.index === session.current_segment_index) ?? null;
+});
+
+const isAgentSegmentCompleted = computed(() => agentSegmentState.session?.status === 'completed');
+
+const agentSegmentProgressLabel = computed(() => {
+  const session = agentSegmentState.session;
+  if (!session) {
+    return '';
+  }
+  return `第 ${session.current_segment_index ?? 1}/${session.segments?.length ?? 1} 段`;
+});
+
+const agentSegmentWordLabel = computed(() => {
+  const session = agentSegmentState.session;
+  if (!session) {
+    return '';
+  }
+  const current = Number(session.current_word_count ?? 0);
+  const target = Number(session.target_word_count ?? 0);
+  return target > 0 ? `${current} / ${target} 字` : `${current} 字`;
+});
+
+const agentSegmentCurrentTitle = computed(() => {
+  const session = agentSegmentState.session;
+  if (!session) {
+    return '当前章节';
+  }
+  return `第 ${session.chapter_index} 章《${session.chapter_title}》`;
+});
+
+const agentSegmentBusy = computed(() => (
+  agentSegmentState.starting || agentSegmentState.running || agentSegmentState.accepting
+));
+
 const planConfirmDisabled = computed(() => (
   running.value
   || planPromptPreviewLoading.value
@@ -201,7 +264,11 @@ const canTogglePreview = computed(() => (
 ));
 
 const showPreviewPanel = computed(() => (
-  canTogglePreview.value && !previewCollapsed.value
+  canTogglePreview.value && (!previewCollapsed.value || agentPanelHidden.value)
+));
+
+const canHideAgentPanel = computed(() => (
+  !props.embedded && hasPreviewChapter.value
 ));
 
 const discussionSummary = computed(() => {
@@ -878,8 +945,104 @@ function openArchitectureConfirmModal() {
   architectureConfirmOpen.value = true;
 }
 
+function extractWritingPlanActions(plan) {
+  return (Array.isArray(plan?.actions) ? plan.actions : [])
+    .map((action, index) => ({ action, index }))
+    .filter(({ action }) => (
+      action?.kind === 'chapter_generate'
+      || (action?.kind === 'chapter_workflow' && (action.mode || '') === 'draft')
+    ));
+}
+
+function resetAgentSegmentState() {
+  agentSegmentState.open = false;
+  agentSegmentState.starting = false;
+  agentSegmentState.running = false;
+  agentSegmentState.accepting = false;
+  agentSegmentState.planId = '';
+  agentSegmentState.promptActions = [];
+  agentSegmentState.actionCursor = 0;
+  agentSegmentState.session = null;
+  agentSegmentState.prompt = '';
+  agentSegmentState.draftText = '';
+  agentSegmentState.message = '';
+  agentSegmentState.error = '';
+  agentSegmentState.taskId = '';
+  agentSegmentState.focusChapterId = '';
+  agentSegmentState.streamResult = null;
+}
+
+function applyAgentSegmentSession(session, message = '') {
+  agentSegmentState.session = session;
+  agentSegmentState.prompt = session?.current_prompt?.editable_prompt || '';
+  const segment = session?.segments?.find((item) => item.index === session.current_segment_index);
+  agentSegmentState.draftText = segment?.draft_text || '';
+  agentSegmentState.message = message || session?.message || '';
+  agentSegmentState.error = '';
+}
+
+function agentSegmentPayloadFromAction(action) {
+  return {
+    project_id: props.project.id,
+    chapter_id: action.chapter_id || props.selectedChapterId,
+    instruction: String(action.instruction ?? '').trim(),
+    target_words: Number(action.target_words || (action.kind === 'chapter_workflow' ? 1800 : 0)),
+    style_name: String(action.style_name || executionOptions.styleName || '').trim(),
+    xp_preset: String(action.xp_preset || executionOptions.xpPreset || '').trim(),
+    characters_involved: String(action.characters_involved || executionOptions.charactersInvolved || '').trim(),
+    key_items: String(action.key_items || executionOptions.keyItems || '').trim(),
+    scene_location: String(action.scene_location || executionOptions.sceneLocation || '').trim(),
+    time_constraint: String(action.time_constraint || executionOptions.timeConstraint || '').trim(),
+    replace_existing: Boolean(action.replace_existing),
+  };
+}
+
+async function startAgentSegmentAction(actionRef, message = '') {
+  if (!actionRef?.action || !props.project?.id) {
+    agentSegmentState.error = '缺少可执行的写正文动作。';
+    return;
+  }
+  agentSegmentState.starting = true;
+  agentSegmentState.error = '';
+  agentSegmentState.message = message || '正在准备当前段提示词。';
+  try {
+    const session = await startChapterSegmentSession(agentSegmentPayloadFromAction(actionRef.action));
+    applyAgentSegmentSession(session, session.message || '已准备当前段提示词。');
+    agentSegmentState.focusChapterId = String(session.chapter_id || '');
+    emit('focus-chapter', session.chapter_id);
+  } catch (error) {
+    agentSegmentState.error = error instanceof Error ? error.message : '创建逐段写作会话失败';
+  } finally {
+    agentSegmentState.starting = false;
+    scheduleOperationStreamScrollToLatest({ smooth: true });
+  }
+}
+
+async function startAgentSegmentWritingFlow() {
+  if (!pendingPlan.value || running.value || agentSegmentBusy.value) {
+    return;
+  }
+  const writingActions = extractWritingPlanActions(pendingPlan.value);
+  if (writingActions.length === 0) {
+    openPlanConfirmModal();
+    return;
+  }
+  resetAgentSegmentState();
+  agentSegmentState.open = true;
+  agentSegmentState.planId = String(pendingPlan.value.id ?? '');
+  agentSegmentState.promptActions = writingActions;
+  agentSegmentState.actionCursor = 0;
+  planConfirmOpen.value = false;
+  await nextTick();
+  await startAgentSegmentAction(writingActions[0]);
+}
+
 function openPlanConfirmModal() {
   if (!pendingPlan.value || running.value) {
+    return;
+  }
+  if (pendingPlanHasWritingActions.value) {
+    void startAgentSegmentWritingFlow();
     return;
   }
 
@@ -907,6 +1070,7 @@ function chapterGeneratePreviewPayload(action) {
     key_items: String(action.key_items || executionOptions.keyItems || '').trim(),
     scene_location: String(action.scene_location || executionOptions.sceneLocation || '').trim(),
     time_constraint: String(action.time_constraint || executionOptions.timeConstraint || '').trim(),
+    replace_existing: Boolean(action.replace_existing),
   };
 }
 
@@ -964,6 +1128,155 @@ async function copyPlanPromptPreview(item) {
     planPromptPreviewMessage.value = '提示词已复制';
   } catch {
     planPromptPreviewMessage.value = '复制失败，可以手动选择文本复制';
+  }
+}
+
+async function copyAgentSegmentPrompt() {
+  const text = String(agentSegmentState.prompt ?? '').trim();
+  if (!text) {
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    agentSegmentState.message = '当前段提示词已复制';
+  } catch {
+    agentSegmentState.error = '复制失败，可以手动选择文本复制';
+  }
+}
+
+function handleAgentSegmentStreamEvent(event) {
+  if (event.event === 'started' && event.data && typeof event.data === 'object') {
+    agentSegmentState.taskId = String(event.data.task_id ?? '');
+    return;
+  }
+  if (event.event === 'progress' && event.data && typeof event.data === 'object') {
+    agentSegmentState.message = String(event.data.message ?? '正在处理当前段');
+    return;
+  }
+  if (event.event === 'result') {
+    agentSegmentState.streamResult = event.data;
+    return;
+  }
+  if (event.event === 'error' && event.data && typeof event.data === 'object') {
+    agentSegmentState.error = String(event.data.message ?? '当前段生成失败');
+  }
+}
+
+async function handleAgentSegmentGenerate(mode = 'draft') {
+  const session = agentSegmentState.session;
+  if (!session?.session_id || !props.project?.id) {
+    agentSegmentState.error = '先准备当前段提示词。';
+    return;
+  }
+  if (mode === 'polish' && !agentSegmentState.draftText.trim()) {
+    agentSegmentState.error = '当前段还没有正文，先生成本段。';
+    return;
+  }
+  agentSegmentState.running = true;
+  agentSegmentState.error = '';
+  agentSegmentState.streamResult = null;
+  try {
+    await streamChapterSegmentGenerate(
+      {
+        project_id: props.project.id,
+        session_id: session.session_id,
+        mode,
+        prompt_override: mode === 'draft' ? agentSegmentState.prompt.trim() : '',
+      },
+      handleAgentSegmentStreamEvent,
+    );
+    if (agentSegmentState.error) {
+      return;
+    }
+    if (agentSegmentState.streamResult?.session_id) {
+      applyAgentSegmentSession(agentSegmentState.streamResult, agentSegmentState.streamResult.message || '当前段已生成。');
+    }
+  } catch (error) {
+    agentSegmentState.error = error instanceof Error ? error.message : '当前段生成失败';
+  } finally {
+    agentSegmentState.running = false;
+    scheduleOperationStreamScrollToLatest({ smooth: true });
+  }
+}
+
+async function refreshProjectDetailAfterSegment(projectId) {
+  if (!projectId) {
+    return;
+  }
+  try {
+    const detail = await getProjectDetail(projectId);
+    if (props.project?.id === projectId) {
+      emit('project-detail-updated', detail);
+    }
+  } catch (error) {
+    agentSegmentState.message = `当前段已合并，但刷新项目详情失败：${error instanceof Error ? error.message : '未知错误'}`;
+  }
+}
+
+function finishAgentSegmentWritingFlow(message) {
+  const session = agentSegmentState.session;
+  const title = session ? `第 ${session.chapter_index} 章《${session.chapter_title}》` : '当前章节';
+  const assistantMessage = createMessage({
+    role: 'assistant',
+    mode: 'execution',
+    task_pack_kind: 'continuation',
+    content: message || `${title}逐段写作已完成，正文已合并到章节。`,
+    changes: [`已更新${title}正文`],
+  });
+  const nextMessages = [...discussionHistory.value, assistantMessage];
+  discussionHistory.value = nextMessages;
+  pendingPlan.value = null;
+  threadSuggestions.value = [];
+  syncActiveDiscussionThread({
+    messages: nextMessages,
+    suggestions: [],
+    pendingPlan: null,
+    activate: true,
+  });
+  resetAgentSegmentState();
+  scheduleOperationStreamScrollToLatest({ smooth: true });
+}
+
+async function handleAcceptAgentSegment() {
+  const session = agentSegmentState.session;
+  if (!session?.session_id || !props.project?.id) {
+    agentSegmentState.error = '先准备当前段提示词。';
+    return;
+  }
+  const acceptedText = agentSegmentState.draftText.trim();
+  if (!acceptedText) {
+    agentSegmentState.error = '当前段没有可合并正文。';
+    return;
+  }
+  agentSegmentState.accepting = true;
+  agentSegmentState.error = '';
+  try {
+    const nextSession = await acceptChapterSegment({
+      project_id: props.project.id,
+      session_id: session.session_id,
+      accepted_text: acceptedText,
+    });
+    applyAgentSegmentSession(nextSession, nextSession.message || '当前段已合并到章节。');
+    emit('focus-chapter', nextSession.chapter_id);
+    await refreshProjectDetailAfterSegment(props.project.id);
+    if (nextSession.status !== 'completed') {
+      return;
+    }
+
+    const nextCursor = agentSegmentState.actionCursor + 1;
+    if (nextCursor < agentSegmentState.promptActions.length) {
+      agentSegmentState.actionCursor = nextCursor;
+      await startAgentSegmentAction(agentSegmentState.promptActions[nextCursor], '上一章已完成，已准备下一章提示词。');
+      return;
+    }
+
+    finishAgentSegmentWritingFlow(
+      `${agentSegmentCurrentTitle.value}逐段写作已完成，正文已合并到章节。`,
+    );
+  } catch (error) {
+    agentSegmentState.error = error instanceof Error ? error.message : '合并当前段失败';
+  } finally {
+    agentSegmentState.accepting = false;
   }
 }
 
@@ -2053,6 +2366,25 @@ function togglePreviewPanel() {
   }
 
   previewCollapsed.value = !previewCollapsed.value;
+  if (previewCollapsed.value) {
+    agentPanelHidden.value = false;
+  }
+}
+
+function hideAgentPanelForReading() {
+  if (!canHideAgentPanel.value) {
+    return;
+  }
+
+  previewCollapsed.value = false;
+  agentPanelHidden.value = true;
+}
+
+function showAgentPanel() {
+  agentPanelHidden.value = false;
+  void nextTick(() => {
+    scheduleOperationStreamLatestButtonUpdate();
+  });
 }
 
 async function sendConversation(options = {}) {
@@ -2252,6 +2584,11 @@ async function handleComposerSubmit() {
     return;
   }
 
+  if (agentSegmentState.open) {
+    setComposerToolMessage('当前有逐段写作未完成，先关闭面板或接受当前段后再发新要求。', 'error');
+    return;
+  }
+
   await sendConversation();
 }
 
@@ -2279,6 +2616,7 @@ function handleCancelPlan() {
   planPromptPreviews.value = [];
   planPromptPreviewError.value = '';
   planPromptPreviewMessage.value = '';
+  resetAgentSegmentState();
   const systemMessage = createMessage({
     role: 'system',
     content: '当前计划已取消。你可以直接发新要求，我会按新的请求重新判断。',
@@ -2300,6 +2638,7 @@ function selectDiscussionThread(threadId) {
   composerText.value = '';
   clearComposerActiveSkill();
   clearComposerReferences();
+  resetAgentSegmentState();
   applyDiscussionThread(threadId);
 }
 
@@ -2310,9 +2649,11 @@ watch(
     clearComposerActiveSkill();
     clearComposerReferences();
     runtimeError.value = '';
+    resetAgentSegmentState();
     architectureSessionActive.value = false;
     forceDiscussionMode.value = false;
     discussionSaveMessage.value = '';
+    agentPanelHidden.value = false;
     executionOptions.styleName = '';
     executionOptions.xpPreset = '';
     executionOptions.charactersInvolved = '';
@@ -2333,11 +2674,18 @@ watch(
   (chapterId, previousChapterId) => {
     if (!chapterId) {
       previewCollapsed.value = true;
+      agentPanelHidden.value = false;
+      resetAgentSegmentState();
       return;
     }
 
     if (chapterId !== previousChapterId) {
       previewCollapsed.value = false;
+      if (agentSegmentState.open && agentSegmentState.focusChapterId === chapterId) {
+        agentSegmentState.focusChapterId = '';
+        return;
+      }
+      resetAgentSegmentState();
     }
   },
   { immediate: true },
@@ -2450,6 +2798,7 @@ onBeforeUnmount(() => {
         {
           'workspace-top-embedded': embedded,
           'workspace-top-preview-hidden': !embedded && !showPreviewPanel,
+          'workspace-top-agent-hidden': agentPanelHidden,
         },
       ]"
     >
@@ -2458,9 +2807,15 @@ onBeforeUnmount(() => {
         class="preview-panel"
         :project="project"
         :selected-chapter-id="selectedChapterId"
+        :agent-hidden="agentPanelHidden"
+        @project-detail-updated="emit('project-detail-updated', $event)"
+        @show-agent="showAgentPanel"
       />
 
-      <section class="operation-panel">
+      <section
+        v-if="!agentPanelHidden"
+        class="operation-panel"
+      >
         <header class="operation-header operation-header-compact">
           <div class="operation-header-copy operation-header-copy-compact">
             <strong class="operation-header-title">Agent 对话</strong>
@@ -2483,6 +2838,14 @@ onBeforeUnmount(() => {
               @click="togglePreviewPanel"
             >
               {{ previewCollapsed ? '显示正文' : '收起正文' }}
+            </button>
+            <button
+              v-if="canHideAgentPanel"
+              class="secondary-button small-button operation-preview-toggle"
+              type="button"
+              @click="hideAgentPanelForReading"
+            >
+              隐藏 Agent
             </button>
 
             <span
@@ -2590,13 +2953,146 @@ onBeforeUnmount(() => {
                   <button
                     class="primary-button small-button plan-execute-button"
                     data-testid="agent-plan-confirm-button"
+                    :disabled="agentSegmentState.open || agentSegmentBusy"
                     type="button"
                     @click="openPlanConfirmModal"
                   >
-                    执行当前计划
+                    {{ pendingPlanHasWritingActions ? agentSegmentState.open ? '逐段写作中' : '开始逐段写作' : '执行当前计划' }}
                   </button>
                 </template>
               </AgentPlanCard>
+
+              <section
+                v-if="isPlanMessageActive(item) && agentSegmentState.open && agentSegmentState.planId === item.plan?.id"
+                class="chapter-prompt-preview agent-segment-panel"
+                data-testid="agent-chapter-segment-panel"
+              >
+                <div class="chapter-prompt-preview-head">
+                  <div>
+                    <strong>当前段提示词</strong>
+                    <p>
+                      {{ agentSegmentCurrentTitle }}
+                      <span v-if="agentSegmentProgressLabel"> · {{ agentSegmentProgressLabel }}</span>
+                      <span v-if="agentSegmentWordLabel"> · {{ agentSegmentWordLabel }}</span>
+                    </p>
+                  </div>
+                  <button
+                    class="secondary-button small-button"
+                    :disabled="agentSegmentBusy"
+                    data-testid="agent-chapter-segment-close-button"
+                    type="button"
+                    @click="resetAgentSegmentState"
+                  >
+                    关闭
+                  </button>
+                </div>
+
+                <p
+                  v-if="agentSegmentState.error"
+                  class="prompt-preview-error"
+                  data-testid="agent-chapter-segment-error"
+                >
+                  {{ agentSegmentState.error }}
+                </p>
+                <p
+                  v-else-if="agentSegmentState.message"
+                  class="prompt-preview-message"
+                  data-testid="agent-chapter-segment-message"
+                >
+                  {{ agentSegmentState.message }}
+                </p>
+
+                <div
+                  v-if="agentSegmentState.session?.segments?.length"
+                  class="agent-segment-list"
+                >
+                  <span
+                    v-for="segment in agentSegmentState.session.segments"
+                    :key="segment.index"
+                    :class="[
+                      'agent-segment-pill',
+                      {
+                        'agent-segment-pill-active': segment.index === agentSegmentState.session.current_segment_index,
+                        'agent-segment-pill-done': segment.status === 'accepted',
+                      },
+                    ]"
+                  >
+                    {{ segment.title || `第 ${segment.index} 段` }}
+                    · {{ segment.accepted_word_count || segment.draft_word_count || segment.target_words || 0 }} 字
+                  </span>
+                </div>
+
+                <label
+                  v-if="!isAgentSegmentCompleted"
+                  class="segment-editor-field"
+                >
+                  <span>当前段提示词</span>
+                  <textarea
+                    v-model="agentSegmentState.prompt"
+                    class="chapter-prompt-editor"
+                    data-testid="agent-chapter-segment-prompt-editor"
+                    rows="12"
+                  />
+                </label>
+
+                <div
+                  v-if="!isAgentSegmentCompleted"
+                  class="architecture-confirm-actions agent-segment-actions"
+                >
+                  <button
+                    class="secondary-button"
+                    type="button"
+                    @click="copyAgentSegmentPrompt"
+                  >
+                    复制提示词
+                  </button>
+                  <button
+                    :disabled="agentSegmentBusy || !agentSegmentState.prompt.trim()"
+                    class="primary-button"
+                    data-testid="agent-chapter-segment-generate-button"
+                    type="button"
+                    @click="handleAgentSegmentGenerate('draft')"
+                  >
+                    {{ agentSegmentState.running ? '生成中…' : activeAgentSegment?.draft_text ? '重新生成本段' : '生成本段' }}
+                  </button>
+                  <button
+                    :disabled="agentSegmentBusy || !agentSegmentState.draftText.trim()"
+                    class="secondary-button"
+                    type="button"
+                    @click="handleAgentSegmentGenerate('polish')"
+                  >
+                    润色本段
+                  </button>
+                </div>
+
+                <label
+                  v-if="agentSegmentState.draftText"
+                  class="segment-editor-field"
+                >
+                  <span>当前段正文</span>
+                  <textarea
+                    v-model="agentSegmentState.draftText"
+                    class="chapter-prompt-editor segment-draft-editor"
+                    data-testid="agent-chapter-segment-draft-editor"
+                    rows="16"
+                  />
+                </label>
+
+                <div
+                  v-if="agentSegmentState.draftText && !isAgentSegmentCompleted"
+                  class="architecture-confirm-actions agent-segment-actions"
+                >
+                  <button
+                    :disabled="agentSegmentBusy"
+                    class="primary-button"
+                    data-testid="agent-chapter-segment-accept-button"
+                    type="button"
+                    @click="handleAcceptAgentSegment"
+                  >
+                    {{ agentSegmentState.accepting ? '合并中…' : '接受并合并到章节' }}
+                  </button>
+                </div>
+              </section>
 
               <section
                 v-if="hasMessageThinkingProcess(item)"
@@ -2726,7 +3222,7 @@ onBeforeUnmount(() => {
         </div>
 
         <button
-          v-if="operationStreamNeedsLatestButton"
+          v-if="!agentPanelHidden && operationStreamNeedsLatestButton"
           aria-label="滑到最新消息"
           class="latest-scroll-button"
           data-testid="agent-scroll-to-latest-button"
@@ -2780,7 +3276,10 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <footer :class="['composer-shell', { 'composer-shell-architecture': showArchitectureStage }]">
+    <footer
+      v-if="!agentPanelHidden"
+      :class="['composer-shell', { 'composer-shell-architecture': showArchitectureStage }]"
+    >
       <input
         ref="composerFileInput"
         :accept="importAcceptValue()"
@@ -3158,7 +3657,8 @@ onBeforeUnmount(() => {
 }
 
 .workspace-top-preview-hidden,
-.workspace-top-embedded {
+.workspace-top-embedded,
+.workspace-top-agent-hidden {
   grid-template-columns: minmax(0, 1fr);
 }
 
@@ -4129,6 +4629,50 @@ onBeforeUnmount(() => {
   font-family: 'SFMono-Regular', ui-monospace, monospace;
   font-size: 12px;
   line-height: 1.7;
+}
+
+.agent-segment-panel {
+  margin-top: 12px;
+}
+
+.agent-segment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.agent-segment-pill {
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #eef2f7;
+  color: #57606a;
+  font-size: 12px;
+}
+
+.agent-segment-pill-active {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.agent-segment-pill-done {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.segment-editor-field {
+  display: grid;
+  gap: 6px;
+  color: #3d4650;
+  font-size: 13px;
+}
+
+.segment-draft-editor {
+  min-height: 320px;
+}
+
+.agent-segment-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
 }
 
 .primary-button,

@@ -342,34 +342,89 @@ async function verifyAgentScrollToLatestButton(page, label) {
   await waitForAgentOperationStreamAtBottom(page, `${label} 点击回到底部按钮`);
 }
 
-async function confirmAgentPlanWithPromptEdit(page, marker) {
-  await page.getByTestId('agent-plan-confirm-button').first().waitFor({ timeout: 60000 });
-  await page.getByTestId('agent-plan-confirm-button').first().click();
-  await page.getByTestId('agent-plan-confirm-modal').waitFor();
-  await page.getByTestId('agent-plan-prompt-preview').waitFor({ timeout: 60000 });
+async function verifyChapterPreviewFocusMode(page, expectedText) {
+  await page.getByRole('button', { name: '隐藏 Agent' }).waitFor();
+  await page.getByRole('button', { name: '隐藏 Agent' }).click();
+  await page.getByRole('button', { name: '显示 Agent' }).waitFor();
+  await page.waitForFunction(() => !document.querySelector('[data-testid="agent-operation-stream"]'));
+  await waitForChapterPreviewContent(page, expectedText);
+
+  await page.getByRole('button', { name: '编辑正文' }).click();
+  await page.getByTestId('chapter-preview-editor').waitFor();
+  const editorValue = await page.getByTestId('chapter-preview-editor').inputValue();
+  if (!editorValue.includes(expectedText)) {
+    throw new Error('正文编辑框没有带入当前章节正文');
+  }
+  const editorLayout = await page.evaluate(() => {
+    const panel = document.querySelector('[data-testid="chapter-preview-panel"]');
+    const article = document.querySelector('.article-preview');
+    const editor = document.querySelector('[data-testid="chapter-preview-editor"]');
+    return {
+      panelHeight: panel instanceof HTMLElement ? panel.getBoundingClientRect().height : 0,
+      articleHeight: article instanceof HTMLElement ? article.getBoundingClientRect().height : 0,
+      editorHeight: editor instanceof HTMLElement ? editor.getBoundingClientRect().height : 0,
+    };
+  });
+  if (
+    editorLayout.panelHeight < 720
+    || editorLayout.articleHeight < 560
+    || editorLayout.editorHeight < 560
+  ) {
+    throw new Error(`正文编辑态高度异常：${JSON.stringify(editorLayout)}`);
+  }
+  await page.getByRole('button', { name: '保存并同步' }).waitFor();
+  await page.getByRole('button', { name: '取消' }).click();
+  await page.getByRole('button', { name: '显示 Agent' }).click();
+  await page.getByTestId('agent-operation-stream').waitFor();
+  await page.getByRole('button', { name: '隐藏 Agent' }).waitFor();
+}
+
+async function confirmAgentWritingSegmentWithPromptEdit(page, marker, expectedPlanText = '') {
+  const planCard = expectedPlanText
+    ? page.getByTestId('agent-plan-card').filter({ hasText: expectedPlanText }).last()
+    : page.getByTestId('agent-plan-card').last();
+  await planCard.waitFor({ timeout: 60000 });
+  const confirmButton = planCard.getByTestId('agent-plan-confirm-button');
+  await confirmButton.waitFor({ timeout: 60000 });
+  await confirmButton.click();
+  await page.getByTestId('agent-chapter-segment-panel').waitFor({ timeout: 60000 });
   await page.waitForFunction(() => {
-    const editor = document.querySelector('[data-testid="agent-plan-prompt-editor"]');
-    const error = document.querySelector('[data-testid="agent-plan-prompt-error"]');
+    const editor = document.querySelector('[data-testid="agent-chapter-segment-prompt-editor"]');
+    const error = document.querySelector('[data-testid="agent-chapter-segment-error"]');
     return (
       editor instanceof HTMLTextAreaElement
       || (error instanceof HTMLElement && Boolean(error.textContent?.trim()))
     );
   });
-  const errorText = await page.getByTestId('agent-plan-prompt-error').textContent().catch(() => '');
+  const errorText = await page.getByTestId('agent-chapter-segment-error').textContent().catch(() => '');
   if (String(errorText ?? '').trim()) {
-    throw new Error(`章节提示词预览失败：${String(errorText ?? '').trim()}`);
+    throw new Error(`当前段提示词预览失败：${String(errorText ?? '').trim()}`);
   }
-  const editor = page.getByTestId('agent-plan-prompt-editor').first();
+  const editor = page.getByTestId('agent-chapter-segment-prompt-editor').first();
   await page.waitForFunction(() => {
-    const textarea = document.querySelector('[data-testid="agent-plan-prompt-editor"]');
-    return textarea instanceof HTMLTextAreaElement && textarea.value.includes('连续性证据包');
+    const textarea = document.querySelector('[data-testid="agent-chapter-segment-prompt-editor"]');
+    return textarea instanceof HTMLTextAreaElement && textarea.value.trim().length > 20;
   });
   const promptBefore = await editor.inputValue();
-  if (!promptBefore.includes('写作任务：生成可直接保存的章节正文')) {
-    throw new Error('章节提示词预览缺少正文生成任务说明');
+  if (promptBefore.trim().length <= 20) {
+    throw new Error('当前段提示词为空或过短');
   }
   await editor.fill(`${promptBefore}\n\nUI smoke 提示词编辑标记：${marker}`);
-  await page.getByTestId('agent-plan-confirm-execute-button').click();
+  await page.getByTestId('agent-chapter-segment-generate-button').click();
+  await page.getByTestId('agent-chapter-segment-draft-editor').waitFor({ timeout: 60000 });
+  const draftText = await page.getByTestId('agent-chapter-segment-draft-editor').inputValue();
+  if (!draftText.trim()) {
+    throw new Error('当前段生成后正文为空');
+  }
+  await page.getByTestId('agent-chapter-segment-accept-button').click();
+  await page.waitForFunction(() => {
+    const button = document.querySelector('[data-testid="agent-chapter-segment-accept-button"]');
+    return !(button instanceof HTMLButtonElement) || !button.disabled;
+  }, { timeout: 60000 });
+  const closeButton = page.getByTestId('agent-chapter-segment-close-button');
+  if (await closeButton.isVisible().catch(() => false)) {
+    await closeButton.click();
+  }
 }
 
 async function resolveChromePath() {
@@ -527,6 +582,19 @@ function architectureStepContent(label) {
 
 function mockRouteResult(userText) {
   const normalized = String(userText ?? '');
+  if (/重新\s*(?:写|生成)?\s*(?:第\s*)?[0-9零一二三四五六七八九十百两]+章|重写\s*(?:第\s*)?[0-9零一二三四五六七八九十百两]+章/u.test(normalized)) {
+    return {
+      intent: 'write_chapter',
+      objective: '重新生成章节正文',
+      chapter_index: 1,
+      chapter_title: '第一章 雨夜靠港',
+      rewrite_mode: '',
+      replace_existing: true,
+      new_chapters: 0,
+      use_next_chapter: false,
+      reason: '用户要求重写章节',
+    };
+  }
   if (/续写|写这一章|补完本章/u.test(normalized)) {
     return {
       intent: 'write_chapter',
@@ -534,6 +602,7 @@ function mockRouteResult(userText) {
       chapter_index: 1,
       chapter_title: '第一章 雨夜靠港',
       rewrite_mode: '',
+      replace_existing: false,
       new_chapters: 0,
       use_next_chapter: false,
       reason: '用户明确要续写',
@@ -546,6 +615,7 @@ function mockRouteResult(userText) {
       chapter_index: 0,
       chapter_title: '',
       rewrite_mode: '',
+      replace_existing: false,
       new_chapters: 0,
       use_next_chapter: false,
       reason: '用户明确要补架构',
@@ -557,6 +627,7 @@ function mockRouteResult(userText) {
     chapter_index: 0,
     chapter_title: '',
     rewrite_mode: '',
+    replace_existing: false,
     new_chapters: 0,
     use_next_chapter: false,
     reason: '用户在讨论方向',
@@ -614,6 +685,26 @@ function mockPlanResult(userText) {
           kind: 'generate_architecture',
           label: '生成整书架构',
           instruction: normalized,
+        },
+      ],
+    };
+  }
+
+  if (/重新\s*(?:写|生成)?\s*(?:第\s*)?[0-9零一二三四五六七八九十百两]+章|重写\s*(?:第\s*)?[0-9零一二三四五六七八九十百两]+章/u.test(normalized)) {
+    return {
+      mode: 'plan',
+      title: '重写第 1 章正文',
+      summary: '先看当前章节状态，再从头重写正文。',
+      requires_confirmation: true,
+      actions: [
+        {
+          kind: 'chapter_generate',
+          label: '重写第 1 章正文',
+          chapter_target: 'exact',
+          chapter_index: 1,
+          instruction: normalized,
+          target_words: 1800,
+          replace_existing: true,
         },
       ],
     };
@@ -1367,6 +1458,7 @@ async function runSmoke(previewUrl, backendUrl) {
     await openSelectedProjectFirstChapter(page);
     await page.getByTestId('chapter-preview-panel').waitFor();
     await waitForChapterPreviewContent(page, token);
+    await verifyChapterPreviewFocusMode(page, token);
     if (await page.getByTestId('agent-session-window').isVisible().catch(() => false)) {
       throw new Error('空对话 session 区不应显示');
     }
@@ -1410,16 +1502,7 @@ async function runSmoke(previewUrl, backendUrl) {
       return textarea instanceof HTMLTextAreaElement && textarea.value === '';
     });
     await waitForAgentOperationStreamAtBottom(page, '发送章节续写请求');
-    await confirmAgentPlanWithPromptEdit(page, '追兵脚步必须压近');
-    await page.getByTestId('agent-artifact-card').first().waitFor({ timeout: 60000 });
-    const visibleChapterTimelineCount = await page.locator('[data-testid="agent-timeline"]:visible').count();
-    if (visibleChapterTimelineCount > 0) {
-      throw new Error('Agent 执行完成后不应继续显示执行步骤列表');
-    }
-    const visibleChapterEventSummaryCount = await page.locator('[data-testid="agent-event-block-summary"]:visible').count();
-    if (visibleChapterEventSummaryCount > 0) {
-      throw new Error('Agent 执行完成后不应继续显示阶段摘要');
-    }
+    await confirmAgentWritingSegmentWithPromptEdit(page, '追兵脚步必须压近', '生成第 1 章正文');
     await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来', { timeoutMs: 60000 });
     await waitForChapterPreviewContent(page, '潮声后面有人跟来');
     await page.locator('[data-testid^="agent-session-row-"]').first().waitFor();
@@ -1438,9 +1521,27 @@ async function runSmoke(previewUrl, backendUrl) {
     });
     await waitForAgentOperationStreamAtBottom(page, '发送第二章生成请求');
     await page.getByTestId('agent-plan-card').getByText(/生成第 2 章正文/u).first().waitFor();
-    await confirmAgentPlanWithPromptEdit(page, '第二章必须承接第一章灯塔线索');
+    await confirmAgentWritingSegmentWithPromptEdit(page, '第二章必须承接第一章灯塔线索', '生成第 2 章正文');
     await waitForProjectChapterNonEmpty(backendUrl, seededProject.id, 'chapter-002', { timeoutMs: 60000 });
     await verifyAgentScrollToLatestButton(page, '多轮 Agent 对话');
+
+    log('检查重新第一章会显示当前段提示词');
+    await waitForWorkspaceComposerReady(page);
+    await page.getByTestId('workspace-composer-input').fill('重新第一章');
+    await page.locator('.composer-submit-button').click();
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('[data-testid="workspace-composer-input"]');
+      return textarea instanceof HTMLTextAreaElement && textarea.value === '';
+    });
+    await waitForAgentOperationStreamAtBottom(page, '发送第一章重写请求');
+    await page.getByTestId('agent-plan-card').getByText(/重写第 1 章正文/u).first().waitFor();
+    await confirmAgentWritingSegmentWithPromptEdit(page, '重写第一章必须先保留铜钥匙压力', '重写第 1 章正文');
+    await waitForProjectChapterContent(backendUrl, seededProject.id, 'chapter-001', '潮声后面有人跟来', { timeoutMs: 60000 });
+    const detailAfterRewrite = await apiRequest(backendUrl, `/api/projects/${seededProject.id}`);
+    const rewrittenChapter = detailAfterRewrite?.chapters?.find((item) => item.id === 'chapter-001');
+    if (String(rewrittenChapter?.content ?? '').includes('主角擅长开锁')) {
+      throw new Error('重新第一章应替换旧章节内容，不应追加到旧稿后面');
+    }
 
     log('检查混合命令优先走架构');
     await waitForWorkspaceComposerReady(page);

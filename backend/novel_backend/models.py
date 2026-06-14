@@ -891,6 +891,7 @@ class AgentPlanAction(BaseModel):
   scene_location: str = Field(default="", max_length=300)
   time_constraint: str = Field(default="", max_length=300)
   prompt_override: str = Field(default="", max_length=600000)
+  replace_existing: bool = False
   skill_ids: list[str] = Field(default_factory=list, max_length=5)
 
 
@@ -1053,6 +1054,7 @@ class ChapterGenerateRequest(BaseModel):
   scene_location: str = Field(default="", max_length=300)
   time_constraint: str = Field(default="", max_length=300)
   prompt_override: str = Field(default="", max_length=600000)
+  replace_existing: bool = False
 
 
 class ChapterGenerateResult(BaseModel):
@@ -1061,6 +1063,48 @@ class ChapterGenerateResult(BaseModel):
   summary: str
   content: str
   next_action: str = ""
+
+
+class ChapterSegmentGenerateRequest(BaseModel):
+  project_id: str = Field(min_length=1, max_length=120)
+  session_id: str = Field(min_length=1, max_length=80)
+  mode: str = Field(default="draft", pattern="^(draft|polish)$")
+  prompt_override: str = Field(default="", max_length=600000)
+
+
+class ChapterSegmentAcceptRequest(BaseModel):
+  project_id: str = Field(min_length=1, max_length=120)
+  session_id: str = Field(min_length=1, max_length=80)
+  accepted_text: str = Field(default="", max_length=600000)
+
+
+class ChapterSegmentItem(BaseModel):
+  index: int = Field(ge=1, le=20)
+  title: str = ""
+  target_words: int = Field(default=1800, ge=300, le=10000)
+  status: str = Field(default="pending", pattern="^(pending|draft|accepted|discarded)$")
+  draft_text: str = ""
+  draft_word_count: int = Field(default=0, ge=0)
+  accepted_word_count: int = Field(default=0, ge=0)
+  summary: str = ""
+  next_action: str = ""
+  updated_at: str = ""
+
+
+class ChapterSegmentSessionResponse(BaseModel):
+  session_id: str
+  project_id: str
+  chapter_id: str
+  chapter_index: int
+  chapter_title: str
+  status: str = Field(pattern="^(ready|generating|draft_ready|completed)$")
+  target_word_count: int = Field(default=0, ge=0)
+  completion_threshold_words: int = Field(default=0, ge=0)
+  current_word_count: int = Field(default=0, ge=0)
+  current_segment_index: int = Field(default=1, ge=1, le=20)
+  segments: list[ChapterSegmentItem] = Field(default_factory=list)
+  current_prompt: ChapterPromptPreviewResponse | None = None
+  message: str = ""
 
 
 class ChapterRewriteRequest(BaseModel):

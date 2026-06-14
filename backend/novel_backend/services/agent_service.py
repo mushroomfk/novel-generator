@@ -156,13 +156,14 @@ JSON 字段固定为：
 - chapter_index: 整数，没有就填 0
 - chapter_title: 没有就填空字符串
 - rewrite_mode: finalize | polish | humanize | 空字符串
+- replace_existing: true 或 false，只有用户明确要从头重写当前章/某一章正文时为 true
 - new_chapters: 整数，没有就填 0
 - use_next_chapter: true 或 false
 - reason: 20 字以内，说明你为什么这样判断
 
 判断规则：
 1. 用户在聊故事方向、人物关系、题材、冲突、下一步怎么推进，intent 选 discussion。
-2. 用户要系统直接写正文、续写、补完本章，intent 选 write_chapter。
+2. 用户要系统直接写正文、续写、补完本章，或从头重写某一章正文，intent 选 write_chapter；从头重写时 replace_existing=true。
 3. 用户要判断当前章节问题、看节奏、看哪里不对，intent 选 diagnose_chapter。
 4. 用户要拆场景、列场景清单，intent 选 scene_chapter。
 5. 用户要润色、改稿、定稿、去 AI，intent 选 rewrite_chapter，并填 rewrite_mode。
@@ -196,6 +197,7 @@ JSON 结构固定为：
       "mode": "diagnose | scenes | draft | finalize | polish | humanize | 空字符串",
       "new_chapters": 0,
       "target_words": 0,
+      "replace_existing": false,
       "skill_ids": ["可选，用户沉淀技能 id"]
     }
   ]
@@ -206,7 +208,7 @@ JSON 结构固定为：
 2. 用户要“重写架构、重新整理蓝图、重做整书规划”时，用 generate_architecture，不要误判成 chapter_generate。
 3. 用户要求“先分析资料，再做后续工作”时，把 review_knowledge 放在前面。
 4. 用户只是讨论方向、人物、冲突、下一步怎么推进时，用 brainstorm，requires_confirmation 设为 false。
-5. chapter_generate 只在用户明确要写正文时使用。
+5. chapter_generate 只在用户明确要写正文时使用；用户说从头重写某一章正文时也使用 chapter_generate，并设置 replace_existing=true。
 6. continue_project 只用于“继续往后规划几章”，不要拿它代替 generate_architecture。
 7. 如果请求不适合执行任何动作，就返回 mode=reply，说明原因。
 8. 除了 brainstorm、diagnose、scenes、一致性检查，其他会改动项目内容或技能文件的动作默认应该要求确认。
@@ -303,6 +305,7 @@ class RoutingDecision:
   chapter_index: int = 0
   chapter_title: str = ""
   rewrite_mode: str = ""
+  replace_existing: bool = False
   new_chapters: int = 0
   use_next_chapter: bool = False
   reason: str = ""
@@ -1875,6 +1878,23 @@ def _chapter_title_from_text(text: str) -> str:
   return matched.group(1).strip() if matched else ""
 
 
+def _instruction_requests_chapter_replacement(text: str) -> bool:
+  normalized = str(text or "").strip()
+  if not normalized:
+    return False
+  lower_text = normalized.lower()
+  if _ARCHITECTURE_CONTEXT_PATTERN.search(normalized):
+    return False
+  if re.search(r"(去\s*ai|去机器味|去模板味|润色|修订|改稿|修稿|定稿|精修|只改|小改|调整|分析|检查|判断|诊断|拆场景|场景)", lower_text):
+    return False
+  rewrite_marker = re.search(r"(重新\s*(?:写|生成|来|开始|起草)?|重写|从头写|推倒重来)", normalized)
+  if not rewrite_marker:
+    return False
+  if _chapter_number_from_text(normalized) > 0:
+    return True
+  return bool(re.search(r"(本章|这一章|当前章|当前章节|章节正文|正文)", normalized))
+
+
 def _new_chapter_count_from_text(text: str) -> int:
   matched = _NEW_CHAPTER_COUNT_PATTERN.search(text)
   if not matched:
@@ -1934,6 +1954,8 @@ def _chapter_step_text(action: AgentPlanAction, runtime: RuntimeState) -> str:
     return f"基于现有架构继续扩写后续 {action.new_chapters or 5} 章规划"
 
   if action.kind == "chapter_generate":
+    if action.replace_existing:
+      return f"从头重写{chapter_label}正文，确认后替换当前章节"
     return f"生成{chapter_label}正文并写回项目"
 
   if action.kind == "chapter_workflow":
@@ -2106,6 +2128,11 @@ def _build_action_from_plan_payload(
       payload["chapter_title"] = user_chapter_title
     payload["chapter_target"] = "exact"
 
+  replace_existing = _bool_from_value(payload.get("replace_existing"), False) or _instruction_requests_chapter_replacement(action_instruction)
+  if kind == "rewrite_chapter" and replace_existing:
+    kind = "chapter_generate"
+    mode = ""
+
   if kind == "continue_project":
     return AgentPlanAction(
       kind=kind,
@@ -2133,7 +2160,7 @@ def _build_action_from_plan_payload(
     )
     return AgentPlanAction(
       kind=kind,
-      label=payload_label or f"生成第 {chapter.index} 章正文",
+      label=payload_label or (f"重写第 {chapter.index} 章正文" if replace_existing else f"生成第 {chapter.index} 章正文"),
       task_pack_kind=_task_pack_kind_for_action(kind, action_instruction, mode),
       chapter_id=chapter.id,
       instruction=action_instruction,
@@ -2144,6 +2171,7 @@ def _build_action_from_plan_payload(
       key_items=request.key_items,
       scene_location=request.scene_location,
       time_constraint=request.time_constraint,
+      replace_existing=replace_existing,
       skill_ids=action_skill_ids,
     ), None
 
@@ -2858,6 +2886,17 @@ def _heuristic_route(text: str) -> RoutingDecision:
       reason="用户只要初稿",
     )
 
+  if _instruction_requests_chapter_replacement(normalized):
+    return RoutingDecision(
+      intent="write_chapter",
+      objective="重新生成章节正文",
+      chapter_index=chapter_index,
+      chapter_title=chapter_title,
+      replace_existing=True,
+      use_next_chapter=use_next_chapter,
+      reason="命中重写正文",
+    )
+
   if re.search(r"(去\s*ai|去机器味|去模板味|更像人写|人味)", lower_text):
     return RoutingDecision(
       intent="rewrite_chapter",
@@ -2996,12 +3035,19 @@ def _route_with_model(
   payload = _extract_json_object(content)
   if not isinstance(payload, dict):
     raise RuntimeError("路由结果不是合法 JSON")
+  replace_existing = _bool_from_value(payload.get("replace_existing"), False) or _instruction_requests_chapter_replacement(latest_user_prompt)
+  intent = _string_from_keys(payload, "intent") or "unknown"
+  rewrite_mode = _string_from_keys(payload, "rewrite_mode", "mode")
+  if replace_existing and intent == "rewrite_chapter":
+    intent = "write_chapter"
+    rewrite_mode = ""
   return RoutingDecision(
-    intent=_string_from_keys(payload, "intent") or "unknown",
+    intent=intent,
     objective=_string_from_keys(payload, "objective", "goal"),
     chapter_index=int(payload.get("chapter_index") or 0),
     chapter_title=_string_from_keys(payload, "chapter_title", "title"),
-    rewrite_mode=_string_from_keys(payload, "rewrite_mode", "mode"),
+    rewrite_mode=rewrite_mode,
+    replace_existing=replace_existing,
     new_chapters=int(payload.get("new_chapters") or 0),
     use_next_chapter=bool(payload.get("use_next_chapter")),
     reason=_string_from_keys(payload, "reason", "why"),
@@ -3271,7 +3317,7 @@ def _build_plan(runtime: RuntimeState, decision: RoutingDecision, instruction: s
       actions.append(
         AgentPlanAction(
           kind="chapter_generate",
-          label=f"生成第 {target_chapter.index} 章正文",
+          label=f"重写第 {target_chapter.index} 章正文" if decision.replace_existing else f"生成第 {target_chapter.index} 章正文",
           task_pack_kind=_task_pack_kind_for_action("chapter_generate", instruction),
           chapter_id=target_chapter.id,
           instruction=instruction,
@@ -3282,9 +3328,13 @@ def _build_plan(runtime: RuntimeState, decision: RoutingDecision, instruction: s
           key_items=payload.key_items,
           scene_location=payload.scene_location,
           time_constraint=payload.time_constraint,
+          replace_existing=decision.replace_existing,
         )
       )
-      steps.append(f"生成第 {target_chapter.index} 章《{target_chapter.title}》正文并写回项目")
+      if decision.replace_existing:
+        steps.append(f"从头重写第 {target_chapter.index} 章《{target_chapter.title}》正文，确认后替换当前章节")
+      else:
+        steps.append(f"生成第 {target_chapter.index} 章《{target_chapter.title}》正文并写回项目")
     elif decision.intent == "diagnose_chapter":
       actions.append(
         AgentPlanAction(
@@ -3681,6 +3731,8 @@ def _chapter_generate_instruction(action: AgentPlanAction, knowledge_summary: st
     skill_prompt=skill_prompt,
   )
   parts = [merged_instruction] if merged_instruction else []
+  if action.replace_existing:
+    parts.append("从本章开头重写，生成内容确认后替换当前章节；已有正文只作为事实和文风参考。")
   if action.target_words > 0:
     parts.append(f"目标长度约 {action.target_words} 字。")
   return _compose_execution_instruction("\n".join(parts).strip(), limit=2000)
@@ -3708,6 +3760,7 @@ def _execute_chapter_generate(
       scene_location=action.scene_location,
       time_constraint=action.time_constraint,
       prompt_override=action.prompt_override,
+      replace_existing=action.replace_existing,
     ),
     task_id,
   )

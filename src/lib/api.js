@@ -700,6 +700,24 @@ export async function previewChapterGeneratePrompt(payload) {
   });
 }
 
+export async function startChapterSegmentSession(payload) {
+  return request('/api/studio/chapter-segments/start', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function streamChapterSegmentGenerate(payload, onEvent) {
+  return streamRequest('/api/studio/chapter-segments/generate/stream', payload, onEvent);
+}
+
+export async function acceptChapterSegment(payload) {
+  return request('/api/studio/chapter-segments/accept', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function streamChapterFinalize(payload, onEvent) {
   return streamRequest('/api/studio/chapter-finalize/stream', payload, onEvent);
 }

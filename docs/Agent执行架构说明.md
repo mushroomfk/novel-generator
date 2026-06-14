@@ -72,7 +72,9 @@
    - 导入成功会通过 `project_updated` 和结果里的 `project_detail / changes` 返回给前端；如果全部候选段都被判定为不适合进入小说资料库，本轮只返回跳过提示，不创建 `Agent长输入-*` 资料；不会静默写入外部 Obsidian Vault
 
 10. 章节提示词确认与编辑
-   - Agent 计划确认弹窗会为 `chapter_generate` 和 `chapter_workflow/draft` 调用章节提示词预览接口，显示完整 messages、可复制文本和可编辑正文提示词
+   - Agent 主会话里的 `chapter_generate` 和 `chapter_workflow/draft` 写正文计划会进入逐段写作面板，调用 `chapter-segments/start` 显示当前段提示词；作者复制或修改后，本次文本作为 `prompt_override` 进入当前段生成，不写入章节、资料库或会话历史
+   - “重新第一章”“重写第 1 章”这类从头重写章节正文请求会被规划成 `chapter_generate`，并带 `replace_existing=true`；面板同样先显示当前段提示词，第一段接受后替换旧章节正文，后续段落接续新稿
+   - 非写正文计划继续走普通计划确认；技能库单章生成、技能库续写正文和小批量生成仍使用对应提示词预览接口显示完整 messages、可复制文本和可编辑正文提示词
    - 作者确认后，前端把编辑后的文本写回对应 action 的 `prompt_override`
    - 执行阶段仍会读取该章上下文、连续性合同、Vault 约束和资料证据；编辑后的文本只替换正文写作模型的用户消息
    - 生成出的正文继续进入承接冲突检查、候选审校、必要修订、后续去 AI 和一致性复查

@@ -1376,6 +1376,7 @@ def _generate_continuation_brief(
   key_items: str = "",
   scene_location: str = "",
   time_constraint: str = "",
+  replace_existing: bool = False,
 ) -> dict[str, object]:
   context_query = _continuation_context_query(
     settings,
@@ -1444,6 +1445,7 @@ def _continuation_single_write_messages(
   instruction: str,
   target_words: int,
   support_text: str,
+  replace_existing: bool = False,
 ) -> list[dict[str, object]]:
   return [
     {"role": "system", "content": _CONTINUATION_WRITE_SYSTEM_PROMPT},
@@ -1453,6 +1455,7 @@ def _continuation_single_write_messages(
         f"{context_text}\n\n"
         f"连续性证据包：\n{evidence_text}\n\n"
         f"承接简报：\n{_continuation_brief_block(brief)}\n\n"
+        f"写作方式：{'从本章开头写新正文，已有正文只作事实参考，输出会替换旧章节。' if replace_existing else '承接已有章节正文继续写。'}\n"
         f"用户补充：{instruction.strip() or '无'}\n"
         f"目标长度：约 {target_words} 字\n"
         f"{support_text or ''}"
@@ -1577,6 +1580,7 @@ def _generate_continuation_plan(
   key_items: str = "",
   scene_location: str = "",
   time_constraint: str = "",
+  replace_existing: bool = False,
 ) -> dict[str, object]:
   context_query = _continuation_context_query(
     settings,
@@ -1648,7 +1652,7 @@ def _generate_continuation_plan(
         f"当前状态：\n{_compact_rules(canon['current_state'])}\n"
         f"表达约束：\n{_compact_rules(canon['voice_rules'])}\n"
         f"不要改动：\n{_compact_rules(canon['blocked_changes'])}\n\n"
-        f"请为《{chapter.title}》排出继续往下写的场景计划。\n"
+        f"请为《{chapter.title}》排出{'从头重写本章' if replace_existing else '继续往下写'}的场景计划。\n"
         f"用户补充：{instruction.strip() or '无'}\n"
         f"目标长度：约 {target_words} 字\n"
         f"{support_text or ''}"
@@ -1684,6 +1688,7 @@ def _continuation_write_messages(
   support_text: str,
   candidate_label: str = "",
   candidate_hint: str = "",
+  replace_existing: bool = False,
 ) -> list[dict[str, object]]:
   scene_lines = []
   for index, item in enumerate(scene_result.scenes, start=1):
@@ -1714,6 +1719,7 @@ def _continuation_write_messages(
         f"表达约束：\n{_compact_rules(canon['voice_rules'])}\n"
         f"不要改动：\n{_compact_rules(canon['blocked_changes'])}\n\n"
         f"场景计划：\n{chr(10).join(scene_lines) if scene_lines else '无'}\n"
+        f"写作方式：{'从本章开头写新正文，已有正文只作事实参考，输出会替换旧章节。' if replace_existing else '承接已有章节正文继续写。'}\n"
         f"用户补充：{instruction.strip() or '无'}\n"
         f"目标长度：约 {target_words} 字\n"
         f"{support_text or ''}"
@@ -1874,6 +1880,7 @@ def _generate_continuation_candidates(
   support_text: str,
   task_name_prefix: str,
   candidate_count: int | None = None,
+  replace_existing: bool = False,
 ) -> list[dict[str, object]]:
   runtime_mode = load_config(settings).model_runtime.chapter_candidate_mode
   resolved_candidate_count = max(1, candidate_count or len(_CONTINUATION_CANDIDATE_VARIANTS))
@@ -1893,6 +1900,7 @@ def _generate_continuation_candidates(
       support_text=support_text,
       candidate_label=str(variant.get("label") or ""),
       candidate_hint=str(variant.get("hint") or ""),
+      replace_existing=replace_existing,
     )
     suffix = _invoke_partial_model(
       settings,
@@ -2073,6 +2081,7 @@ def _run_segmented_continuation_pipeline(
   time_constraint: str = "",
   task_name_prefix: str = "chapter_generate",
   candidate_count: int = 1,
+  replace_existing: bool = False,
 ) -> dict[str, object]:
   plan = _generate_continuation_plan(
     settings,
@@ -2085,8 +2094,9 @@ def _run_segmented_continuation_pipeline(
     key_items=key_items,
     scene_location=scene_location,
     time_constraint=time_constraint,
+    replace_existing=replace_existing,
   )
-  current_content = _continuation_prefix(plan["chapter"]).strip()
+  current_content = "" if replace_existing else _continuation_prefix(plan["chapter"]).strip()
   canon = dict(plan["canon"])
   segment_reports: list[str] = []
   segment_results: list[dict[str, object]] = []
@@ -2135,6 +2145,7 @@ def _run_segmented_continuation_pipeline(
       support_text=support_text,
       task_name_prefix=f"{task_name_prefix}:segment-{index:02d}",
       candidate_count=segment_candidate_count,
+      replace_existing=replace_existing and index == 1 and not current_content.strip(),
     )
     total_candidates += len(candidates)
     best_candidate = _choose_best_continuation_candidate(candidates)
@@ -2264,29 +2275,31 @@ def _resolve_continuation_length_targets(
   *,
   prefer_project_budget: bool = False,
   complete_chapter: bool = False,
+  replace_existing: bool = False,
 ) -> dict[str, object]:
+  chapter_for_target = None if replace_existing else chapter_for_length
   explicit_target = explicit_length_target(instruction)
   explicit_length_requested = instruction_requests_explicit_length(instruction)
   full_chapter_requested = instruction_requests_full_chapter(instruction)
   average_target = chapter_average_word_target(project_detail)
-  current_words = chapter_text_length(chapter_for_length)
+  current_words = 0 if replace_existing else chapter_text_length(chapter_for_length)
   if explicit_target > 0:
     target_words = explicit_target
-  elif full_chapter_requested or complete_chapter:
-    full_target = full_chapter_generation_target(project_detail, chapter_for_length)
+  elif full_chapter_requested or complete_chapter or replace_existing:
+    full_target = full_chapter_generation_target(project_detail, chapter_for_target)
     if full_target > 0:
       target_words = full_target
   target_words = recommended_chapter_generation_target(
     project_detail,
-    chapter_for_length,
+    chapter_for_target,
     requested_target=target_words,
     prefer_project_budget=prefer_project_budget and not explicit_length_requested and not complete_chapter,
   )
   if complete_chapter and explicit_target <= 0:
-    full_target = full_chapter_generation_target(project_detail, chapter_for_length)
+    full_target = full_chapter_generation_target(project_detail, chapter_for_target)
     if full_target > 0 and target_words < full_target:
       target_words = full_target
-  length_guidance = build_chapter_length_guidance(project_detail, chapter_for_length, generation_target=target_words)
+  length_guidance = build_chapter_length_guidance(project_detail, chapter_for_target, generation_target=target_words)
   segment_targets = _continuation_segment_targets(target_words)
   completion_target_words = 0
   if full_chapter_requested or complete_chapter:
@@ -2321,6 +2334,7 @@ def _run_prompt_override_continuation_pipeline(
   scene_location: str = "",
   time_constraint: str = "",
   task_name_prefix: str = "chapter_generate",
+  replace_existing: bool = False,
 ) -> dict[str, object]:
   plan = _generate_continuation_plan(
     settings,
@@ -2333,12 +2347,13 @@ def _run_prompt_override_continuation_pipeline(
     key_items=key_items,
     scene_location=scene_location,
     time_constraint=time_constraint,
+    replace_existing=replace_existing,
   )
   bundle = plan["bundle"]
   evidence_text = str(plan["evidence_text"])
   canon = dict(plan["canon"])
   scene_result = plan["scene_result"]
-  prefix = _continuation_prefix(plan["chapter"])
+  prefix = "" if replace_existing else _continuation_prefix(plan["chapter"])
   suffix = _invoke_partial_model(
     settings,
     [
@@ -2461,6 +2476,7 @@ def build_continuation_prompt_preview(
   time_constraint: str = "",
   prefer_project_budget: bool = False,
   complete_chapter: bool = False,
+  replace_existing: bool = False,
 ) -> ChapterPromptPreviewResponse:
   project_detail = get_project_detail(settings, project_id)
   chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
@@ -2471,6 +2487,7 @@ def build_continuation_prompt_preview(
     target_words,
     prefer_project_budget=prefer_project_budget,
     complete_chapter=complete_chapter,
+    replace_existing=replace_existing,
   )
   resolved_target_words = int(length_targets["target_words"])
   length_guidance = str(length_targets["length_guidance"])
@@ -2513,7 +2530,7 @@ def build_continuation_prompt_preview(
     f"连续性证据包：\n{guard_context.evidence_text}",
     (
       f"本次章节：第 {chapter.index} 章《{chapter.title}》\n"
-      "写作任务：生成可直接保存的章节正文。必须承接当前章节或上一章末尾，不能改动已成立的人名、关系、事件结果和时间顺序。\n"
+      f"写作任务：{'从头重写本章，生成可直接替换当前章节的新正文。已有正文只作为事实参考，不作为续写前缀。' if replace_existing else '生成可直接保存的章节正文。必须承接当前章节或上一章末尾。'}不能改动已成立的人名、关系、事件结果和时间顺序。\n"
       f"用户补充：{instruction.strip() or '无'}\n"
       f"涉及人物：{characters_involved.strip() or '无'}\n"
       f"关键道具或线索：{key_items.strip() or '无'}\n"
@@ -2555,6 +2572,7 @@ def _run_continuation_pipeline(
   prefer_project_budget: bool = False,
   complete_chapter: bool = False,
   prompt_override: str = "",
+  replace_existing: bool = False,
 ) -> dict[str, object]:
   project_detail = get_project_detail(settings, project_id)
   chapter_for_length = next((item for item in project_detail.chapters if item.id == chapter_id), None)
@@ -2565,6 +2583,7 @@ def _run_continuation_pipeline(
     target_words,
     prefer_project_budget=prefer_project_budget,
     complete_chapter=complete_chapter,
+    replace_existing=replace_existing,
   )
   target_words = int(length_targets["target_words"])
   length_guidance = str(length_targets["length_guidance"])
@@ -2586,6 +2605,7 @@ def _run_continuation_pipeline(
       scene_location=scene_location,
       time_constraint=time_constraint,
       task_name_prefix=task_name_prefix,
+      replace_existing=replace_existing,
     )
 
   if len(segment_targets) > 1:
@@ -2605,6 +2625,7 @@ def _run_continuation_pipeline(
       time_constraint=time_constraint,
       task_name_prefix=task_name_prefix,
       candidate_count=candidate_count,
+      replace_existing=replace_existing,
     )
 
   if candidate_count > 1:
@@ -2619,8 +2640,9 @@ def _run_continuation_pipeline(
       key_items=key_items,
       scene_location=scene_location,
       time_constraint=time_constraint,
+      replace_existing=replace_existing,
     )
-    prefix = _continuation_prefix(plan["chapter"])
+    prefix = "" if replace_existing else _continuation_prefix(plan["chapter"])
     candidates = _generate_continuation_candidates(
       settings,
       prefix=prefix,
@@ -2633,6 +2655,7 @@ def _run_continuation_pipeline(
       support_text=support_text,
       task_name_prefix=task_name_prefix,
       candidate_count=candidate_count,
+      replace_existing=replace_existing,
     )
     best_candidate = _choose_best_continuation_candidate(candidates)
     content = str(best_candidate.get("content") or "").strip()
@@ -2698,8 +2721,9 @@ def _run_continuation_pipeline(
     key_items=key_items,
     scene_location=scene_location,
     time_constraint=time_constraint,
+    replace_existing=replace_existing,
   )
-  prefix = _continuation_prefix(plan["chapter"])
+  prefix = "" if replace_existing else _continuation_prefix(plan["chapter"])
   suffix = _invoke_partial_model(
     settings,
     _continuation_single_write_messages(
@@ -2709,6 +2733,7 @@ def _run_continuation_pipeline(
       instruction=instruction,
       target_words=target_words,
       support_text=support_text,
+      replace_existing=replace_existing,
     ),
     prefix=prefix,
     task_name=f"{task_name_prefix}:partial",

@@ -25,6 +25,10 @@ from novel_backend.models import (
   ChapterPromptPreviewResponse,
   ChapterRewriteRequest,
   ChapterRewriteResult,
+  ChapterSegmentAcceptRequest,
+  ChapterSegmentGenerateRequest,
+  ChapterSegmentItem,
+  ChapterSegmentSessionResponse,
   ChapterUpdateRequest,
   ConsistencyCheckRequest,
   ConsistencyCheckResult,
@@ -51,8 +55,13 @@ from novel_backend.services.project_dream_service import build_project_dream_pro
 from novel_backend.services.generation_service import (
   build_continuation_prompt_preview,
   _compact_text,
+  _completion_threshold,
+  _content_length,
   _extract_json_object,
   _invoke_model,
+  _merge_segment_content,
+  _next_section_target,
+  _resolve_continuation_length_targets,
   _run_continuation_pipeline,
   _string_from_keys,
   _string_list_from_keys,
@@ -116,6 +125,9 @@ _CONSISTENCY_SYSTEM_PROMPT = """
 4. level 只能是 info、warning、critical。
 5. 重点检查人物动机、设定前后、信息揭示顺序、空间时间连续性。
 """.strip()
+
+_CHAPTER_SEGMENT_SESSION_DIR = "chapter_segment_sessions"
+_CHAPTER_SEGMENT_MAX_COUNT = 8
 
 _BLUEPRINT_SYSTEM_PROMPT = """
 你是中文长篇小说蓝图策划编辑。
@@ -1149,6 +1161,7 @@ def _generate_chapter(settings: Settings, payload: ChapterGenerateRequest, task_
     prefer_project_budget=payload.target_words <= 0,
     complete_chapter=payload.target_words <= 0,
     prompt_override=payload.prompt_override,
+    replace_existing=payload.replace_existing,
   )
   return ChapterGenerateResult(
     task_id=task_id,
@@ -1183,7 +1196,410 @@ def chapter_generate_prompt_preview(settings: Settings, payload: ChapterGenerate
     time_constraint=payload.time_constraint,
     prefer_project_budget=payload.target_words <= 0,
     complete_chapter=payload.target_words <= 0,
+    replace_existing=payload.replace_existing,
   )
+
+
+def _chapter_segment_sessions_dir(project_dir: Path) -> Path:
+  return project_dir / ".gaoxia" / _CHAPTER_SEGMENT_SESSION_DIR
+
+
+def _chapter_segment_session_path(project_dir: Path, session_id: str) -> Path:
+  if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", str(session_id or "")):
+    raise HTTPException(status_code=400, detail="分段会话 ID 不合法")
+  return _chapter_segment_sessions_dir(project_dir) / f"{session_id}.json"
+
+
+def _chapter_or_404(project_detail, chapter_id: str):
+  chapter = next((item for item in project_detail.chapters if item.id == chapter_id), None)
+  if chapter is None:
+    raise HTTPException(status_code=404, detail="章节不存在")
+  return chapter
+
+
+def _chapter_segment_new_item(index: int, target_words: int) -> dict[str, object]:
+  return {
+    "index": index,
+    "title": f"第 {index} 段",
+    "target_words": max(300, min(10_000, int(target_words or 0) or 1_800)),
+    "status": "pending",
+    "draft_text": "",
+    "draft_word_count": 0,
+    "accepted_word_count": 0,
+    "summary": "",
+    "next_action": "",
+    "updated_at": "",
+  }
+
+
+def _chapter_segment_base_payload(session: dict[str, object], segment: dict[str, object]) -> ChapterGenerateRequest:
+  request = session.get("request")
+  if not isinstance(request, dict):
+    request = {}
+  instruction = _chapter_segment_instruction(session, segment)
+  return ChapterGenerateRequest(
+    project_id=str(session.get("project_id") or request.get("project_id") or ""),
+    chapter_id=str(session.get("chapter_id") or request.get("chapter_id") or ""),
+    instruction=instruction,
+    target_words=int(segment.get("target_words") or 1_800),
+    style_name=str(request.get("style_name") or ""),
+    xp_preset=str(request.get("xp_preset") or ""),
+    characters_involved=str(request.get("characters_involved") or ""),
+    key_items=str(request.get("key_items") or ""),
+    scene_location=str(request.get("scene_location") or ""),
+    time_constraint=str(request.get("time_constraint") or ""),
+    replace_existing=_chapter_segment_replaces_existing(session, segment),
+  )
+
+
+def _chapter_segment_replaces_existing(session: dict[str, object], segment: dict[str, object]) -> bool:
+  request = session.get("request")
+  if not isinstance(request, dict) or not bool(request.get("replace_existing")):
+    return False
+  current_index = int(segment.get("index") or session.get("current_segment_index") or 1)
+  if current_index != 1:
+    return False
+  for item in session.get("segments") or []:
+    if isinstance(item, dict) and str(item.get("status") or "") == "accepted":
+      return False
+  return True
+
+
+def _chapter_segment_instruction(session: dict[str, object], segment: dict[str, object]) -> str:
+  request = session.get("request")
+  if not isinstance(request, dict):
+    request = {}
+  base = str(request.get("instruction") or "").strip() or "请继续写当前章节。"
+  index = int(segment.get("index") or 1)
+  total = max(len(session.get("segments") or []), index)
+  target_words = int(segment.get("target_words") or 1_800)
+  if _chapter_segment_replaces_existing(session, segment):
+    return (
+      f"{base}\n\n"
+      f"逐段重写要求：这是新稿第 {index}/{total} 段，目标约 {target_words} 字。"
+      "请从本章开头重写当前段，已有章节正文只作为事实和文风参考；"
+      "本段接受后会先替换旧章节正文。不要把旧正文原样复制到开头。"
+      "段尾保留下一段可继续发展的压力。"
+    )
+  return (
+    f"{base}\n\n"
+    f"逐段写作要求：这是第 {index}/{total} 段，目标约 {target_words} 字。"
+    "只写当前段，承接已经合并到章节里的正文继续推进；不要提前写完全章，"
+    "段尾保留下一段可继续发展的压力。不要重复已经写过的正文。"
+  )
+
+
+def _load_chapter_segment_session(settings: Settings, project_id: str, session_id: str) -> tuple[dict[str, object], Path, object]:
+  project_detail = get_project_detail(settings, project_id)
+  project_dir = Path(project_detail.path)
+  session_path = _chapter_segment_session_path(project_dir, session_id)
+  session = read_json(session_path, {})
+  if not isinstance(session, dict):
+    raise HTTPException(status_code=400, detail="分段会话文件已损坏")
+  if not session:
+    raise HTTPException(status_code=404, detail="分段会话不存在")
+  if str(session.get("project_id") or "") != project_id:
+    raise HTTPException(status_code=400, detail="分段会话不属于当前项目")
+  return session, project_dir, project_detail
+
+
+def _save_chapter_segment_session(project_dir: Path, session: dict[str, object]) -> None:
+  session_id = str(session.get("session_id") or "")
+  atomic_write_json(_chapter_segment_session_path(project_dir, session_id), session)
+
+
+def _current_chapter_segment(session: dict[str, object]) -> dict[str, object]:
+  segments = session.get("segments")
+  if not isinstance(segments, list) or not segments:
+    raise HTTPException(status_code=400, detail="分段会话没有可用段落")
+  current_index = int(session.get("current_segment_index") or 1)
+  for segment in segments:
+    if isinstance(segment, dict) and int(segment.get("index") or 0) == current_index:
+      return segment
+  for segment in segments:
+    if isinstance(segment, dict) and str(segment.get("status") or "") != "accepted":
+      session["current_segment_index"] = int(segment.get("index") or 1)
+      return segment
+  return segments[-1]
+
+
+def _chapter_segment_prompt_preview(
+  settings: Settings,
+  session: dict[str, object],
+  segment: dict[str, object],
+) -> ChapterPromptPreviewResponse:
+  payload = _chapter_segment_base_payload(session, segment)
+  support = _apply_preset_and_style(
+    settings,
+    task_key="chapter",
+    style_name=payload.style_name,
+    style_task_type="chapter",
+    style_query=payload.instruction,
+    xp_name=payload.xp_preset,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
+  )
+  return build_continuation_prompt_preview(
+    settings,
+    project_id=payload.project_id,
+    chapter_id=payload.chapter_id,
+    instruction=payload.instruction,
+    target_words=payload.target_words,
+    support_text=support,
+    characters_involved=payload.characters_involved,
+    key_items=payload.key_items,
+    scene_location=payload.scene_location,
+    time_constraint=payload.time_constraint,
+    prefer_project_budget=False,
+    complete_chapter=False,
+    replace_existing=payload.replace_existing,
+  )
+
+
+def _chapter_segment_response(
+  settings: Settings,
+  session: dict[str, object],
+  message: str = "",
+) -> ChapterSegmentSessionResponse:
+  project_detail = get_project_detail(settings, str(session.get("project_id") or ""))
+  chapter = _chapter_or_404(project_detail, str(session.get("chapter_id") or ""))
+  status = str(session.get("status") or "ready")
+  raw_segments = [item for item in (session.get("segments") or []) if isinstance(item, dict)]
+  current_segment = _current_chapter_segment(session) if raw_segments else {}
+  current_prompt = None
+  if status != "completed":
+    current_prompt = _chapter_segment_prompt_preview(settings, session, current_segment)
+  segments = [
+    ChapterSegmentItem.model_validate(item)
+    for item in raw_segments
+  ]
+  current_word_count = 0 if current_segment and _chapter_segment_replaces_existing(session, current_segment) else _content_length(chapter.content)
+  return ChapterSegmentSessionResponse(
+    session_id=str(session.get("session_id") or ""),
+    project_id=str(session.get("project_id") or ""),
+    chapter_id=str(session.get("chapter_id") or ""),
+    chapter_index=int(session.get("chapter_index") or getattr(chapter, "index", 1)),
+    chapter_title=str(session.get("chapter_title") or getattr(chapter, "title", "")),
+    status=status if status in {"ready", "generating", "draft_ready", "completed"} else "ready",
+    target_word_count=int(session.get("target_word_count") or 0),
+    completion_threshold_words=int(session.get("completion_threshold_words") or 0),
+    current_word_count=current_word_count,
+    current_segment_index=int(session.get("current_segment_index") or 1),
+    segments=segments,
+    current_prompt=current_prompt,
+    message=message,
+  )
+
+
+def start_chapter_segment_session(settings: Settings, payload: ChapterGenerateRequest) -> ChapterSegmentSessionResponse:
+  project_detail = get_project_detail(settings, payload.project_id)
+  chapter = _chapter_or_404(project_detail, payload.chapter_id)
+  length_targets = _resolve_continuation_length_targets(
+    project_detail,
+    chapter,
+    payload.instruction,
+    payload.target_words or 1_800,
+    prefer_project_budget=payload.target_words <= 0,
+    complete_chapter=payload.target_words <= 0,
+    replace_existing=payload.replace_existing,
+  )
+  target_words = int(length_targets.get("target_words") or payload.target_words or 1_800)
+  segment_targets = [
+    int(item)
+    for item in (length_targets.get("segment_targets") or [])
+    if int(item or 0) > 0
+  ][: _CHAPTER_SEGMENT_MAX_COUNT]
+  if not segment_targets:
+    segment_targets = [target_words]
+  current_word_count = 0 if payload.replace_existing else _content_length(chapter.content)
+  completion_target = int(length_targets.get("completion_target_words") or 0)
+  target_word_count = max(completion_target, current_word_count + target_words)
+  session_id = str(uuid4())
+  session: dict[str, object] = {
+    "session_id": session_id,
+    "project_id": payload.project_id,
+    "chapter_id": payload.chapter_id,
+    "chapter_index": int(getattr(chapter, "index", 1)),
+    "chapter_title": str(getattr(chapter, "title", "")),
+    "status": "ready",
+    "target_word_count": target_word_count,
+    "completion_threshold_words": _completion_threshold(target_word_count),
+    "current_segment_index": 1,
+    "request": payload.model_dump(mode="json"),
+    "segments": [
+      _chapter_segment_new_item(index, target)
+      for index, target in enumerate(segment_targets, start=1)
+    ],
+    "created_at": _now_iso(),
+    "updated_at": _now_iso(),
+  }
+  project_dir = Path(project_detail.path)
+  _save_chapter_segment_session(project_dir, session)
+  message = "已创建逐段重写会话，当前提示词可编辑。" if payload.replace_existing else "已创建逐段写作会话，当前提示词可编辑。"
+  return _chapter_segment_response(settings, session, message)
+
+
+def _extract_current_segment_text(current_content: str, generated_content: str) -> str:
+  current = str(current_content or "").strip()
+  generated = str(generated_content or "").strip()
+  if current and generated.startswith(current):
+    return generated[len(current) :].strip()
+  return generated
+
+
+def _polish_chapter_segment(
+  settings: Settings,
+  session: dict[str, object],
+  segment: dict[str, object],
+  prompt_override: str,
+  task_id: str,
+) -> tuple[str, str, str]:
+  draft = str(segment.get("draft_text") or "").strip()
+  if not draft:
+    raise RuntimeError("当前段还没有草稿，先生成本段。")
+  request = session.get("request")
+  if not isinstance(request, dict):
+    request = {}
+  guidance = str(prompt_override or "").strip()
+  user_message = (
+    "请润色下面这段小说正文。\n"
+    "要求：只输出 JSON，对象字段固定为 headline、summary、revised、changes。"
+    "revised 只放润色后的本段正文；保留剧情事实、信息顺序、人物关系和伏笔，不扩写成后续段落。\n\n"
+    f"原始写作要求：{str(request.get('instruction') or '').strip() or '继续写当前章节。'}\n"
+  )
+  if guidance:
+    user_message += f"\n用户对本次润色的补充要求：\n{guidance}\n"
+  user_message += f"\n本段草稿：\n{draft}"
+  content = _invoke_model(
+    settings,
+    [
+      {"role": "system", "content": "你是中文长篇小说编辑，只处理用户给出的当前段正文。"},
+      {"role": "user", "content": user_message},
+    ],
+    task_name="chapter_segment_polish",
+    max_tokens=max(1_200, min(12_000, _content_length(draft) * 2 + 800)),
+  )
+  result = _parse_rewrite_result(content, task_id)
+  revised = result.revised.strip() or _strip_code_fence(content).strip()
+  return revised, result.summary, "检查润色后的本段，确认后合并到章节。"
+
+
+def _generate_chapter_segment(
+  settings: Settings,
+  payload: ChapterSegmentGenerateRequest,
+  task_id: str,
+) -> ChapterSegmentSessionResponse:
+  session, project_dir, project_detail = _load_chapter_segment_session(settings, payload.project_id, payload.session_id)
+  if str(session.get("status") or "") == "completed":
+    return _chapter_segment_response(settings, session, "这一章的逐段会话已完成。")
+  segment = _current_chapter_segment(session)
+  previous_status = str(session.get("status") or "ready")
+  session["status"] = "generating"
+  session["updated_at"] = _now_iso()
+  _save_chapter_segment_session(project_dir, session)
+  try:
+    if payload.mode == "polish":
+      segment_text, summary, next_action = _polish_chapter_segment(
+        settings,
+        session,
+        segment,
+        payload.prompt_override,
+        task_id,
+      )
+    else:
+      chapter = _chapter_or_404(project_detail, str(session.get("chapter_id") or ""))
+      request_payload = _chapter_segment_base_payload(session, segment).model_copy(
+        update={"prompt_override": payload.prompt_override.strip()}
+      )
+      result = _generate_chapter(settings, request_payload, task_id)
+      base_content = "" if request_payload.replace_existing else chapter.content
+      segment_text = _extract_current_segment_text(base_content, result.content)
+      summary = result.summary
+      next_action = result.next_action or "检查本段后，选择接受合并或重新生成。"
+  except Exception:
+    session["status"] = previous_status if previous_status in {"ready", "draft_ready"} else "ready"
+    session["updated_at"] = _now_iso()
+    _save_chapter_segment_session(project_dir, session)
+    raise
+  segment["draft_text"] = segment_text.strip()
+  segment["draft_word_count"] = _content_length(segment_text)
+  segment["summary"] = summary
+  segment["next_action"] = next_action
+  segment["status"] = "draft"
+  segment["updated_at"] = _now_iso()
+  session["status"] = "draft_ready"
+  session["updated_at"] = _now_iso()
+  _save_chapter_segment_session(project_dir, session)
+  return _chapter_segment_response(settings, session, "当前段已生成，确认后可合并到章节。")
+
+
+def accept_chapter_segment(settings: Settings, payload: ChapterSegmentAcceptRequest) -> ChapterSegmentSessionResponse:
+  session, project_dir, project_detail = _load_chapter_segment_session(settings, payload.project_id, payload.session_id)
+  if str(session.get("status") or "") == "completed":
+    return _chapter_segment_response(settings, session, "这一章的逐段会话已完成。")
+  segment = _current_chapter_segment(session)
+  accepted_text = str(payload.accepted_text or segment.get("draft_text") or "").strip()
+  if not accepted_text:
+    raise RuntimeError("当前段没有可合并正文。")
+  chapter_id = str(session.get("chapter_id") or "")
+  chapter = _chapter_or_404(project_detail, chapter_id)
+  merged = accepted_text if _chapter_segment_replaces_existing(session, segment) else _merge_segment_content(chapter.content, accepted_text)
+  request = session.get("request")
+  if not isinstance(request, dict):
+    request = {}
+  updated_detail, review_error = update_chapter_content_with_review_status(
+    settings,
+    str(session.get("project_id") or ""),
+    chapter_id,
+    ChapterUpdateRequest(
+      content=merged,
+      style_name=str(request.get("style_name") or ""),
+      xp_preset=str(request.get("xp_preset") or ""),
+    ),
+  )
+  updated_chapter = _chapter_or_404(updated_detail, chapter_id)
+  segment["draft_text"] = accepted_text
+  segment["draft_word_count"] = _content_length(accepted_text)
+  segment["accepted_word_count"] = _content_length(accepted_text)
+  segment["status"] = "accepted"
+  segment["updated_at"] = _now_iso()
+  segments = [item for item in (session.get("segments") or []) if isinstance(item, dict)]
+  current_index = int(segment.get("index") or 1)
+  current_words = _content_length(updated_chapter.content)
+  threshold = int(session.get("completion_threshold_words") or 0)
+  message = review_error or "当前段已合并到章节。"
+  if threshold > 0 and current_words >= threshold:
+    session["status"] = "completed"
+    message = f"{message} 当前章节已达到目标字数。"
+  elif current_index < len(segments):
+    session["current_segment_index"] = current_index + 1
+    session["status"] = "ready"
+    message = f"{message} 已准备下一段提示词。"
+  elif len(segments) < _CHAPTER_SEGMENT_MAX_COUNT:
+    next_target = _next_section_target(current_words, int(session.get("target_word_count") or 0))
+    segments.append(_chapter_segment_new_item(len(segments) + 1, next_target))
+    session["segments"] = segments
+    session["current_segment_index"] = len(segments)
+    session["status"] = "ready"
+    message = f"{message} 已追加下一段提示词。"
+  else:
+    session["status"] = "completed"
+    message = f"{message} 已达到本次逐段会话的段数上限。"
+  session["updated_at"] = _now_iso()
+  _save_chapter_segment_session(project_dir, session)
+  return _chapter_segment_response(settings, session, message)
+
+
+async def chapter_segment_generate_stream(settings: Settings, payload: ChapterSegmentGenerateRequest):
+  label = "润色当前段" if payload.mode == "polish" else "生成当前段"
+  async for item in _simple_stream(
+    settings,
+    f"chapter_segment_stream:{payload.mode}",
+    ["读取分段会话", "整理当前段提示词", f"向模型{label}", "等待用户确认"],
+    lambda task_id: _generate_chapter_segment(settings, payload, task_id),
+    lambda result: result.model_dump(mode="json"),
+  ):
+    yield item
 
 
 def _rewrite_chapter(settings: Settings, payload: ChapterRewriteRequest, task_id: str, mode: str) -> ChapterRewriteResult:

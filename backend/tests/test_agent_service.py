@@ -220,6 +220,32 @@ class AgentServiceTestCase(unittest.TestCase):
     self.assertEqual(result_event[1]["plan"]["actions"][2]["mode"], "humanize")
     self.assertIn("计划步骤：", result_event[1]["reply"])
 
+  def test_rewrite_whole_chapter_uses_segment_generation_plan(self) -> None:
+    self._write_chapter_without_review(
+      "chapter-001",
+      "# 第一章\n旧码头重新亮灯，主角被迫回港。\n",
+    )
+
+    events = asyncio.run(
+      collect_stream(
+        agent_session_stream(
+          self.settings,
+          AgentChatRequest(
+            project_id=self.project.id,
+            selected_chapter_id="chapter-001",
+            messages=[AgentMessage(role="user", content="重新第一章")],
+          ),
+        )
+      )
+    )
+
+    result_event = next(item for item in events if item[0] == "result")
+    actions = result_event[1]["plan"]["actions"]
+    chapter_action = next(item for item in actions if item["kind"] == "chapter_generate")
+    self.assertEqual(chapter_action["label"], "重写第 1 章正文")
+    self.assertTrue(chapter_action["replace_existing"])
+    self.assertNotIn("修订第 1 章", [item["label"] for item in actions])
+
   def test_write_request_can_skip_supervised_longform_steps(self) -> None:
     self._write_chapter_without_review(
       "chapter-001",

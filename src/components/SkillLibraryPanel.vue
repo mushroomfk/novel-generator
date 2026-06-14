@@ -7736,6 +7736,60 @@ async function handleStyleReferenceFilesSelected(event) {
   color: #b42318;
 }
 
+.chapter-segment-panel {
+  border: 1px solid #dfe6ec;
+  border-radius: 14px;
+  padding: 14px;
+  background: #fbfcfe;
+}
+
+.segment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segment-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border: 1px solid #d0d7de;
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: #ffffff;
+  color: #57606a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.segment-pill-active {
+  border-color: #9ec5fe;
+  background: #e8f0fe;
+  color: #1d4ed8;
+}
+
+.segment-pill-accepted {
+  border-color: #b7dfc1;
+  background: #f4fbf5;
+  color: #2b6940;
+}
+
+.segment-pill-draft {
+  border-color: #f1d18a;
+  background: #fff8e6;
+  color: #8a5a00;
+}
+
+.segment-prompt-editor {
+  min-height: 220px;
+}
+
+.segment-draft-editor {
+  min-height: 360px;
+  font-family: 'SFMono-Regular', ui-monospace, monospace;
+  line-height: 1.7;
+}
+
 .overview-copy,
 .controls-shell,
 .catalog-section,

@@ -21,6 +21,8 @@ from novel_backend.models import (
   ChapterReviewIssue,
   ChapterReviewReport,
   ChapterRewriteRequest,
+  ChapterSegmentAcceptRequest,
+  ChapterSegmentGenerateRequest,
   ChapterUpdateRequest,
   ContinueProjectRequest,
   CreateProjectRequest,
@@ -68,10 +70,13 @@ from novel_backend.services.studio_service import (
   blueprint_stream,
   brainstorm_stream,
   character_replica_stream,
+  accept_chapter_segment,
   chapter_generate_prompt_preview,
   chapter_generate_stream,
   chapter_rewrite_stream,
+  chapter_segment_generate_stream,
   continue_project_stream,
+  start_chapter_segment_session,
   style_analyze_stream,
   style_analyze_dna_stream,
   style_calibrate_narrative_stream,
@@ -1034,6 +1039,168 @@ class StudioServiceTestCase(unittest.TestCase):
     self.assertIn("让追兵先在门外逼近", preview.editable_prompt)
     self.assertIn("[system]", preview.prompt_text)
     self.assertEqual(preview.messages[-1].role, "user")
+
+  def test_chapter_segment_session_start_returns_current_prompt_without_model_call(self) -> None:
+    with patch("novel_backend.services.generation_service._request_chat_completion") as request_mock:
+      session = start_chapter_segment_session(
+        self.settings,
+        ChapterGenerateRequest(
+          project_id=self.project.id,
+          chapter_id="chapter-001",
+          instruction="让追兵从门外逼近，保留段尾压力。",
+          target_words=9000,
+          characters_involved="林追",
+          key_items="铜钥匙",
+        ),
+      )
+
+    request_mock.assert_not_called()
+    self.assertEqual(session.project_id, self.project.id)
+    self.assertEqual(session.chapter_id, "chapter-001")
+    self.assertEqual(session.current_segment_index, 1)
+    self.assertEqual(len(session.segments), 2)
+    self.assertIn("逐段写作要求", session.current_prompt.editable_prompt)
+    self.assertIn("第 1/2 段", session.current_prompt.editable_prompt)
+
+  def test_chapter_segment_generate_and_accept_appends_segment_to_chapter(self) -> None:
+    session = start_chapter_segment_session(
+      self.settings,
+      ChapterGenerateRequest(
+        project_id=self.project.id,
+        chapter_id="chapter-001",
+        instruction="让追兵从门外逼近，保留段尾压力。",
+        target_words=9000,
+      ),
+    )
+    base_content = get_project_detail(self.settings, self.project.id).chapters[0].content.strip()
+    generated_content = f"{base_content}\n\n林追把铜钥匙扣进掌心，门轴在雾里无声转动。"
+    generated = ChapterGenerateResult(
+      task_id="fake-task",
+      headline="当前段已生成",
+      summary="本段承接钥匙和门外压力。",
+      content=generated_content,
+      next_action="确认本段后继续第二段。",
+    )
+
+    with patch("novel_backend.services.studio_service._generate_chapter", return_value=generated):
+      events = asyncio.run(
+        collect_stream(
+          chapter_segment_generate_stream(
+            self.settings,
+            ChapterSegmentGenerateRequest(
+              project_id=self.project.id,
+              session_id=session.session_id,
+              prompt_override=session.current_prompt.editable_prompt,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    self.assertEqual(result_event[1]["status"], "draft_ready")
+    self.assertIn("门轴在雾里无声转动", result_event[1]["segments"][0]["draft_text"])
+    self.assertNotIn("# 第一章", result_event[1]["segments"][0]["draft_text"])
+
+    accepted = accept_chapter_segment(
+      self.settings,
+      ChapterSegmentAcceptRequest(
+        project_id=self.project.id,
+        session_id=session.session_id,
+        accepted_text=result_event[1]["segments"][0]["draft_text"],
+      ),
+    )
+    detail = get_project_detail(self.settings, self.project.id)
+    chapter = next(item for item in detail.chapters if item.id == "chapter-001")
+
+    self.assertIn("铜钥匙", chapter.content)
+    self.assertIn("门轴在雾里无声转动", chapter.content)
+    self.assertEqual(accepted.current_segment_index, 2)
+    self.assertEqual(accepted.status, "ready")
+    self.assertIn("第 2/2 段", accepted.current_prompt.editable_prompt)
+
+  def test_chapter_segment_generate_failure_restores_retryable_status(self) -> None:
+    session = start_chapter_segment_session(
+      self.settings,
+      ChapterGenerateRequest(
+        project_id=self.project.id,
+        chapter_id="chapter-001",
+        instruction="让追兵从门外逼近，保留段尾压力。",
+        target_words=1800,
+      ),
+    )
+
+    with patch("novel_backend.services.studio_service._generate_chapter", side_effect=RuntimeError("model offline")):
+      events = asyncio.run(
+        collect_stream(
+          chapter_segment_generate_stream(
+            self.settings,
+            ChapterSegmentGenerateRequest(
+              project_id=self.project.id,
+              session_id=session.session_id,
+              prompt_override=session.current_prompt.editable_prompt,
+            ),
+          )
+        )
+      )
+
+    session_path = self.project_dir / ".gaoxia" / "chapter_segment_sessions" / f"{session.session_id}.json"
+    stored = json.loads(session_path.read_text(encoding="utf-8"))
+
+    self.assertEqual(next(item for item in events if item[0] == "error")[1]["message"], "model offline")
+    self.assertEqual(stored["status"], "ready")
+    self.assertEqual(stored["segments"][0]["status"], "pending")
+
+  def test_chapter_segment_rewrite_accept_replaces_existing_chapter(self) -> None:
+    session = start_chapter_segment_session(
+      self.settings,
+      ChapterGenerateRequest(
+        project_id=self.project.id,
+        chapter_id="chapter-001",
+        instruction="重新第一章，从暴雨靠港开始写。",
+        target_words=1800,
+        replace_existing=True,
+      ),
+    )
+
+    self.assertEqual(session.current_word_count, 0)
+    self.assertIn("逐段重写要求", session.current_prompt.editable_prompt)
+    self.assertIn("替换当前章节", session.current_prompt.editable_prompt)
+
+    generated = ChapterGenerateResult(
+      task_id="fake-rewrite-task",
+      headline="当前段已生成",
+      summary="新稿从暴雨靠港开始。",
+      content="# 第一章 雨夜靠港\n暴雨压住旧码头，林追在栈桥尽头听见铜钥匙撞响。",
+      next_action="确认本段后继续下一段。",
+    )
+    with patch("novel_backend.services.studio_service._generate_chapter", return_value=generated):
+      events = asyncio.run(
+        collect_stream(
+          chapter_segment_generate_stream(
+            self.settings,
+            ChapterSegmentGenerateRequest(
+              project_id=self.project.id,
+              session_id=session.session_id,
+              prompt_override=session.current_prompt.editable_prompt,
+            ),
+          )
+        )
+      )
+
+    result_event = next(item for item in events if item[0] == "result")
+    accepted = accept_chapter_segment(
+      self.settings,
+      ChapterSegmentAcceptRequest(
+        project_id=self.project.id,
+        session_id=session.session_id,
+        accepted_text=result_event[1]["segments"][0]["draft_text"],
+      ),
+    )
+    chapter = next(item for item in get_project_detail(self.settings, self.project.id).chapters if item.id == "chapter-001")
+
+    self.assertNotIn("林追在旧码头仓库找到一把铜钥匙", chapter.content)
+    self.assertIn("暴雨压住旧码头", chapter.content)
+    self.assertEqual(accepted.current_segment_index, 2)
 
   def test_chapter_generate_stream_respects_explicit_target_words(self) -> None:
     def fake_pipeline(_settings, **kwargs):

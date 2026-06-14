@@ -4,6 +4,38 @@
 
 历史上已经做完、但没有单独留日期的内容，不补编日期，先按“基线能力”归档；后续新改动按日期继续追加。
 
+## 2026-06-14
+
+### 0.1.4 未提交改动复核与逐段写作稳定性修正
+
+- 修改摘要：复核当前未提交改动时，修正主会话章节生成预览 payload 未携带 `replace_existing` 的不一致问题；修正逐段写作生成或润色失败后 `.gaoxia/chapter_segment_sessions/` 会话文件停留在 `generating` 状态的问题，失败后会恢复为进入生成前的 `ready` 或 `draft_ready`，方便作者重试和后续恢复。
+- 影响范围：主会话逐段写作、从头重写章节正文、章节生成提示词预览、分段会话状态文件和对应后端回归测试；不改变章节保存接口、作品数据结构、模型配置格式或技能库单章生成流程。
+- 验证结果：`.venv/bin/python -m py_compile` 相关后端文件和测试文件通过；`node --check scripts/verify-ui-smoke.mjs` 通过；定向 unittest 通过，覆盖“重新第一章”路由、分段会话启动、当前段生成与接受合并、模型失败后状态恢复、重写替换旧章节和 API success envelope；`git diff --check` 通过；`npm run verify` 通过，包含打包静态检查、前端静态回归、API smoke、451 个后端 unittest 和前端生产构建；`CHROME_BIN="/Users/liuqingxing/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" npm run verify:ui` 通过；`npm run verify:release-audit` 通过，包含完整本地回归、本地长篇链路 smoke、《围城》原文导入和第 10 章本地上下文、当前保存模型配置与 DNS 预检。未执行真实模型长篇生成验证；未执行 Windows 实机安装、卸载、首次启动和安装后 GUI 操作。
+
+### Agent 正文编辑态高度修复
+
+- 修改摘要：修复隐藏 Agent 后进入正文编辑态时预览卡按 `textarea` 内容高度收缩、页面下方留下大块空白的问题。工作台主画布现在会填充主区域剩余高度，正文预览侧栏、编辑态容器和正文编辑框会沿着可用高度展开；UI smoke 也新增正文编辑态高度断言，避免只检查按钮存在却漏掉布局收缩。
+- 影响范围：`src/style.css`、`ProjectWorkspaceSidebar` 编辑态样式、`scripts/verify-ui-smoke.mjs` 高度断言和界面回归说明；不改变章节保存接口、正文同步逻辑、项目数据结构或 Agent SSE 协议。
+- 验证结果：`npm run build` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；`git diff --check` 通过；本地启动 `npm run dev`，Vite 因 1420 端口被占用自动使用 `http://localhost:1421/`，用内置浏览器在 2048x1400 视口检查现有项目第 1 章：隐藏 Agent 后进入“编辑正文”，正文编辑框高度从修复前约 88px 变为约 1144px，预览卡填满工作区，浏览器 console 无 error。`npm run verify:ui` 运行到 Agent 自学习面板后段失败，失败点为 `waitForTestButtonEnabled(page, 'self-evolution-obsidian-stage-visible-button')` 超时；新增的正文编辑态高度断言在此之前已经通过。未执行桌面包验证或真实模型长篇生成验证。
+
+### 主会话重写章节提示词确认
+
+- 修改摘要：修正“重新第一章 / 重写第 1 章”这类请求被当成普通修订计划的问题。主会话从头重写章节正文时现在会规划成 `chapter_generate`，进入逐段写作面板，先显示当前段提示词供作者复制、修改和确认；分段会话带 `replace_existing=true`，第一段接受后替换旧章节正文，后续段落接续新稿。润色、去 AI、定稿、判断、资料分析、架构整理和一致性检查仍不显示逐段提示词面板。
+- 影响范围：Agent 路由 / 规划、章节生成请求模型、主会话逐段写作 API、生成提示词预览、章节分段接受逻辑、主会话前端 payload、UI smoke、README、Agent 指令、核心引擎说明、Agent 执行架构说明、技能流程说明、界面回归说明和测试反馈清单；不改变技能库单章生成、小批量生成、章节保存路径、会话历史结构或模型配置格式。
+- 验证结果：`.venv/bin/python -m py_compile backend/novel_backend/models.py backend/novel_backend/services/generation_service.py backend/novel_backend/services/studio_service.py backend/novel_backend/services/agent_service.py` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；相关后端定向 unittest 通过；`.venv/bin/python -m unittest backend.tests.test_generation_service` 通过；`npm run verify:frontend-static` 通过；`npm run build` 通过；`git diff --check` 通过；`CHROME_BIN="/Users/liuqingxing/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" npm run verify:ui` 通过，覆盖“重新第一章”显示当前段提示词、生成本段、接受后替换旧章节正文；`npm run verify` 通过，包含打包静态检查、前端静态回归、API smoke、450 个后端 unittest 和前端生产构建。未执行桌面包验证或真实模型长篇生成验证。
+
+### Agent 正文专注编辑
+
+- 修改摘要：Agent 对话选中章节时新增“隐藏 Agent”入口，隐藏后正文预览占用工作区并提供“显示 Agent”恢复按钮；正文预览新增“编辑正文”状态，作者可直接修改当前章节，点击“保存并同步”后复用现有章节保存接口刷新后端知识来源、系统记忆、章节核验、文风 / XP 观察和叙事状态观察。保存成功或核验失败都会在正文卡片内显示状态；编辑期间如果后端正文发生变化，会提示保存将覆盖当前章。
+- 影响范围：`NovelWorkflowPanel`、`ProjectWorkspaceSidebar`、浏览器 UI smoke、README、Agent 指令和界面回归说明；不改变章节保存 API、项目数据结构、Agent SSE 协议或模型调用方式。
+- 验证结果：`npm run build` 通过；`node --check scripts/verify-ui-smoke.mjs` 通过；本地启动 `npm run dev` 时 1420 端口被占用，Vite 自动使用 `http://localhost:1421/`，再启动 `npm run backend:dev` 后用内置浏览器检查现有项目：选中第 1 章后确认“隐藏 Agent”和“编辑正文”可见，点击“隐藏 Agent”后只保留正文预览、“显示 Agent”和“编辑正文”，进入编辑态后出现正文编辑框、“保存并同步”和“取消”，取消后未保存正文，点击“显示 Agent”后 Agent 对话恢复；浏览器控制台无 error。未执行完整 `npm run verify:ui`、桌面包验证或真实模型长篇生成验证。
+
+### 主会话章节逐段写作
+
+- 修改摘要：主会话里的写正文计划改为逐段写作会话。用户点击“开始逐段写作”后，会话流显示当前段提示词，作者可复制或修改；提示词只作为本次模型调用输入，不写入章节、资料库或会话历史。每段生成后先进入可编辑草稿框，作者可重新生成、润色，或接受并合并到当前章节。分段会话状态保存在项目 `.gaoxia/chapter_segment_sessions/`，接受合并后准备下一段提示词；只有接受动作会写入章节正文。讨论、判断、资料分析、架构整理、改稿和一致性检查不显示逐段面板。
+- 影响范围：Studio 章节分段 API、主会话 Agent 计划卡、主会话写正文执行方式、UI smoke、章节保存后的知识索引 / 核验 / 自学习 / 稳定档案维护触发时机、README、Agent 指令、核心引擎说明、Agent 执行架构说明、技能流程说明、界面回归说明和测试反馈清单；技能库单章生成和技能库续写正文回到原来的提示词确认流程；不改变小批量生成提示词确认、章节正文保存路径或模型配置格式。
+- 验证结果：`node --check scripts/verify-ui-smoke.mjs` 通过；`.venv/bin/python -m unittest backend.tests.test_agent_service.AgentServiceTestCase.test_model_plan_respects_user_explicit_chapter_over_selected_chapter backend.tests.test_agent_service.AgentServiceTestCase.test_model_plan_uses_action_specific_chapter_when_reference_chapter_appears_first backend.tests.test_studio_service.StudioServiceTestCase.test_chapter_segment_session_start_returns_current_prompt_without_model_call backend.tests.test_studio_service.StudioServiceTestCase.test_chapter_segment_generate_and_accept_appends_segment_to_chapter backend.tests.test_app.AppEnvelopeTestCase.test_chapter_prompt_preview_routes_use_success_envelope` 通过；`npm run verify:frontend-static` 通过；`npm run build` 通过；`git diff --check` 通过；`CHROME_BIN="/Users/liuqingxing/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" npm run verify:ui` 通过，覆盖主会话逐段提示词展示、编辑、生成、接受合并和选中第一章时生成第二章的写回路径；`npm run verify` 通过，包含打包静态检查、前端静态回归、API 冒烟、448 个后端 unittest 和前端生产构建。直接使用系统 `python3` 组合执行 `backend.tests.test_app` 时，曾因 macOS 阻止 `cryptography` 动态库加载失败；改用项目 `.venv/bin/python` 后通过。系统 Chrome 启动 Playwright 曾被 `SIGKILL`，改用 Playwright 缓存的 Chrome for Testing 后 UI smoke 通过。未执行桌面包验证或真实模型长篇生成验证。
+
 ## 2026-06-13
 
 ### 0.1.4 全量核验与桌面测试包重打包

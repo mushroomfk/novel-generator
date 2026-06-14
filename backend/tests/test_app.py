@@ -88,6 +88,7 @@ class AppEnvelopeTestCase(unittest.TestCase):
   def test_chapter_prompt_preview_routes_use_success_envelope(self) -> None:
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=Settings())))
     preview = SimpleNamespace(model_dump=lambda mode="json": {"editable_prompt": "提示词"})
+    segment = SimpleNamespace(model_dump=lambda mode="json": {"session_id": "segment-session"})
 
     with patch("novel_backend.api.generate.require_valid_license"), patch(
       "novel_backend.api.generate.chapter_workflow_prompt_preview",
@@ -101,8 +102,22 @@ class AppEnvelopeTestCase(unittest.TestCase):
     ):
       generate_payload = asyncio.run(studio.preview_chapter_generate_prompt(request, object()))
 
+    with patch("novel_backend.api.studio.require_valid_license"), patch(
+      "novel_backend.api.studio.start_chapter_segment_session",
+      return_value=segment,
+    ):
+      segment_start_payload = studio.post_chapter_segment_start(request, object())
+
+    with patch("novel_backend.api.studio.require_valid_license"), patch(
+      "novel_backend.api.studio.accept_chapter_segment",
+      return_value=segment,
+    ):
+      segment_accept_payload = studio.post_chapter_segment_accept(request, object())
+
     self.assertEqual(workflow_payload, {"ok": True, "data": {"editable_prompt": "提示词"}})
     self.assertEqual(generate_payload, {"ok": True, "data": {"editable_prompt": "提示词"}})
+    self.assertEqual(segment_start_payload, {"ok": True, "data": {"session_id": "segment-session"}})
+    self.assertEqual(segment_accept_payload, {"ok": True, "data": {"session_id": "segment-session"}})
 
 
 if __name__ == "__main__":
