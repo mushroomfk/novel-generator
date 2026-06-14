@@ -6,6 +6,12 @@
 
 ## 2026-06-14
 
+### 0.1.4 未提交改动复核与桌面测试包重打包
+
+- 修改摘要：复核当前未提交改动并提交逐段写作相关修正；基于远端 package source 提交 `607094e9b180c1a68854c840d4d613c575858199` 重新生成 macOS arm64 和 Windows x64 0.1.4 测试包；更新 README、Windows 打包说明和 Windows 包内说明中的 run、artifact 和 SHA256 信息。
+- 影响范围：主会话逐段写作、从头重写章节正文、macOS / Windows 0.1.4 测试包、README、Windows 打包说明和包内安装说明；不改变模型配置结构、作品数据格式、许可证格式或运行时 API。
+- 验证结果：`git diff --check` 通过；定向 unittest 通过；`npm run verify` 通过，包含打包静态检查、前端静态回归、API smoke、451 个后端 unittest 和前端生产构建；`npm run verify:ui` 通过；`npm run verify:release-audit` 通过，包含完整本地回归、本地长篇链路 smoke、《围城》原文导入和第 10 章本地上下文、当前保存模型配置与 DNS 预检；`npm run release:test:macos` 通过，包含桌面发布检查、451 个后端 unittest、前端生产构建、Python sidecar 打包、sidecar 健康检查、Tauri release `.app` / `.dmg` 构建、签名修复、开发机路径扫描、应用内 sidecar 健康检查和 `.app` 启动检查；macOS 测试包目录 `release/test-release/macos/稿匣_0.1.4_测试包` 的 `shasum -a 256 -c SHA256SUMS.txt` 通过，`hdiutil verify` 通过，DMG SHA256 为 `2276ae04f566a34ca103a7baf0b8d9691c96875e6749006afe1e56ddb866ebd9`；GitHub Actions `Windows Desktop Release` run `27495837771` 在提交 `607094e9b180c1a68854c840d4d613c575858199` 上通过，artifact `gaoxia-windows-607094e9b180c1a68854c840d4d613c575858199` 下载并整理到 `release/test-release/windows/稿匣_0.1.4_测试包`，`shasum -a 256 -c SHA256SUMS.txt` 通过，Windows 安装程序 SHA256 为 `20ab9762c50f5e0b220c8126ac4117e8d39f0abb2cc164205634e621f5e1845d`，Windows sidecar SHA256 为 `b0dca7b3ccfeb7c871e5d33e15b04a52b0bba7315da09b845bc5479131fb0b0f`。未执行真实模型长篇生成验证；Windows 实机安装、卸载、首次启动和安装后 GUI 操作仍待人工验收。
+
 ### 0.1.4 未提交改动复核与逐段写作稳定性修正
 
 - 修改摘要：复核当前未提交改动时，修正主会话章节生成预览 payload 未携带 `replace_existing` 的不一致问题；修正逐段写作生成或润色失败后 `.gaoxia/chapter_segment_sessions/` 会话文件停留在 `generating` 状态的问题，失败后会恢复为进入生成前的 `ready` 或 `draft_ready`，方便作者重试和后续恢复。

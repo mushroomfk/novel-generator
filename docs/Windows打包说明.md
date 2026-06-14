@@ -48,7 +48,7 @@ release/test-release/windows/稿匣_0.1.4_测试包/
 
 截至 2026-06-10，`0.1.3` Windows 测试包已由 GitHub Actions `Windows Desktop Release` run `27259635805` 在分支 `codex/full-verification-windows-20260609` 的提交 `943cd574b2ffa7fc9f8e486377f31b6d400c5d14` 构建完成；本地已整理到 `release/test-release/windows/稿匣_0.1.3_测试包/` 并通过 SHA256 校验。Windows 实机安装、卸载和首次启动仍需人工验收。
 
-截至 2026-06-13，`0.1.4` Windows 测试包已由 GitHub Actions `Windows Desktop Release` run `27459193672` 在分支 `codex/full-verification-windows-20260609` 的提交 `a2da44c5ce9906a518370ff1d7669693c2e99282` 构建完成；本地已整理到 `release/test-release/windows/稿匣_0.1.4_测试包/` 并通过 SHA256 校验。安装程序 SHA256 为 `d2b60a93e654856071628dd54bbab97b40edb9ccbb25348f059adef22734f268`，Windows sidecar SHA256 为 `981527d124fe84b71c030324bb6d452da08ab6c0be791257545397b655fb43bf`。Windows 实机安装、卸载、首次启动和安装后 GUI 操作仍需人工验收。
+截至 2026-06-14，`0.1.4` Windows 测试包已由 GitHub Actions `Windows Desktop Release` run `27495837771` 在分支 `codex/full-verification-windows-20260609` 的提交 `607094e9b180c1a68854c840d4d613c575858199` 构建完成；artifact 为 `gaoxia-windows-607094e9b180c1a68854c840d4d613c575858199`，ID 为 `7620248739`；本地已整理到 `release/test-release/windows/稿匣_0.1.4_测试包/` 并通过 SHA256 校验。安装程序 SHA256 为 `20ab9762c50f5e0b220c8126ac4117e8d39f0abb2cc164205634e621f5e1845d`，Windows sidecar SHA256 为 `b0dca7b3ccfeb7c871e5d33e15b04a52b0bba7315da09b845bc5479131fb0b0f`。Windows 实机安装、卸载、首次启动和安装后 GUI 操作仍需人工验收。
 
 ## 本地 Windows 打包
 
